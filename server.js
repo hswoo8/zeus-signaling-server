@@ -83,8 +83,18 @@ wss.on('connection', (ws) => {
                 break;
             }
 
+            // ── 방 목록 조회 ─────────────────────────────────────────────
+            case 'get_room_list': {
+                const list = Object.keys(rooms)
+                    .filter(code => !rooms[code].guest)
+                    .map(code => ({ code }));
+                send(ws, { type: 'room_list', rooms: list });
+                break;
+            }
+
             // ── 게임 패킷 릴레이 ─────────────────────────────────────────
-            // WebRTC DataChannel 연결 전/후 fallback으로도 사용 가능
+            case 'rematch_accept':
+            case 'rematch_decline':
             case 'game_start':
             case 'game_state':
             case 'game_skill':
