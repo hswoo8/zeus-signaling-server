@@ -93,6 +93,7 @@ wss.on('connection', (ws) => {
             }
 
             // ── 게임 패킷 릴레이 ─────────────────────────────────────────
+            case 'game_over':
             case 'rematch_accept':
             case 'rematch_decline':
             case 'game_start':
