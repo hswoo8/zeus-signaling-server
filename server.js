@@ -85,8 +85,11 @@ wss.on('connection', (ws) => {
 
             // ── 게임 패킷 릴레이 ─────────────────────────────────────────
             // WebRTC DataChannel 연결 전/후 fallback으로도 사용 가능
+            case 'game_start':
             case 'game_state':
-            case 'game_skill': {
+            case 'game_skill':
+            case 'game_damage':
+            case 'game_state_hp': {
                 const code = ws.roomCode;
                 const room = rooms[code];
                 if (!room) return;
