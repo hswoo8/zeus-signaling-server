@@ -2,13 +2,25 @@
 
 WebSocket signaling and relay server for BeerRock multiplayer.
 
+## Runtime gates
+
+Set these environment variables in production to block outdated multiplayer clients at the server:
+
+| env | Default | Description |
+| --- | --- | --- |
+| `MULTIPLAYER_MIN_APP_VERSION_CODE` | `1` | Minimum Android `clientVersionCode` allowed to use lobby/match start messages |
+| `MULTIPLAYER_MIN_PROTOCOL_VERSION` | `1` | Minimum network protocol version |
+| `MULTIPLAYER_MIN_BALANCE_VERSION` | `1` | Minimum gameplay balance/data version |
+
+If a client is missing or below these values, the server returns `{ type: "error", code: "update_required", message }`.
+
 ## Lobby messages
 
 | type | Direction | Description |
 | --- | --- | --- |
-| `create_room` | Client -> Server | Create room with `{ hostCharacterId, hostPassiveId, arenaId, networkMode }`; missing/invalid `networkMode` becomes `relay` |
+| `create_room` | Client -> Server | Create room with compatibility metadata and `{ hostCharacterId, hostPassiveId, arenaId, networkMode }`; missing/invalid `networkMode` becomes `relay` |
 | `room_created` | Server -> Host | `{ code, networkMode }` |
-| `join_room` | Client -> Server | `{ code }` |
+| `join_room` | Client -> Server | Compatibility metadata and `{ code }` |
 | `room_joined` | Server -> Guest | `{ code, matchId, networkMode }` |
 | `guest_joined` | Server -> Host | `{ matchId, networkMode }` |
 | `ping_check` | Client -> Server | `{ clientTime, rttMs? }` |

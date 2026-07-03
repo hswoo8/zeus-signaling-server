@@ -9,6 +9,18 @@ const RATE_LIMITS = {
     gameState: Number(process.env.RATE_LIMIT_GAME_STATE_MAX || 420),
     gameEvent: Number(process.env.RATE_LIMIT_GAME_EVENT_MAX || 240),
 };
+const MIN_CLIENT_VERSION_CODE = envInt(
+    ['MULTIPLAYER_MIN_APP_VERSION_CODE', 'MIN_CLIENT_VERSION_CODE'],
+    1
+);
+const MIN_PROTOCOL_VERSION = envInt(
+    ['MULTIPLAYER_MIN_PROTOCOL_VERSION', 'MIN_PROTOCOL_VERSION'],
+    1
+);
+const MIN_BALANCE_VERSION = envInt(
+    ['MULTIPLAYER_MIN_BALANCE_VERSION', 'MIN_BALANCE_VERSION'],
+    1
+);
 const NETWORK_MODES = new Set(['auto', 'relay', 'p2p']);
 const wss = new WebSocket.Server({ port: PORT });
 
@@ -27,6 +39,19 @@ const GAME_TYPES = new Set([
 ]);
 
 const ALL_TYPES = new Set([...LOBBY_TYPES, ...GAME_TYPES]);
+
+const COMPATIBILITY_TYPES = new Set([
+    'create_room', 'join_room', 'get_room_list', 'ping_check',
+    'game_start', 'game_ready', 'rematch_ready',
+]);
+
+function envInt(names, fallback) {
+    for (const name of names) {
+        const parsed = Number.parseInt(process.env[name] || '', 10);
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return fallback;
+}
 
 function generateCode() {
     return Math.floor(1000 + Math.random() * 9000).toString();
@@ -93,6 +118,33 @@ function rateLimitOk(ws, type) {
     return state.count <= RATE_LIMITS[bucket];
 }
 
+function packetInt(msg, field) {
+    const value = msg[field];
+    return Number.isInteger(value) ? value : null;
+}
+
+function compatibilityError(msg) {
+    if (!COMPATIBILITY_TYPES.has(msg.type)) return null;
+
+    const clientVersionCode = packetInt(msg, 'clientVersionCode');
+    const protocolVersion = packetInt(msg, 'protocolVersion');
+    const balanceVersion = packetInt(msg, 'balanceVersion');
+
+    if (clientVersionCode === null) {
+        return '앱 버전 정보를 확인할 수 없습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+    }
+    if (clientVersionCode < MIN_CLIENT_VERSION_CODE) {
+        return `앱 업데이트가 필요합니다. 필요 버전 코드 ${MIN_CLIENT_VERSION_CODE} 이상에서 대전할 수 있습니다.`;
+    }
+    if (protocolVersion === null || protocolVersion < MIN_PROTOCOL_VERSION) {
+        return '대전 프로토콜이 오래되었습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+    }
+    if (balanceVersion === null || balanceVersion < MIN_BALANCE_VERSION) {
+        return '대전 밸런스 데이터가 오래되었습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+    }
+    return null;
+}
+
 wss.on('connection', (ws) => {
     ws.roomCode = null;
     ws.role = null; // 'host' | 'guest'
@@ -111,6 +163,18 @@ wss.on('connection', (ws) => {
 
         if (!msg || typeof msg.type !== 'string' || !ALL_TYPES.has(msg.type)) return;
         if (!rateLimitOk(ws, msg.type)) return;
+        const compatibilityMessage = compatibilityError(msg);
+        if (compatibilityMessage) {
+            send(ws, {
+                type: 'error',
+                code: 'update_required',
+                message: compatibilityMessage,
+                requiredVersionCode: MIN_CLIENT_VERSION_CODE,
+                requiredProtocolVersion: MIN_PROTOCOL_VERSION,
+                requiredBalanceVersion: MIN_BALANCE_VERSION,
+            });
+            return;
+        }
 
         switch (msg.type) {
             case 'ping_check': {
