@@ -34,7 +34,7 @@ const LOBBY_TYPES = new Set([
 
 const GAME_TYPES = new Set([
     'game_start', 'game_ready', 'game_state', 'game_skill', 'game_damage',
-    'game_state_hp', 'game_over', 'game_start_failed', 'rematch_accept', 'rematch_decline',
+    'game_state_hp', 'game_emote', 'game_over', 'game_start_failed', 'rematch_accept', 'rematch_decline',
     'rematch_request', 'rematch_cancel', 'rematch_reselect', 'rematch_ready',
 ]);
 
@@ -302,7 +302,8 @@ wss.on('connection', (ws) => {
             case 'game_state':
             case 'game_skill':
             case 'game_damage':
-            case 'game_state_hp': {
+            case 'game_state_hp':
+            case 'game_emote': {
                 const code = ws.roomCode;
                 const room = rooms[code];
                 if (!room) return;
