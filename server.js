@@ -23,7 +23,7 @@ const LOBBY_TYPES = new Set([
 const GAME_TYPES = new Set([
     'game_start', 'game_ready', 'game_state', 'game_skill', 'game_damage',
     'game_state_hp', 'game_over', 'game_start_failed', 'rematch_accept', 'rematch_decline',
-    'rematch_reselect', 'rematch_ready',
+    'rematch_request', 'rematch_reselect', 'rematch_ready',
 ]);
 
 const ALL_TYPES = new Set([...LOBBY_TYPES, ...GAME_TYPES]);
@@ -229,6 +229,7 @@ wss.on('connection', (ws) => {
             case 'game_start_failed':
             case 'rematch_accept':
             case 'rematch_decline':
+            case 'rematch_request':
             case 'rematch_reselect':
             case 'rematch_ready':
             case 'game_start':
