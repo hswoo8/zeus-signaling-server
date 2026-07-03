@@ -93,8 +93,14 @@ function roomQuality(hostRttMs, guestRttMs) {
     const pingMs = Math.round(hostRttMs + guestRttMs);
     return {
         pingMs,
-        quality: pingMs > 150 ? 'poor' : 'good',
+        quality: pingMs <= 120 ? 'good' : (pingMs <= 240 ? 'casual' : 'poor'),
     };
+}
+
+function smoothedRttMs(previous, sample) {
+    if (!Number.isFinite(sample)) return previous;
+    if (!Number.isFinite(previous)) return sample;
+    return Math.round(previous * 0.65 + sample * 0.35);
 }
 
 function rateLimitBucket(type) {
@@ -183,9 +189,9 @@ wss.on('connection', (ws) => {
                     Number.isFinite(reportedRttMs) &&
                     reportedRttMs >= 0 &&
                     reportedRttMs < 60000) {
-                    ws.lastRttMs = reportedRttMs;
+                    ws.lastRttMs = smoothedRttMs(ws.lastRttMs, reportedRttMs);
                     if (ws.role === 'host' && ws.roomCode && rooms[ws.roomCode]) {
-                        rooms[ws.roomCode].hostRttMs = reportedRttMs;
+                        rooms[ws.roomCode].hostRttMs = ws.lastRttMs;
                     }
                 }
                 send(ws, { type: 'ping_check_ack', clientTime: msg.clientTime, serverTime: Date.now() });
