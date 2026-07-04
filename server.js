@@ -1,7 +1,12 @@
+const http = require('http');
 const WebSocket = require('ws');
+const packageJson = require('./package.json');
 
 const PORT = process.env.PORT || 8080;
 const MAX_MSG_BYTES = Number(process.env.MAX_MSG_BYTES || 16 * 1024);
+const HTTP_BODY_LIMIT_BYTES = Number(process.env.HTTP_BODY_LIMIT_BYTES || MAX_MSG_BYTES);
+const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 15000);
+const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS || 45000);
 const RATE_LIMIT_WINDOW_MS = 10000;
 const RATE_LIMITS = {
     lobby: Number(process.env.RATE_LIMIT_LOBBY_MAX || 120),
@@ -22,10 +27,21 @@ const MIN_BALANCE_VERSION = envInt(
     1
 );
 const NETWORK_MODES = new Set(['auto', 'relay', 'p2p']);
-const wss = new WebSocket.Server({ port: PORT });
+const server = http.createServer((req, res) => {
+    handleHttpRequest(req, res).catch((err) => {
+        console.error('[http] unexpected error:', err?.message || err);
+        sendJson(res, 500, {
+            error: { code: 'internal_error', message: 'Internal server error' },
+        });
+    });
+});
+const wss = new WebSocket.Server({ server });
 
 // rooms[roomCode] = { host, guest, networkMode, hostCharacterId, hostPassiveId, arenaId, matchId }
 const rooms = {};
+const statsPlayers = new Map();
+const statsIdempotency = new Map();
+let serverMatchCounter = 0;
 
 const LOBBY_TYPES = new Set([
     'create_room', 'join_room', 'get_room_list', 'ping_check',
@@ -62,6 +78,573 @@ function send(ws, data) {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(data));
     }
+}
+
+function markSocketAlive(ws) {
+    ws.isAlive = true;
+    ws.lastSeenAt = Date.now();
+}
+
+function sendJson(res, statusCode, data) {
+    const body = JSON.stringify(data);
+    res.writeHead(statusCode, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+    });
+    res.end(body);
+}
+
+function sendHttpError(res, statusCode, code, message) {
+    sendJson(res, statusCode, { error: { code, message } });
+}
+
+function readJsonBody(req) {
+    return new Promise((resolve, reject) => {
+        const contentType = String(req.headers['content-type'] || '').toLowerCase();
+        if (!contentType.includes('application/json')) {
+            reject(Object.assign(new Error('Content-Type must be application/json'), { statusCode: 415, code: 'unsupported_media_type' }));
+            return;
+        }
+
+        let raw = '';
+        req.setEncoding('utf8');
+        req.on('data', (chunk) => {
+            raw += chunk;
+            if (Buffer.byteLength(raw, 'utf8') > HTTP_BODY_LIMIT_BYTES) {
+                reject(Object.assign(new Error('Request body too large'), { statusCode: 413, code: 'payload_too_large' }));
+                req.destroy();
+            }
+        });
+        req.on('end', () => {
+            try {
+                resolve(raw.trim() ? JSON.parse(raw) : {});
+            } catch {
+                reject(Object.assign(new Error('Malformed JSON body'), { statusCode: 400, code: 'invalid_json' }));
+            }
+        });
+        req.on('error', (err) => reject(err));
+    });
+}
+
+async function handleHttpRequest(req, res) {
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const pathname = url.pathname;
+
+    if (req.method === 'GET' && pathname === '/health') {
+        sendJson(res, 200, {
+            ok: true,
+            service: 'beerock-signaling-server',
+            version: packageJson.version || '1.0.0',
+            uptimeSec: Math.floor(process.uptime()),
+            storage: 'memory',
+            rooms: Object.keys(rooms).length,
+            players: statsPlayers.size,
+        });
+        return;
+    }
+
+    if (req.method === 'POST' && pathname === '/matches/result') {
+        const body = await readJsonRequest(req, res);
+        if (!body) return;
+        handleSingleMatchResult(res, body);
+        return;
+    }
+
+    if (req.method === 'POST' && pathname === '/matches/pvp-result') {
+        const body = await readJsonRequest(req, res);
+        if (!body) return;
+        handlePvpMatchResult(res, body);
+        return;
+    }
+
+    if (req.method === 'GET' && pathname === '/rankings') {
+        const mode = normalizeMode(url.searchParams.get('mode') || 'single');
+        if (!mode) {
+            sendHttpError(res, 400, 'invalid_request', 'mode must be single or multi');
+            return;
+        }
+        const limit = parseBoundedInt(url.searchParams.get('limit'), 50, 1, 100);
+        const offset = parseBoundedInt(url.searchParams.get('offset'), 0, 0, 1000000);
+        sendJson(res, 200, rankingsResponse(mode, limit, offset));
+        return;
+    }
+
+    const playerStatsMatch = pathname.match(/^\/players\/([^/]+)\/stats$/);
+    if (req.method === 'GET' && playerStatsMatch) {
+        const mode = normalizeMode(url.searchParams.get('mode') || 'single');
+        if (!mode) {
+            sendHttpError(res, 400, 'invalid_request', 'mode must be single or multi');
+            return;
+        }
+        const playerRef = decodeURIComponent(playerStatsMatch[1]);
+        const player = findPlayerByRef(mode, playerRef);
+        if (!player) {
+            sendHttpError(res, 404, 'player_not_found', 'Player stats were not found');
+            return;
+        }
+        sendJson(res, 200, playerStatsResponse(player, rankForPlayer(mode, player.key)));
+        return;
+    }
+
+    if (['/matches/result', '/matches/pvp-result'].includes(pathname) ||
+        pathname === '/health' ||
+        pathname === '/rankings' ||
+        playerStatsMatch) {
+        sendHttpError(res, 405, 'method_not_allowed', 'Method not allowed');
+        return;
+    }
+
+    sendHttpError(res, 404, 'not_found', 'Route not found');
+}
+
+async function readJsonRequest(req, res) {
+    try {
+        return await readJsonBody(req);
+    } catch (err) {
+        sendHttpError(
+            res,
+            err.statusCode || 400,
+            err.code || 'invalid_request',
+            err.message || 'Invalid request'
+        );
+        return null;
+    }
+}
+
+function normalizeMode(value) {
+    return value === 'single' || value === 'multi' ? value : null;
+}
+
+function parseBoundedInt(value, fallback, min, max) {
+    const parsed = Number.parseInt(value || '', 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(max, Math.max(min, parsed));
+}
+
+function makeServerMatchId() {
+    serverMatchCounter += 1;
+    const now = Date.now().toString(36).toUpperCase();
+    const seq = serverMatchCounter.toString(36).toUpperCase().padStart(4, '0');
+    const random = Math.random().toString(36).slice(2, 8).toUpperCase();
+    return `srv_${now}_${seq}_${random}`;
+}
+
+function normalizeNicknameInput(value, fallback = null) {
+    if (typeof value !== 'string') return fallback;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > 24 || /[\u0000-\u001F\u007F]/.test(trimmed)) return fallback;
+    return trimmed;
+}
+
+function nicknameKey(value) {
+    return normalizeNicknameInput(value, '')?.toLocaleLowerCase('en-US') || '';
+}
+
+function normalizePlayerId(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > 128 || /[\u0000-\u001F\u007F]/.test(trimmed)) return null;
+    return trimmed;
+}
+
+function playerIdentityKey(player) {
+    const playerId = normalizePlayerId(player?.playerId);
+    if (playerId) return `id:${playerId}`;
+    const nick = nicknameKey(player?.nickname);
+    return nick ? `name:${nick}` : null;
+}
+
+function statsKey(mode, identityKey) {
+    return `${mode}:${identityKey}`;
+}
+
+function validEnumToken(value, required = false) {
+    if (value === undefined || value === null || value === '') return !required;
+    return typeof value === 'string' && /^[A-Z0-9_]+$/.test(value);
+}
+
+function validStringId(value) {
+    if (value === undefined || value === null || value === '') return true;
+    return typeof value === 'string' && value.length <= 128 && !/[\u0000-\u001F\u007F]/.test(value);
+}
+
+function validIsoTime(value) {
+    if (value === undefined || value === null || value === '') return true;
+    if (typeof value !== 'string' || Number.isNaN(Date.parse(value))) return false;
+    return value.endsWith('Z');
+}
+
+function intField(value, min, max) {
+    return Number.isInteger(value) && value >= min && value <= max;
+}
+
+function outcomeValue(value) {
+    return value === 'win' || value === 'loss' || value === 'draw' ? value : null;
+}
+
+function reverseOutcome(outcome) {
+    if (outcome === 'win') return 'loss';
+    if (outcome === 'loss') return 'win';
+    return 'draw';
+}
+
+function rewardForResult(outcome, finishReason) {
+    if (outcome === 'loss') return 0;
+    if (outcome === 'draw') return 25;
+    if (finishReason === 'remote_disconnect' || finishReason === 'remote_forfeit') return 20;
+    return 100;
+}
+
+function ratingDelta(outcome, mode) {
+    if (outcome === 'win') return mode === 'multi' ? 16 : 16;
+    if (outcome === 'loss') return mode === 'multi' ? -16 : -12;
+    return mode === 'multi' ? 1 : 2;
+}
+
+function getOrCreatePlayer(mode, playerInput) {
+    const nickname = normalizeNicknameInput(playerInput.nickname, 'Player');
+    const identityKey = playerIdentityKey({ ...playerInput, nickname });
+    if (!identityKey) return null;
+    const key = statsKey(mode, identityKey);
+    let player = statsPlayers.get(key);
+    if (!player) {
+        player = {
+            key,
+            mode,
+            playerId: normalizePlayerId(playerInput.playerId),
+            nickname,
+            nicknameKey: nicknameKey(nickname),
+            rating: 1000,
+            wins: 0,
+            losses: 0,
+            draws: 0,
+            currentStreak: 0,
+            bestStreak: 0,
+            totalDurationSec: 0,
+            characterCounts: new Map(),
+            lastPlayedAt: null,
+            coinsEarned: 0,
+        };
+        statsPlayers.set(key, player);
+    } else {
+        player.nickname = nickname;
+        player.nicknameKey = nicknameKey(nickname);
+        player.playerId = normalizePlayerId(playerInput.playerId) || player.playerId;
+    }
+    return player;
+}
+
+function applyPlayerResult(player, outcome, metadata) {
+    player.rating = Math.max(0, player.rating + ratingDelta(outcome, player.mode));
+    if (outcome === 'win') {
+        player.wins += 1;
+        player.currentStreak = Math.max(1, player.currentStreak + 1);
+        player.bestStreak = Math.max(player.bestStreak, player.currentStreak);
+    } else if (outcome === 'loss') {
+        player.losses += 1;
+        player.currentStreak = Math.min(-1, player.currentStreak - 1);
+    } else {
+        player.draws += 1;
+        player.currentStreak = 0;
+    }
+    player.totalDurationSec += metadata.durationSec;
+    if (metadata.characterId) {
+        player.characterCounts.set(
+            metadata.characterId,
+            (player.characterCounts.get(metadata.characterId) || 0) + 1
+        );
+    }
+    player.lastPlayedAt = metadata.completedAt;
+    player.coinsEarned += metadata.rewardCoins || 0;
+}
+
+function favoriteCharacterId(player) {
+    let bestId = null;
+    let bestCount = -1;
+    for (const [id, count] of player.characterCounts.entries()) {
+        if (count > bestCount || (count === bestCount && (bestId === null || id < bestId))) {
+            bestId = id;
+            bestCount = count;
+        }
+    }
+    return bestId;
+}
+
+function playerMatchCount(player) {
+    return player.wins + player.losses + player.draws;
+}
+
+function winRate(player) {
+    const matches = playerMatchCount(player);
+    return matches > 0 ? Math.round((player.wins / matches) * 1000) / 10 : 0;
+}
+
+function averageDurationSec(player) {
+    const matches = playerMatchCount(player);
+    return matches > 0 ? Math.round((player.totalDurationSec / matches) * 10) / 10 : 0;
+}
+
+function rankedPlayers(mode) {
+    return Array.from(statsPlayers.values())
+        .filter((player) => player.mode === mode)
+        .sort((a, b) => {
+            if (b.rating !== a.rating) return b.rating - a.rating;
+            if (b.wins !== a.wins) return b.wins - a.wins;
+            if (winRate(b) !== winRate(a)) return winRate(b) - winRate(a);
+            return a.nicknameKey.localeCompare(b.nicknameKey);
+        });
+}
+
+function rankForPlayer(mode, key) {
+    const rows = rankedPlayers(mode);
+    const index = rows.findIndex((player) => player.key === key);
+    return index >= 0 ? index + 1 : null;
+}
+
+function playerRankRow(player, rank) {
+    const matches = playerMatchCount(player);
+    return {
+        rank,
+        nickname: player.nickname,
+        playerId: player.playerId || null,
+        rating: player.rating,
+        wins: player.wins,
+        losses: player.losses,
+        draws: player.draws,
+        matches,
+        winRate: winRate(player),
+        bestStreak: player.bestStreak,
+        lastPlayedAt: player.lastPlayedAt,
+    };
+}
+
+function playerStatsResponse(player, rank) {
+    return {
+        nickname: player.nickname,
+        playerId: player.playerId || null,
+        rating: player.rating,
+        rank,
+        wins: player.wins,
+        losses: player.losses,
+        draws: player.draws,
+        matches: playerMatchCount(player),
+        winRate: winRate(player),
+        bestStreak: player.bestStreak,
+        currentStreak: player.currentStreak,
+        averageDurationSec: averageDurationSec(player),
+        favoriteCharacterId: favoriteCharacterId(player),
+        coinsEarned: player.coinsEarned,
+        lastPlayedAt: player.lastPlayedAt,
+    };
+}
+
+function pvpPlayerSummary(player, rewardCoins) {
+    return {
+        nickname: player.nickname,
+        playerId: player.playerId || null,
+        rating: player.rating,
+        wins: player.wins,
+        losses: player.losses,
+        draws: player.draws,
+        rewardCoins,
+    };
+}
+
+function pvpResponseFromRecord(record, localIdentity, remoteIdentity, duplicate = false) {
+    const local = record.players[localIdentity] || record.players.local;
+    const remote = record.players[remoteIdentity] || record.players.remote;
+    return {
+        matchId: record.matchId,
+        accepted: true,
+        mode: 'multi',
+        finishReason: record.finishReason,
+        players: {
+            local,
+            remote,
+        },
+        ...(duplicate ? { duplicate: true } : {}),
+    };
+}
+
+function rankingsResponse(mode, limit, offset) {
+    const rows = rankedPlayers(mode).map((player, index) => playerRankRow(player, index + 1));
+    return {
+        mode,
+        limit,
+        offset,
+        players: rows.slice(offset, offset + limit),
+    };
+}
+
+function findPlayerByRef(mode, ref) {
+    const safeRef = normalizePlayerId(ref);
+    if (!safeRef) return null;
+    const byId = statsPlayers.get(statsKey(mode, `id:${safeRef}`));
+    if (byId) return byId;
+    const byName = statsPlayers.get(statsKey(mode, `name:${nicknameKey(safeRef)}`));
+    if (byName) return byName;
+    return Array.from(statsPlayers.values()).find(
+        (player) => player.mode === mode && player.nicknameKey === nicknameKey(safeRef)
+    ) || null;
+}
+
+function validateCommonResult(body, mode) {
+    if (!normalizeMode(mode)) return 'mode must be single or multi';
+    if (!outcomeValue(body.outcome)) return 'outcome must be win, loss, or draw';
+    if (!intField(body.durationSec, 1, 3600)) return 'durationSec must be between 1 and 3600';
+    if (!validStringId(body.clientMatchId)) return 'clientMatchId is invalid';
+    if (!validStringId(body.serverMatchId)) return 'serverMatchId is invalid';
+    if (!validIsoTime(body.completedAt)) return 'completedAt must be an ISO-8601 UTC timestamp';
+    if (!validEnumToken(body.arenaId, false)) return 'arenaId is invalid';
+    return null;
+}
+
+function validatePlayerPayload(player, prefix) {
+    if (!player || typeof player !== 'object') return `${prefix} is required`;
+    if (!normalizeNicknameInput(player.nickname)) return `${prefix}.nickname is invalid`;
+    if (!validStringId(player.playerId)) return `${prefix}.playerId is invalid`;
+    if (!validEnumToken(player.characterId, true)) return `${prefix}.characterId is invalid`;
+    if (!validEnumToken(player.passiveId, false)) return `${prefix}.passiveId is invalid`;
+    if (!intField(player.hp, 0, 9999)) return `${prefix}.hp must be between 0 and 9999`;
+    return null;
+}
+
+function handleSingleMatchResult(res, body) {
+    if (body.mode !== 'single') {
+        sendHttpError(res, 400, 'invalid_request', 'mode must be single on /matches/result');
+        return;
+    }
+    const commonError = validateCommonResult(body, 'single');
+    const playerError = validatePlayerPayload({
+        nickname: body.nickname,
+        playerId: body.playerId,
+        characterId: body.characterId,
+        passiveId: body.passiveId,
+        hp: body.localHp,
+    }, 'player');
+    if (commonError || playerError || !intField(body.remoteHp, 0, 9999)) {
+        sendHttpError(res, 400, 'invalid_request', commonError || playerError || 'remoteHp must be between 0 and 9999');
+        return;
+    }
+
+    const player = getOrCreatePlayer('single', {
+        nickname: body.nickname,
+        playerId: body.playerId,
+    });
+    const clientMatchId = normalizePlayerId(body.clientMatchId);
+    const duplicateKey = clientMatchId ? `single:${player.key}:${clientMatchId}` : null;
+    if (duplicateKey && statsIdempotency.has(duplicateKey)) {
+        sendJson(res, 200, statsIdempotency.get(duplicateKey));
+        return;
+    }
+
+    const outcome = outcomeValue(body.outcome);
+    const completedAt = body.completedAt || new Date().toISOString();
+    const rewardCoins = rewardForResult(outcome, body.finishReason);
+    applyPlayerResult(player, outcome, {
+        durationSec: body.durationSec,
+        characterId: body.characterId,
+        completedAt,
+        rewardCoins,
+    });
+    const response = {
+        matchId: makeServerMatchId(),
+        accepted: true,
+        mode: 'single',
+        rewardCoins,
+        player: {
+            nickname: player.nickname,
+            playerId: player.playerId || null,
+            rating: player.rating,
+            wins: player.wins,
+            losses: player.losses,
+            draws: player.draws,
+            rewardCoins,
+        },
+    };
+    if (duplicateKey) statsIdempotency.set(duplicateKey, { ...response, duplicate: true });
+    sendJson(res, 201, response);
+}
+
+function handlePvpMatchResult(res, body) {
+    const mode = body.mode === undefined ? 'multi' : body.mode;
+    if (mode !== 'multi') {
+        sendHttpError(res, 400, 'invalid_request', 'mode must be multi on /matches/pvp-result');
+        return;
+    }
+    const commonError = validateCommonResult(body, 'multi');
+    const localError = validatePlayerPayload(body.localPlayer, 'localPlayer');
+    const remoteError = validatePlayerPayload(body.remotePlayer, 'remotePlayer');
+    if (commonError || localError || remoteError) {
+        sendHttpError(res, 400, 'invalid_request', commonError || localError || remoteError);
+        return;
+    }
+
+    const localIdentity = playerIdentityKey(body.localPlayer);
+    const remoteIdentity = playerIdentityKey(body.remotePlayer);
+    if (!localIdentity || !remoteIdentity || localIdentity === remoteIdentity) {
+        sendHttpError(res, 400, 'invalid_request', 'localPlayer and remotePlayer must be different');
+        return;
+    }
+
+    const matchRef = normalizePlayerId(body.serverMatchId) || normalizePlayerId(body.clientMatchId);
+    const duplicateKey = matchRef ? `multi:${matchRef}` : null;
+    if (duplicateKey && statsIdempotency.has(duplicateKey)) {
+        const record = statsIdempotency.get(duplicateKey);
+        if (record?.type === 'pvp') {
+            sendJson(res, 200, pvpResponseFromRecord(record, localIdentity, remoteIdentity, true));
+        } else {
+            sendJson(res, 200, { ...record, duplicate: true });
+        }
+        return;
+    }
+
+    const outcome = outcomeValue(body.outcome);
+    const remoteOutcome = reverseOutcome(outcome);
+    const completedAt = body.completedAt || new Date().toISOString();
+    const finishReason = typeof body.finishReason === 'string' ? body.finishReason : 'normal';
+    const localReward = rewardForResult(outcome, finishReason);
+    const remoteReward = rewardForResult(remoteOutcome, finishReason);
+    const local = getOrCreatePlayer('multi', body.localPlayer);
+    const remote = getOrCreatePlayer('multi', body.remotePlayer);
+
+    applyPlayerResult(local, outcome, {
+        durationSec: body.durationSec,
+        characterId: body.localPlayer.characterId,
+        completedAt,
+        rewardCoins: localReward,
+    });
+    applyPlayerResult(remote, remoteOutcome, {
+        durationSec: body.durationSec,
+        characterId: body.remotePlayer.characterId,
+        completedAt,
+        rewardCoins: remoteReward,
+    });
+
+    const matchId = matchRef || makeServerMatchId();
+    const record = {
+        type: 'pvp',
+        matchId,
+        finishReason,
+        players: {
+            [localIdentity]: pvpPlayerSummary(local, localReward),
+            [remoteIdentity]: pvpPlayerSummary(remote, remoteReward),
+            local: pvpPlayerSummary(local, localReward),
+            remote: pvpPlayerSummary(remote, remoteReward),
+        },
+    };
+    const response = {
+        matchId,
+        accepted: true,
+        mode: 'multi',
+        finishReason,
+        players: {
+            local: record.players[localIdentity],
+            remote: record.players[remoteIdentity],
+        },
+    };
+    if (duplicateKey) statsIdempotency.set(duplicateKey, record);
+    sendJson(res, 201, response);
 }
 
 function makeMatchId() {
@@ -155,8 +738,14 @@ function compatibilityError(msg) {
 wss.on('connection', (ws) => {
     ws.roomCode = null;
     ws.role = null; // 'host' | 'guest'
+    markSocketAlive(ws);
+
+    ws.on('pong', () => {
+        markSocketAlive(ws);
+    });
 
     ws.on('message', (raw) => {
+        markSocketAlive(ws);
         if (typeof raw !== 'string' && !Buffer.isBuffer(raw)) return;
         const text = raw.toString();
         if (text.length > MAX_MSG_BYTES) return;
@@ -343,4 +932,28 @@ wss.on('connection', (ws) => {
     });
 });
 
-console.log(`Signaling server running on port ${PORT}`);
+const heartbeatInterval = setInterval(() => {
+    const now = Date.now();
+    wss.clients.forEach((ws) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        const lastSeenAt = Number.isFinite(ws.lastSeenAt) ? ws.lastSeenAt : now;
+        if (now - lastSeenAt > HEARTBEAT_TIMEOUT_MS) {
+            ws.terminate();
+            return;
+        }
+        ws.isAlive = false;
+        try {
+            ws.ping();
+        } catch {
+            ws.terminate();
+        }
+    });
+}, HEARTBEAT_INTERVAL_MS);
+
+wss.on('close', () => {
+    clearInterval(heartbeatInterval);
+});
+
+server.listen(PORT, () => {
+    console.log(`Signaling server running on port ${PORT}`);
+});
