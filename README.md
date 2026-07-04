@@ -13,6 +13,8 @@ Set these environment variables in production to block outdated multiplayer clie
 | `MULTIPLAYER_MIN_BALANCE_VERSION` | `1` | Minimum gameplay balance/data version |
 | `HEARTBEAT_INTERVAL_MS` | `15000` | Server WebSocket ping interval |
 | `HEARTBEAT_TIMEOUT_MS` | `45000` | Time since last message/pong before a socket is terminated |
+| `DATABASE_URL` | unset | PostgreSQL connection string. When set, match results/rankings use Postgres instead of memory |
+| `PGSSL` / `PGSSLMODE` | unset | Set `PGSSL=true` or `PGSSLMODE=require` if the Postgres provider requires SSL |
 
 If a client is missing or below these values, the server returns `{ type: "error", code: "update_required", message }`.
 
@@ -38,14 +40,19 @@ Room quality uses smoothed client-reported RTT samples. Server labels are `good`
 
 ## HTTP stats API
 
-The same process also exposes memory-backed HTTP JSON APIs. This is an MVP contract layer; data is lost on server restart until a database is added.
+The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the server creates and uses PostgreSQL tables. Without `DATABASE_URL`, it falls back to process-local memory for local development and data is lost on restart.
 
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/health` | Process health, version, storage mode, room/player counts |
 | `POST` | `/matches/result` | Store a single-player result for one player |
 | `POST` | `/matches/pvp-result` | Store a PvP result for both players and return local reward/MMR data |
-| `GET` | `/rankings?mode=single|multi` | Return memory-backed ranking rows |
+| `GET` | `/rankings?mode=single|multi` | Return ranking rows from the active stats storage |
 | `GET` | `/players/:playerIdOrNickname/stats?mode=single|multi` | Return one player's aggregate stats |
 
-PvP results prefer `playerId` as the identity key and use nickname only as a fallback/display value. Normal PvP wins return the full coin reward; disconnect/forfeit wins return reduced reward so abuse-prone outcomes can still count for MMR without becoming a farming path.
+PvP results prefer `playerId` as the identity key and use nickname only as a fallback/display value. Normal PvP wins return the full coin reward; disconnect/forfeit wins return reduced reward so abuse-prone outcomes can still count for MMR without becoming a farming path. Duplicate `serverMatchId`/`clientMatchId` submissions are idempotent, so both devices can submit the same match without double-counting.
+
+PostgreSQL tables are created automatically at startup:
+
+- `br_player_stats`: aggregate MMR, wins/losses/draws, streaks, favorite character data, and coin totals.
+- `br_match_results`: idempotency records and stored result payloads.
