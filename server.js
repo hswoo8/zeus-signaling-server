@@ -9,6 +9,18 @@ const MAX_MSG_BYTES = Number(process.env.MAX_MSG_BYTES || 16 * 1024);
 const HTTP_BODY_LIMIT_BYTES = Number(process.env.HTTP_BODY_LIMIT_BYTES || MAX_MSG_BYTES);
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 15000);
 const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS || 45000);
+const MAX_CONNECTIONS = envOptionalInt(['MAX_CONNECTIONS', 'MULTIPLAYER_MAX_CONNECTIONS']);
+const MAX_ACTIVE_ROOMS = envOptionalInt(['MAX_ACTIVE_ROOMS', 'MULTIPLAYER_MAX_ACTIVE_ROOMS']);
+const MAX_ACTIVE_MATCHES = envOptionalInt(['MAX_ACTIVE_MATCHES', 'MULTIPLAYER_MAX_ACTIVE_MATCHES']);
+const CAPACITY_BUSY_RATIO = envFloat(['CAPACITY_BUSY_RATIO', 'MULTIPLAYER_CAPACITY_BUSY_RATIO'], 0.9, 0.1, 1);
+const CAPACITY_RETRY_AFTER_SEC = envInt(['CAPACITY_RETRY_AFTER_SEC', 'MULTIPLAYER_CAPACITY_RETRY_AFTER_SEC'], 30);
+const MAINTENANCE_MODE = envBool(['MAINTENANCE_MODE', 'MULTIPLAYER_MAINTENANCE'], false);
+const MAINTENANCE_MESSAGE = process.env.MAINTENANCE_MESSAGE ||
+    process.env.MULTIPLAYER_MAINTENANCE_MESSAGE ||
+    '대전 서버 점검 중입니다. 잠시 후 다시 시도해주세요.';
+const SERVER_BUSY_MESSAGE = process.env.SERVER_BUSY_MESSAGE ||
+    process.env.MULTIPLAYER_SERVER_BUSY_MESSAGE ||
+    '현재 대전 서버가 혼잡합니다. 잠시 후 다시 시도해주세요.';
 const RATE_LIMIT_WINDOW_MS = 10000;
 const RATE_LIMITS = {
     lobby: Number(process.env.RATE_LIMIT_LOBBY_MAX || 120),
@@ -72,6 +84,32 @@ function envInt(names, fallback) {
     for (const name of names) {
         const parsed = Number.parseInt(process.env[name] || '', 10);
         if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return fallback;
+}
+
+function envOptionalInt(names) {
+    for (const name of names) {
+        const parsed = Number.parseInt(process.env[name] || '', 10);
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return 0;
+}
+
+function envFloat(names, fallback, min, max) {
+    for (const name of names) {
+        const parsed = Number.parseFloat(process.env[name] || '');
+        if (Number.isFinite(parsed)) return Math.min(max, Math.max(min, parsed));
+    }
+    return fallback;
+}
+
+function envBool(names, fallback) {
+    for (const name of names) {
+        const raw = String(process.env[name] || '').trim().toLowerCase();
+        if (!raw) continue;
+        if (['1', 'true', 'yes', 'on'].includes(raw)) return true;
+        if (['0', 'false', 'no', 'off'].includes(raw)) return false;
     }
     return fallback;
 }
@@ -156,6 +194,120 @@ function sendHttpError(res, statusCode, code, message) {
     sendJson(res, statusCode, { error: { code, message } });
 }
 
+function openConnectionCount() {
+    return Array.from(wss.clients).filter((client) => client.readyState === WebSocket.OPEN).length;
+}
+
+function roomCounts() {
+    const roomValues = Object.values(rooms);
+    const waitingRooms = roomValues.filter((room) =>
+        room.host?.readyState === WebSocket.OPEN &&
+        !(room.guest && room.guest.readyState === WebSocket.OPEN)
+    ).length;
+    const activeMatches = roomValues.filter((room) =>
+        room.host?.readyState === WebSocket.OPEN &&
+        room.guest?.readyState === WebSocket.OPEN
+    ).length;
+    return {
+        rooms: roomValues.length,
+        waitingRooms,
+        activeMatches,
+    };
+}
+
+function limitValue(limit) {
+    return limit > 0 ? limit : null;
+}
+
+function exceedsLimit(count, limit, extra = 0) {
+    return limit > 0 && (count + extra) > limit;
+}
+
+function exceedsBusyRatio(count, limit) {
+    return limit > 0 &&
+        CAPACITY_BUSY_RATIO < 1 &&
+        count > 0 &&
+        (count / limit) >= CAPACITY_BUSY_RATIO;
+}
+
+function blockedReason(count, limit, extra = 0) {
+    if (exceedsLimit(count, limit, extra)) return 'full';
+    if (exceedsBusyRatio(count, limit, extra)) return 'busy';
+    return null;
+}
+
+function capacitySnapshot(options = {}) {
+    const connectionExtra = Number.isInteger(options.connectionExtra) ? options.connectionExtra : 1;
+    const roomStats = roomCounts();
+    const counts = {
+        connections: openConnectionCount(),
+        rooms: roomStats.rooms,
+        waitingRooms: roomStats.waitingRooms,
+        activeMatches: roomStats.activeMatches,
+    };
+    const limits = {
+        connections: limitValue(MAX_CONNECTIONS),
+        rooms: limitValue(MAX_ACTIVE_ROOMS),
+        activeMatches: limitValue(MAX_ACTIVE_MATCHES),
+        busyRatio: CAPACITY_BUSY_RATIO,
+    };
+
+    const connectReason = blockedReason(counts.connections, MAX_CONNECTIONS, connectionExtra);
+    const createReason = blockedReason(counts.rooms, MAX_ACTIVE_ROOMS, 1);
+    const joinReason = blockedReason(counts.activeMatches, MAX_ACTIVE_MATCHES, 1);
+    const canConnect = !MAINTENANCE_MODE && !connectReason;
+    const canCreateRoom = !MAINTENANCE_MODE && !createReason;
+    const canJoinRoom = !MAINTENANCE_MODE && !joinReason;
+    const canAcceptMatchmaking = canConnect && (canCreateRoom || canJoinRoom);
+
+    let status = 'available';
+    let code = 'ok';
+    let message = '대전 서버 이용 가능';
+    if (MAINTENANCE_MODE) {
+        status = 'maintenance';
+        code = 'server_maintenance';
+        message = MAINTENANCE_MESSAGE;
+    } else if (!canAcceptMatchmaking) {
+        const reason = connectReason || createReason || joinReason || 'busy';
+        status = reason === 'full' ? 'full' : 'busy';
+        code = 'server_busy';
+        message = SERVER_BUSY_MESSAGE;
+    } else if (connectReason || createReason || joinReason) {
+        status = 'busy';
+        code = 'server_busy';
+        message = SERVER_BUSY_MESSAGE;
+    }
+
+    return {
+        ok: true,
+        service: 'beerock-signaling-server',
+        version: packageJson.version || '1.0.0',
+        status,
+        code,
+        message,
+        canConnect,
+        canCreateRoom,
+        canJoinRoom,
+        canAcceptMatchmaking,
+        retryAfterSec: status === 'available' ? 0 : CAPACITY_RETRY_AFTER_SEC,
+        counts,
+        limits,
+        requiredVersionCode: MIN_CLIENT_VERSION_CODE,
+        requiredProtocolVersion: MIN_PROTOCOL_VERSION,
+        requiredBalanceVersion: MIN_BALANCE_VERSION,
+    };
+}
+
+function sendCapacityWsError(ws, snapshot) {
+    send(ws, {
+        type: 'error',
+        code: snapshot.code || 'server_busy',
+        message: snapshot.message || SERVER_BUSY_MESSAGE,
+        status: snapshot.status || 'busy',
+        retryAfterSec: snapshot.retryAfterSec || CAPACITY_RETRY_AFTER_SEC,
+    });
+}
+
 function readJsonBody(req) {
     return new Promise((resolve, reject) => {
         const contentType = String(req.headers['content-type'] || '').toLowerCase();
@@ -199,6 +351,26 @@ async function handleHttpRequest(req, res) {
             rooms: Object.keys(rooms).length,
             players,
         });
+        return;
+    }
+
+    if (req.method === 'GET' && pathname === '/capacity') {
+        const compatibilityMessage = compatibilityErrorFromQuery(url.searchParams);
+        if (compatibilityMessage) {
+            sendJson(res, 200, {
+                ...capacitySnapshot(),
+                status: 'update_required',
+                code: 'update_required',
+                message: compatibilityMessage,
+                canConnect: false,
+                canCreateRoom: false,
+                canJoinRoom: false,
+                canAcceptMatchmaking: false,
+                retryAfterSec: 0,
+            });
+            return;
+        }
+        sendJson(res, 200, capacitySnapshot());
         return;
     }
 
@@ -263,6 +435,7 @@ async function handleHttpRequest(req, res) {
 
     if (['/matches/result', '/matches/pvp-result'].includes(pathname) ||
         pathname === '/health' ||
+        pathname === '/capacity' ||
         pathname === '/rankings' ||
         playerStatsMatch) {
         sendHttpError(res, 405, 'method_not_allowed', 'Method not allowed');
@@ -1123,6 +1296,43 @@ function packetInt(msg, field) {
     return Number.isInteger(value) ? value : null;
 }
 
+function queryInt(params, field) {
+    const raw = params.get(field);
+    if (raw === null || raw === '') return null;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function clientCompatibilityError(clientVersionCode, protocolVersion, balanceVersion, requireAll) {
+    if (requireAll && clientVersionCode === null) {
+        return '앱 버전 정보를 확인할 수 없습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+    }
+    if (clientVersionCode !== null && clientVersionCode < MIN_CLIENT_VERSION_CODE) {
+        return `앱 업데이트가 필요합니다. 필요 버전 코드 ${MIN_CLIENT_VERSION_CODE} 이상에서 대전할 수 있습니다.`;
+    }
+    if (requireAll && protocolVersion === null) {
+        return '대전 프로토콜 정보를 확인할 수 없습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+    }
+    if (protocolVersion !== null && protocolVersion < MIN_PROTOCOL_VERSION) {
+        return '대전 프로토콜이 오래되었습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+    }
+    if (requireAll && balanceVersion === null) {
+        return '대전 밸런스 정보를 확인할 수 없습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+    }
+    if (balanceVersion !== null && balanceVersion < MIN_BALANCE_VERSION) {
+        return '대전 밸런스 데이터가 오래되었습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+    }
+    return null;
+}
+
+function compatibilityErrorFromQuery(params) {
+    const clientVersionCode = queryInt(params, 'clientVersionCode');
+    const protocolVersion = queryInt(params, 'protocolVersion');
+    const balanceVersion = queryInt(params, 'balanceVersion');
+    const hasAnyVersionField = clientVersionCode !== null || protocolVersion !== null || balanceVersion !== null;
+    return clientCompatibilityError(clientVersionCode, protocolVersion, balanceVersion, hasAnyVersionField);
+}
+
 function compatibilityError(msg) {
     if (!COMPATIBILITY_TYPES.has(msg.type)) return null;
 
@@ -1130,25 +1340,20 @@ function compatibilityError(msg) {
     const protocolVersion = packetInt(msg, 'protocolVersion');
     const balanceVersion = packetInt(msg, 'balanceVersion');
 
-    if (clientVersionCode === null) {
-        return '앱 버전 정보를 확인할 수 없습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
-    }
-    if (clientVersionCode < MIN_CLIENT_VERSION_CODE) {
-        return `앱 업데이트가 필요합니다. 필요 버전 코드 ${MIN_CLIENT_VERSION_CODE} 이상에서 대전할 수 있습니다.`;
-    }
-    if (protocolVersion === null || protocolVersion < MIN_PROTOCOL_VERSION) {
-        return '대전 프로토콜이 오래되었습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
-    }
-    if (balanceVersion === null || balanceVersion < MIN_BALANCE_VERSION) {
-        return '대전 밸런스 데이터가 오래되었습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
-    }
-    return null;
+    return clientCompatibilityError(clientVersionCode, protocolVersion, balanceVersion, true);
 }
 
 wss.on('connection', (ws) => {
     ws.roomCode = null;
     ws.role = null; // 'host' | 'guest'
     markSocketAlive(ws);
+
+    const connectionCapacity = capacitySnapshot({ connectionExtra: 0 });
+    if (!connectionCapacity.canConnect) {
+        sendCapacityWsError(ws, connectionCapacity);
+        ws.close(1013, connectionCapacity.status || 'server_busy');
+        return;
+    }
 
     ws.on('pong', () => {
         markSocketAlive(ws);
@@ -1200,6 +1405,11 @@ wss.on('connection', (ws) => {
 
             // ── 방 만들기 ────────────────────────────────────────────────
             case 'create_room': {
+                const capacity = capacitySnapshot({ connectionExtra: 0 });
+                if (!capacity.canCreateRoom) {
+                    sendCapacityWsError(ws, capacity);
+                    return;
+                }
                 if (ws.roomCode) {
                     send(ws, { type: 'error', message: 'Already in a room' });
                     return;
@@ -1229,6 +1439,11 @@ wss.on('connection', (ws) => {
 
             // ── 방 참가 ──────────────────────────────────────────────────
             case 'join_room': {
+                const capacity = capacitySnapshot({ connectionExtra: 0 });
+                if (!capacity.canJoinRoom) {
+                    sendCapacityWsError(ws, capacity);
+                    return;
+                }
                 const code = msg.code;
                 if (!validateJoinCode(code)) {
                     send(ws, { type: 'error', message: 'Invalid room code' });
