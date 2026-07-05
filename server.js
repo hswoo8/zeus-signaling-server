@@ -55,14 +55,14 @@ const server = http.createServer((req, res) => {
 });
 const wss = new WebSocket.Server({ server });
 
-// rooms[roomCode] = { host, guest, networkMode, hostCharacterId, hostPassiveId, arenaId, matchId }
+// rooms[roomCode] = { host, guest, networkMode, hostCharacterId, hostPassiveId, arenaId, matchId, hostNickname, guestNickname }
 const rooms = {};
 const statsPlayers = new Map();
 const statsIdempotency = new Map();
 let serverMatchCounter = 0;
 
 const LOBBY_TYPES = new Set([
-    'create_room', 'join_room', 'get_room_list', 'ping_check',
+    'create_room', 'join_room', 'get_room_list', 'ping_check', 'selection_update',
     'offer', 'answer', 'ice_candidate',
 ]);
 
@@ -77,7 +77,7 @@ const ALL_TYPES = new Set([...LOBBY_TYPES, ...GAME_TYPES]);
 
 const COMPATIBILITY_TYPES = new Set([
     'create_room', 'join_room', 'get_room_list', 'ping_check',
-    'game_start', 'game_ready', 'rematch_ready',
+    'selection_update', 'game_start', 'game_ready', 'rematch_ready',
 ]);
 
 function envInt(names, fallback) {
@@ -206,7 +206,8 @@ function roomCounts() {
     ).length;
     const activeMatches = roomValues.filter((room) =>
         room.host?.readyState === WebSocket.OPEN &&
-        room.guest?.readyState === WebSocket.OPEN
+        room.guest?.readyState === WebSocket.OPEN &&
+        room.matchStarted
     ).length;
     return {
         rooms: roomValues.length,
@@ -1426,7 +1427,15 @@ wss.on('connection', (ws) => {
                     hostCharacterId: enumToken(msg.hostCharacterId),
                     hostPassiveId: enumToken(msg.hostPassiveId),
                     arenaId: enumToken(msg.arenaId),
+                    hostNickname: typeof msg.hostNickname === 'string' ? msg.hostNickname : undefined,
+                    hostPlayerId: typeof msg.hostPlayerId === 'string' ? msg.hostPlayerId : undefined,
+                    guestCharacterId: undefined,
+                    guestPassiveId: undefined,
+                    guestArenaId: undefined,
+                    guestNickname: undefined,
+                    guestPlayerId: undefined,
                     networkMode: networkMode(msg.networkMode),
+                    matchStarted: false,
                     matchId: null,
                 };
                 ws.roomCode = code;
@@ -1461,13 +1470,37 @@ wss.on('connection', (ws) => {
                 }
 
                 room.guest = ws;
+                room.guestCharacterId = enumToken(msg.guestCharacterId);
+                room.guestPassiveId = enumToken(msg.guestPassiveId);
+                room.guestArenaId = enumToken(msg.arenaId);
+                room.guestNickname = typeof msg.guestNickname === 'string' ? msg.guestNickname : undefined;
+                room.guestPlayerId = typeof msg.guestPlayerId === 'string' ? msg.guestPlayerId : undefined;
                 if (!room.matchId) room.matchId = makeMatchId();
                 ws.roomCode = code;
                 ws.role = 'guest';
 
                 // 양쪽에게 준비 알림
-                send(ws, { type: 'room_joined', code, matchId: room.matchId, networkMode: room.networkMode || 'relay' });
-                send(room.host, { type: 'guest_joined', matchId: room.matchId, networkMode: room.networkMode || 'relay' });
+                send(ws, {
+                    type: 'room_joined',
+                    code,
+                    matchId: room.matchId,
+                    networkMode: room.networkMode || 'relay',
+                    hostCharacterId: room.hostCharacterId,
+                    hostPassiveId: room.hostPassiveId,
+                    arenaId: room.arenaId,
+                    hostNickname: room.hostNickname,
+                    hostPlayerId: room.hostPlayerId,
+                });
+                send(room.host, {
+                    type: 'guest_joined',
+                    matchId: room.matchId,
+                    networkMode: room.networkMode || 'relay',
+                    guestCharacterId: room.guestCharacterId,
+                    guestPassiveId: room.guestPassiveId,
+                    arenaId: room.guestArenaId,
+                    guestNickname: room.guestNickname,
+                    guestPlayerId: room.guestPlayerId,
+                });
                 console.log(`[+] Room joined: ${code}`);
                 break;
             }
@@ -1483,6 +1516,30 @@ wss.on('connection', (ws) => {
 
                 const peer = ws.role === 'host' ? room.guest : room.host;
                 send(peer, msg); // 메시지 타입 유지하여 그대로 전달
+                break;
+            }
+
+            case 'selection_update': {
+                const code = ws.roomCode;
+                const room = rooms[code];
+                if (!room) return;
+
+                if (ws.role === 'host') {
+                    room.hostCharacterId = enumToken(msg.characterId) || room.hostCharacterId;
+                    room.hostPassiveId = enumToken(msg.passiveId) || room.hostPassiveId;
+                    room.arenaId = enumToken(msg.arenaId) || room.arenaId;
+                    room.hostNickname = typeof msg.nickname === 'string' ? msg.nickname : room.hostNickname;
+                    room.hostPlayerId = typeof msg.playerId === 'string' ? msg.playerId : room.hostPlayerId;
+                } else if (ws.role === 'guest') {
+                    room.guestCharacterId = enumToken(msg.characterId) || room.guestCharacterId;
+                    room.guestPassiveId = enumToken(msg.passiveId) || room.guestPassiveId;
+                    room.guestArenaId = enumToken(msg.arenaId) || room.guestArenaId;
+                    room.guestNickname = typeof msg.nickname === 'string' ? msg.nickname : room.guestNickname;
+                    room.guestPlayerId = typeof msg.playerId === 'string' ? msg.playerId : room.guestPlayerId;
+                }
+
+                const peer = ws.role === 'host' ? room.guest : room.host;
+                send(peer, msg);
                 break;
             }
 
@@ -1531,6 +1588,9 @@ wss.on('connection', (ws) => {
                 const room = rooms[code];
                 if (!room) return;
 
+                if (msg.type === 'game_start') {
+                    room.matchStarted = true;
+                }
                 const peer = ws.role === 'host' ? room.guest : room.host;
                 send(peer, msg);
                 break;
@@ -1546,6 +1606,50 @@ wss.on('connection', (ws) => {
         if (!code || !rooms[code]) return;
 
         const room = rooms[code];
+
+        if (ws.role === 'guest' && !room.matchStarted) {
+            send(room.host, { type: 'peer_disconnected' });
+            room.guest = null;
+            room.guestCharacterId = undefined;
+            room.guestPassiveId = undefined;
+            room.guestArenaId = undefined;
+            room.guestNickname = undefined;
+            room.guestPlayerId = undefined;
+            room.matchId = null;
+            console.log(`[-] Guest left waiting room: ${code}`);
+            return;
+        }
+
+        if (ws.role === 'host' &&
+            !room.matchStarted &&
+            room.guest?.readyState === WebSocket.OPEN) {
+            const promotedHost = room.guest;
+            room.host = promotedHost;
+            room.guest = null;
+            room.hostRttMs = socketRttMs(promotedHost);
+            room.hostCharacterId = room.guestCharacterId;
+            room.hostPassiveId = room.guestPassiveId;
+            room.arenaId = room.guestArenaId || room.arenaId;
+            room.hostNickname = room.guestNickname;
+            room.hostPlayerId = room.guestPlayerId;
+            room.guestCharacterId = undefined;
+            room.guestPassiveId = undefined;
+            room.guestArenaId = undefined;
+            room.guestNickname = undefined;
+            room.guestPlayerId = undefined;
+            room.matchId = null;
+            promotedHost.role = 'host';
+            promotedHost.roomCode = code;
+            send(promotedHost, {
+                type: 'host_migrated',
+                code,
+                networkMode: room.networkMode || 'relay',
+                arenaId: room.arenaId,
+            });
+            console.log(`[~] Host migrated after waiting host left: ${code}`);
+            return;
+        }
+
         const peer = ws.role === 'host' ? room.guest : room.host;
 
         // 상대방에게 연결 끊김 알림

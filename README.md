@@ -30,11 +30,12 @@ If capacity or maintenance gates block entry, the server returns `{ type: "error
 
 | type | Direction | Description |
 | --- | --- | --- |
-| `create_room` | Client -> Server | Create room with compatibility metadata and `{ hostCharacterId, hostPassiveId, arenaId, networkMode }`; missing/invalid `networkMode` becomes `relay` |
+| `create_room` | Client -> Server | Create room with compatibility metadata and `{ hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId, networkMode }`; missing/invalid `networkMode` becomes `relay` |
 | `room_created` | Server -> Host | `{ code, networkMode }` |
-| `join_room` | Client -> Server | Compatibility metadata and `{ code }` |
-| `room_joined` | Server -> Guest | `{ code, matchId, networkMode }` |
-| `guest_joined` | Server -> Host | `{ matchId, networkMode }` |
+| `join_room` | Client -> Server | Compatibility metadata and `{ code, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
+| `room_joined` | Server -> Guest | `{ code, matchId, networkMode, hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId }` |
+| `guest_joined` | Server -> Host | `{ matchId, networkMode, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
+| `selection_update` | Client -> Server -> Peer | Live setup selection and ready state: `{ characterId, passiveId, arenaId, nickname, playerId, ready, networkMode }` |
 | `ping_check` | Client -> Server | `{ clientTime, rttMs? }` |
 | `ping_check_ack` | Server -> Client | `{ clientTime, serverTime }` |
 | `get_room_list` | Client -> Server | Open rooms |
