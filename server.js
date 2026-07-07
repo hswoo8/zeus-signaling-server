@@ -9,6 +9,7 @@ const MAX_MSG_BYTES = Number(process.env.MAX_MSG_BYTES || 16 * 1024);
 const HTTP_BODY_LIMIT_BYTES = Number(process.env.HTTP_BODY_LIMIT_BYTES || MAX_MSG_BYTES);
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 15000);
 const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS || 45000);
+const ROOM_READY_TIMEOUT_MS = envInt(['ROOM_READY_TIMEOUT_MS', 'READY_TIMEOUT_MS'], 90000);
 const MAX_CONNECTIONS = envOptionalInt(['MAX_CONNECTIONS', 'MULTIPLAYER_MAX_CONNECTIONS']);
 const MAX_ACTIVE_ROOMS = envOptionalInt(['MAX_ACTIVE_ROOMS', 'MULTIPLAYER_MAX_ACTIVE_ROOMS']);
 const MAX_ACTIVE_MATCHES = envOptionalInt(['MAX_ACTIVE_MATCHES', 'MULTIPLAYER_MAX_ACTIVE_MATCHES']);
@@ -55,7 +56,7 @@ const server = http.createServer((req, res) => {
 });
 const wss = new WebSocket.Server({ server });
 
-// rooms[roomCode] = { host, guest, networkMode, hostCharacterId, hostPassiveId, arenaId, matchId, hostNickname, guestNickname }
+// rooms[roomCode] = { host, guest, networkMode, hostCharacterId, hostPassiveId, arenaId, matchId, hostNickname, guestNickname, readyDeadlineAt }
 const rooms = {};
 const statsPlayers = new Map();
 const statsIdempotency = new Map();
@@ -1271,6 +1272,118 @@ function smoothedRttMs(previous, sample) {
     return Math.round(previous * 0.65 + sample * 0.35);
 }
 
+function clearReadyDeadline(room) {
+    if (!room) return;
+    if (room.readyTimer) {
+        clearTimeout(room.readyTimer);
+    }
+    room.readyTimer = null;
+    room.readyDeadlineAt = null;
+}
+
+function resetGuestSlot(room) {
+    if (!room) return;
+    room.guest = null;
+    room.guestCharacterId = undefined;
+    room.guestPassiveId = undefined;
+    room.guestArenaId = undefined;
+    room.guestNickname = undefined;
+    room.guestPlayerId = undefined;
+    room.guestReady = false;
+    room.hostReady = false;
+    room.matchId = null;
+}
+
+function startReadyDeadline(code, room) {
+    if (!room || room.matchStarted) return;
+    if (room.host?.readyState !== WebSocket.OPEN || room.guest?.readyState !== WebSocket.OPEN) {
+        clearReadyDeadline(room);
+        return;
+    }
+    clearReadyDeadline(room);
+    room.hostReady = false;
+    room.guestReady = false;
+    room.readyDeadlineAt = Date.now() + ROOM_READY_TIMEOUT_MS;
+    room.readyTimer = setTimeout(() => {
+        handleReadyTimeout(code);
+    }, ROOM_READY_TIMEOUT_MS);
+    const payload = { type: 'room_ready_deadline', deadlineAtMs: room.readyDeadlineAt };
+    send(room.host, payload);
+    send(room.guest, payload);
+}
+
+function updateRoomReady(room, role, ready) {
+    if (!room || typeof ready !== 'boolean') return;
+    if (role === 'host') room.hostReady = ready;
+    if (role === 'guest') room.guestReady = ready;
+    if (room.hostReady && room.guestReady) {
+        clearReadyDeadline(room);
+    }
+}
+
+function handleReadyTimeout(code) {
+    const room = rooms[code];
+    if (!room || room.matchStarted) return;
+    room.readyTimer = null;
+    room.readyDeadlineAt = null;
+    if (room.host?.readyState !== WebSocket.OPEN || room.guest?.readyState !== WebSocket.OPEN) {
+        clearReadyDeadline(room);
+        return;
+    }
+
+    const hostReady = room.hostReady === true;
+    const guestReady = room.guestReady === true;
+    if (hostReady && guestReady) return;
+
+    if (!hostReady && !guestReady) {
+        send(room.host, { type: 'room_ready_timeout', action: 'room_closed', reason: 'both_not_ready' });
+        send(room.guest, { type: 'room_ready_timeout', action: 'room_closed', reason: 'both_not_ready' });
+        room.host.roomCode = null;
+        room.host.role = null;
+        room.guest.roomCode = null;
+        room.guest.role = null;
+        delete rooms[code];
+        console.log(`[timeout] Room closed because both players were not ready: ${code}`);
+        return;
+    }
+
+    if (hostReady && !guestReady) {
+        const kicked = room.guest;
+        send(kicked, { type: 'room_ready_timeout', action: 'kicked', reason: 'not_ready' });
+        send(room.host, { type: 'room_ready_timeout', action: 'peer_removed', reason: 'not_ready' });
+        kicked.roomCode = null;
+        kicked.role = null;
+        resetGuestSlot(room);
+        console.log(`[timeout] Guest kicked for not ready: ${code}`);
+        return;
+    }
+
+    const kicked = room.host;
+    const promotedHost = room.guest;
+    send(kicked, { type: 'room_ready_timeout', action: 'kicked', reason: 'not_ready' });
+    send(promotedHost, { type: 'room_ready_timeout', action: 'peer_removed', reason: 'not_ready' });
+    kicked.roomCode = null;
+    kicked.role = null;
+    room.host = promotedHost;
+    room.guest = null;
+    room.hostRttMs = socketRttMs(promotedHost);
+    room.hostCharacterId = room.guestCharacterId;
+    room.hostPassiveId = room.guestPassiveId;
+    room.arenaId = room.guestArenaId || room.arenaId;
+    room.hostNickname = room.guestNickname;
+    room.hostPlayerId = room.guestPlayerId;
+    resetGuestSlot(room);
+    promotedHost.role = 'host';
+    promotedHost.roomCode = code;
+    send(promotedHost, {
+        type: 'host_migrated',
+        code,
+        networkMode: room.networkMode || 'relay',
+        arenaId: room.arenaId,
+    });
+    console.log(`[timeout] Host kicked for not ready; guest promoted: ${code}`);
+}
+
 function rateLimitBucket(type) {
     if (type === 'game_state') return 'gameState';
     if (type === 'offer' || type === 'answer' || type === 'ice_candidate') return 'signaling';
@@ -1437,6 +1550,10 @@ wss.on('connection', (ws) => {
                     networkMode: networkMode(msg.networkMode),
                     matchStarted: false,
                     matchId: null,
+                    hostReady: false,
+                    guestReady: false,
+                    readyDeadlineAt: null,
+                    readyTimer: null,
                 };
                 ws.roomCode = code;
                 ws.role = 'host';
@@ -1501,6 +1618,7 @@ wss.on('connection', (ws) => {
                     guestNickname: room.guestNickname,
                     guestPlayerId: room.guestPlayerId,
                 });
+                startReadyDeadline(code, room);
                 console.log(`[+] Room joined: ${code}`);
                 break;
             }
@@ -1537,6 +1655,7 @@ wss.on('connection', (ws) => {
                     room.guestNickname = typeof msg.nickname === 'string' ? msg.nickname : room.guestNickname;
                     room.guestPlayerId = typeof msg.playerId === 'string' ? msg.playerId : room.guestPlayerId;
                 }
+                updateRoomReady(room, ws.role, msg.ready);
 
                 const peer = ws.role === 'host' ? room.guest : room.host;
                 send(peer, msg);
@@ -1590,6 +1709,7 @@ wss.on('connection', (ws) => {
 
                 if (msg.type === 'game_start') {
                     room.matchStarted = true;
+                    clearReadyDeadline(room);
                 }
                 const peer = ws.role === 'host' ? room.guest : room.host;
                 send(peer, msg);
@@ -1609,13 +1729,8 @@ wss.on('connection', (ws) => {
 
         if (ws.role === 'guest' && !room.matchStarted) {
             send(room.host, { type: 'peer_disconnected' });
-            room.guest = null;
-            room.guestCharacterId = undefined;
-            room.guestPassiveId = undefined;
-            room.guestArenaId = undefined;
-            room.guestNickname = undefined;
-            room.guestPlayerId = undefined;
-            room.matchId = null;
+            clearReadyDeadline(room);
+            resetGuestSlot(room);
             console.log(`[-] Guest left waiting room: ${code}`);
             return;
         }
@@ -1632,12 +1747,8 @@ wss.on('connection', (ws) => {
             room.arenaId = room.guestArenaId || room.arenaId;
             room.hostNickname = room.guestNickname;
             room.hostPlayerId = room.guestPlayerId;
-            room.guestCharacterId = undefined;
-            room.guestPassiveId = undefined;
-            room.guestArenaId = undefined;
-            room.guestNickname = undefined;
-            room.guestPlayerId = undefined;
-            room.matchId = null;
+            clearReadyDeadline(room);
+            resetGuestSlot(room);
             promotedHost.role = 'host';
             promotedHost.roomCode = code;
             send(promotedHost, {
@@ -1656,6 +1767,7 @@ wss.on('connection', (ws) => {
         send(peer, { type: 'peer_disconnected' });
 
         // 방 삭제
+        clearReadyDeadline(room);
         delete rooms[code];
         console.log(`[-] Room removed: ${code}`);
     });
