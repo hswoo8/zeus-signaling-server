@@ -43,7 +43,7 @@ If capacity or maintenance gates block entry, the server returns `{ type: "error
 
 `create_room` and `join_room` also enforce the same capacity gates as `/capacity`, so clients cannot bypass overload protection by skipping the HTTP preflight.
 
-Relay game packets (`game_start`, `game_ready`, `game_state`, `game_skill`, `game_damage`, `game_state_hp`, `game_emote`, `game_over`, `game_start_failed`, `rematch_request`, `rematch_cancel`, `rematch_reselect`, `rematch_ready`, rematch accept/decline, etc.) are forwarded unchanged to the peer. WebRTC `offer` / `answer` / `ice_candidate` messages are forwarded for P2P DataChannel setup.
+Relay game packets (`game_start`, `game_ready`, `game_countdown_sync`, `game_state`, `game_skill`, `game_damage`, `game_state_hp`, `game_emote`, `game_over`, `game_start_failed`, `rematch_request`, `rematch_cancel`, `rematch_reselect`, `rematch_ready`, rematch accept/decline, etc.) are forwarded unchanged to the peer. WebRTC `offer` / `answer` / `ice_candidate` messages are forwarded for P2P DataChannel setup.
 
 Rate limits are type-specific so lobby/signaling traffic stays low while `game_state` can sustain 20 Hz relay traffic.
 
