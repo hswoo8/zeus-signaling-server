@@ -1571,7 +1571,6 @@ wss.on('connection', (ws) => {
                     room.hostCharacterId = enumToken(msg.characterId) || room.hostCharacterId;
                     room.hostPassiveId = enumToken(msg.passiveId) || room.hostPassiveId;
                     room.arenaId = enumToken(msg.arenaId) || room.arenaId;
-                    room.battleType = battleType(msg.battleType || room.battleType);
                     room.hostNickname = typeof msg.nickname === 'string' ? msg.nickname : room.hostNickname;
                     room.hostPlayerId = typeof msg.playerId === 'string' ? msg.playerId : room.hostPlayerId;
                 } else if (ws.role === 'guest') {

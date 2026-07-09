@@ -35,7 +35,7 @@ If capacity or maintenance gates block entry, the server returns `{ type: "error
 | `join_room` | Client -> Server | Compatibility metadata and `{ code, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
 | `room_joined` | Server -> Guest | `{ code, matchId, networkMode, battleType, hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId }` |
 | `guest_joined` | Server -> Host | `{ matchId, networkMode, battleType, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
-| `selection_update` | Client -> Server -> Peer | Live setup selection and ready state: `{ characterId, passiveId, arenaId, battleType, nickname, playerId, ready, networkMode }`; only Host updates the room battle type |
+| `selection_update` | Client -> Server -> Peer | Live setup selection and ready state: `{ characterId, passiveId, arenaId, battleType, nickname, playerId, ready, networkMode }`; room `battleType` is fixed at `create_room` |
 | `ping_check` | Client -> Server | `{ clientTime, rttMs? }` |
 | `ping_check_ack` | Server -> Client | `{ clientTime, serverTime }` |
 | `get_room_list` | Client -> Server | Open rooms |
