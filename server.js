@@ -42,6 +42,7 @@ const MIN_BALANCE_VERSION = envInt(
     1
 );
 const NETWORK_MODES = new Set(['auto', 'relay', 'p2p']);
+const BATTLE_TYPES = new Set(['short', 'standard', 'long']);
 const statsPool = DATABASE_URL ? new Pool({
     connectionString: DATABASE_URL,
     ssl: postgresSslConfig(),
@@ -169,6 +170,11 @@ async function initializeStatsStorage() {
 
 function generateCode() {
     return Math.floor(1000 + Math.random() * 9000).toString();
+}
+
+function battleType(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    return BATTLE_TYPES.has(normalized) ? normalized : 'short';
 }
 
 function send(ws, data) {
@@ -1455,6 +1461,7 @@ wss.on('connection', (ws) => {
                     hostCharacterId: enumToken(msg.hostCharacterId),
                     hostPassiveId: enumToken(msg.hostPassiveId),
                     arenaId: enumToken(msg.arenaId),
+                    battleType: battleType(msg.battleType),
                     hostNickname: typeof msg.hostNickname === 'string' ? msg.hostNickname : undefined,
                     hostPlayerId: typeof msg.hostPlayerId === 'string' ? msg.hostPlayerId : undefined,
                     guestCharacterId: undefined,
@@ -1470,7 +1477,12 @@ wss.on('connection', (ws) => {
                 ws.roomCode = code;
                 ws.role = 'host';
 
-                send(ws, { type: 'room_created', code, networkMode: rooms[code].networkMode });
+                send(ws, {
+                    type: 'room_created',
+                    code,
+                    networkMode: rooms[code].networkMode,
+                    battleType: rooms[code].battleType,
+                });
                 console.log(`[+] Room created: ${code}`);
                 break;
             }
@@ -1517,6 +1529,7 @@ wss.on('connection', (ws) => {
                     hostCharacterId: room.hostCharacterId,
                     hostPassiveId: room.hostPassiveId,
                     arenaId: room.arenaId,
+                    battleType: room.battleType,
                     hostNickname: room.hostNickname,
                     hostPlayerId: room.hostPlayerId,
                 });
@@ -1527,6 +1540,7 @@ wss.on('connection', (ws) => {
                     guestCharacterId: room.guestCharacterId,
                     guestPassiveId: room.guestPassiveId,
                     arenaId: room.guestArenaId,
+                    battleType: room.battleType,
                     guestNickname: room.guestNickname,
                     guestPlayerId: room.guestPlayerId,
                 });
@@ -1557,6 +1571,7 @@ wss.on('connection', (ws) => {
                     room.hostCharacterId = enumToken(msg.characterId) || room.hostCharacterId;
                     room.hostPassiveId = enumToken(msg.passiveId) || room.hostPassiveId;
                     room.arenaId = enumToken(msg.arenaId) || room.arenaId;
+                    room.battleType = battleType(msg.battleType || room.battleType);
                     room.hostNickname = typeof msg.nickname === 'string' ? msg.nickname : room.hostNickname;
                     room.hostPlayerId = typeof msg.playerId === 'string' ? msg.playerId : room.hostPlayerId;
                 } else if (ws.role === 'guest') {
@@ -1586,6 +1601,7 @@ wss.on('connection', (ws) => {
                             ...roomQuality(room.hostRttMs, guestRttMs),
                             hostCharacterId: room.hostCharacterId,
                             arenaId: room.arenaId,
+                            battleType: room.battleType,
                             networkMode: room.networkMode || 'relay',
                         };
                     })

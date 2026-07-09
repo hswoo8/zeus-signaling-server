@@ -30,16 +30,16 @@ If capacity or maintenance gates block entry, the server returns `{ type: "error
 
 | type | Direction | Description |
 | --- | --- | --- |
-| `create_room` | Client -> Server | Create room with compatibility metadata and `{ hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId, networkMode }`; missing/invalid `networkMode` becomes `relay` |
-| `room_created` | Server -> Host | `{ code, networkMode }` |
+| `create_room` | Client -> Server | Create room with compatibility metadata and `{ hostCharacterId, hostPassiveId, arenaId, battleType, hostNickname, hostPlayerId, networkMode }`; missing/invalid `networkMode` becomes `relay`, missing/invalid `battleType` becomes `short` |
+| `room_created` | Server -> Host | `{ code, networkMode, battleType }` |
 | `join_room` | Client -> Server | Compatibility metadata and `{ code, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
-| `room_joined` | Server -> Guest | `{ code, matchId, networkMode, hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId }` |
-| `guest_joined` | Server -> Host | `{ matchId, networkMode, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
-| `selection_update` | Client -> Server -> Peer | Live setup selection and ready state: `{ characterId, passiveId, arenaId, nickname, playerId, ready, networkMode }` |
+| `room_joined` | Server -> Guest | `{ code, matchId, networkMode, battleType, hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId }` |
+| `guest_joined` | Server -> Host | `{ matchId, networkMode, battleType, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
+| `selection_update` | Client -> Server -> Peer | Live setup selection and ready state: `{ characterId, passiveId, arenaId, battleType, nickname, playerId, ready, networkMode }`; only Host updates the room battle type |
 | `ping_check` | Client -> Server | `{ clientTime, rttMs? }` |
 | `ping_check_ack` | Server -> Client | `{ clientTime, serverTime }` |
 | `get_room_list` | Client -> Server | Open rooms |
-| `room_list` | Server -> Client | `{ rooms: [{ code, pingMs, quality, hostCharacterId?, arenaId?, networkMode }] }` |
+| `room_list` | Server -> Client | `{ rooms: [{ code, pingMs, quality, hostCharacterId?, arenaId?, battleType, networkMode }] }` |
 
 `create_room` and `join_room` also enforce the same capacity gates as `/capacity`, so clients cannot bypass overload protection by skipping the HTTP preflight.
 
