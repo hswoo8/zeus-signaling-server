@@ -28,6 +28,7 @@ const RATE_LIMITS = {
     gameState: Number(process.env.RATE_LIMIT_GAME_STATE_MAX || 420),
     gameEvent: Number(process.env.RATE_LIMIT_GAME_EVENT_MAX || 240),
 };
+const BATTLE_COUNTDOWN_SYNC_DELAY_MS = Number(process.env.BATTLE_COUNTDOWN_SYNC_DELAY_MS || 4500);
 const MIN_CLIENT_VERSION_CODE = envInt(
     ['MULTIPLAYER_MIN_APP_VERSION_CODE', 'MIN_CLIENT_VERSION_CODE'],
     1
@@ -174,6 +175,22 @@ function send(ws, data) {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(data));
     }
+}
+
+function sendCountdownSync(room) {
+    if (!room || !room.host || !room.guest) return;
+    const serverTimeMs = Date.now();
+    if (!Number.isFinite(room.battleStartAtMs) || room.battleStartAtMs <= serverTimeMs) {
+        room.battleStartAtMs = serverTimeMs + BATTLE_COUNTDOWN_SYNC_DELAY_MS;
+    }
+    const packet = {
+        type: 'game_countdown_sync',
+        serverTimeMs,
+        battleStartAtMs: room.battleStartAtMs,
+        countdownDelayMs: Math.max(0, room.battleStartAtMs - serverTimeMs),
+    };
+    send(room.host, packet);
+    send(room.guest, packet);
 }
 
 function markSocketAlive(ws) {
@@ -1448,6 +1465,7 @@ wss.on('connection', (ws) => {
                     networkMode: networkMode(msg.networkMode),
                     matchStarted: false,
                     matchId: null,
+                    battleStartAtMs: null,
                 };
                 ws.roomCode = code;
                 ws.role = 'host';
@@ -1604,6 +1622,9 @@ wss.on('connection', (ws) => {
                 }
                 const peer = ws.role === 'host' ? room.guest : room.host;
                 send(peer, msg);
+                if (msg.type === 'game_ready') {
+                    sendCountdownSync(room);
+                }
                 break;
             }
 
