@@ -21,6 +21,7 @@ Set these environment variables in production to block outdated multiplayer clie
 | `MAINTENANCE_MODE` | `false` | When true, block new multiplayer entry with a maintenance message |
 | `MAINTENANCE_MESSAGE` | Korean default | Message shown to clients during maintenance |
 | `DATABASE_URL` | unset | PostgreSQL connection string. When set, match results/rankings use Postgres instead of memory |
+| `CONFIRMED_MATCH_TTL_MS` | `86400000` | Time a server-confirmed PvP result remains eligible for stats submission |
 | `PGSSL` / `PGSSLMODE` | unset | Set `PGSSL=true` or `PGSSLMODE=require` if the Postgres provider requires SSL |
 
 If a client is missing or below the version values, the server returns `{ type: "error", code: "update_required", message }`.
@@ -33,8 +34,8 @@ If capacity or maintenance gates block entry, the server returns `{ type: "error
 | `create_room` | Client -> Server | Create room with compatibility metadata and `{ hostCharacterId, hostPassiveId, arenaId, battleType, hostNickname, hostPlayerId, networkMode }`; missing/invalid `networkMode` becomes `relay`, missing/invalid `battleType` becomes `short` |
 | `room_created` | Server -> Host | `{ code, networkMode, battleType }` |
 | `join_room` | Client -> Server | Compatibility metadata and `{ code, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
-| `room_joined` | Server -> Guest | `{ code, matchId, networkMode, battleType, hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId }` |
-| `guest_joined` | Server -> Host | `{ matchId, networkMode, battleType, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
+| `room_joined` | Server -> Guest | `{ code, networkMode, battleType, hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId }` |
+| `guest_joined` | Server -> Host | `{ networkMode, battleType, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
 | `selection_update` | Client -> Server -> Peer | Live setup selection and ready state: `{ characterId, passiveId, arenaId, battleType, nickname, playerId, ready, networkMode }`; room `battleType` is fixed at `create_room` |
 | `ping_check` | Client -> Server | `{ clientTime, rttMs? }` |
 | `ping_check_ack` | Server -> Client | `{ clientTime, serverTime }` |
@@ -43,7 +44,7 @@ If capacity or maintenance gates block entry, the server returns `{ type: "error
 
 `create_room` and `join_room` also enforce the same capacity gates as `/capacity`, so clients cannot bypass overload protection by skipping the HTTP preflight.
 
-Relay game packets (`game_start`, `game_ready`, `game_countdown_sync`, `game_state`, `game_skill`, `game_damage`, `game_state_hp`, `game_emote`, `game_over`, `game_start_failed`, `rematch_request`, `rematch_cancel`, `rematch_reselect`, `rematch_ready`, rematch accept/decline, etc.) are forwarded to the peer. After `game_ready`, the server sends `game_countdown_sync { serverTimeMs, battleStartAtMs }` to both players so battle countdown starts from the same server-authoritative time. WebRTC `offer` / `answer` / `ice_candidate` messages are forwarded for P2P DataChannel setup.
+Each accepted `game_start` assigns a new `matchId`, including rematches. The guest receives it on `game_start`, the host receives `match_assigned`, and both receive it again on `game_countdown_sync`. Relay game packets remain peer-compatible. On `game_over` or an active-match socket disconnect, the server emits perspective-correct `match_result { matchId, outcome, finishReason, serverConfirmed }` packets to both sides. After `game_ready`, the server sends `game_countdown_sync { matchId, serverTimeMs, battleStartAtMs }` so battle countdown starts from the same server-authoritative time. WebRTC `offer` / `answer` / `ice_candidate` messages are forwarded for P2P DataChannel setup.
 
 Rate limits are type-specific so lobby/signaling traffic stays low while `game_state` can sustain 20 Hz relay traffic.
 
@@ -58,7 +59,7 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 | `GET` | `/health` | Process health, version, storage mode, room/player counts |
 | `GET` | `/capacity` | Multiplayer entry status, current counts, optional caps, retry delay, and minimum version requirements |
 | `POST` | `/matches/result` | Store a single-player result for one player |
-| `POST` | `/matches/pvp-result` | Store a PvP result for both players and return local reward/MMR data |
+| `POST` | `/matches/pvp-result` | Store a server-confirmed PvP result for both players and return local reward/MMR data |
 | `GET` | `/rankings?mode=single|multi` | Return ranking rows from the active stats storage |
 | `GET` | `/players/:playerIdOrNickname/stats?mode=single|multi` | Return one player's aggregate stats |
 
@@ -67,9 +68,10 @@ Recommended Railway rollout:
 - Hobby: use for development, two-device QA, and small closed tests. Set conservative caps such as `MAX_CONNECTIONS`, `MAX_ACTIVE_ROOMS`, and `MAX_ACTIVE_MATCHES`, then verify the app shows the busy/maintenance popup instead of entering multiplayer.
 - Pro: switch before public SLT/release multiplayer, then raise caps based on load-test results and Railway CPU/RAM/egress metrics.
 
-PvP results prefer `playerId` as the identity key and use nickname only as a fallback/display value. Normal PvP wins return the full coin reward; disconnect/forfeit wins return reduced reward so abuse-prone outcomes can still count for MMR without becoming a farming path. Duplicate `serverMatchId`/`clientMatchId` submissions are idempotent, so both devices can submit the same match without double-counting.
+PvP results prefer `playerId` as the identity key and use nickname only as a fallback/display value. `/matches/pvp-result` rejects unknown match IDs, participant mismatches, and outcomes that differ from the WebSocket-confirmed result. Normal PvP wins return the full coin reward; disconnect/forfeit wins return reduced reward so abuse-prone outcomes can still count for MMR without becoming a farming path. Duplicate `serverMatchId` submissions are idempotent, so both devices can submit the same match without double-counting.
 
 PostgreSQL tables are created automatically at startup:
 
 - `br_player_stats`: aggregate MMR, wins/losses/draws, streaks, favorite character data, and coin totals.
 - `br_match_results`: idempotency records and stored result payloads.
+- `br_pvp_match_confirmations`: short-lived server-confirmed match participants and outcomes used to validate PvP result submissions.

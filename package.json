@@ -4,7 +4,8 @@
   "description": "WebRTC signaling server for Zeus 1v1 Battle",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test server.test.js"
   },
   "engines": {
     "node": ">=18"

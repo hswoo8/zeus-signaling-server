@@ -29,6 +29,7 @@ const RATE_LIMITS = {
     gameEvent: Number(process.env.RATE_LIMIT_GAME_EVENT_MAX || 240),
 };
 const BATTLE_COUNTDOWN_SYNC_DELAY_MS = Number(process.env.BATTLE_COUNTDOWN_SYNC_DELAY_MS || 4500);
+const CONFIRMED_MATCH_TTL_MS = Number(process.env.CONFIRMED_MATCH_TTL_MS || 24 * 60 * 60 * 1000);
 const MIN_CLIENT_VERSION_CODE = envInt(
     ['MULTIPLAYER_MIN_APP_VERSION_CODE', 'MIN_CLIENT_VERSION_CODE'],
     1
@@ -61,6 +62,7 @@ const wss = new WebSocket.Server({ server });
 const rooms = {};
 const statsPlayers = new Map();
 const statsIdempotency = new Map();
+const confirmedPvpMatches = new Map();
 let serverMatchCounter = 0;
 
 const LOBBY_TYPES = new Set([
@@ -166,6 +168,14 @@ async function initializeStatsStorage() {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
+    await statsPool.query(`
+        CREATE TABLE IF NOT EXISTS br_pvp_match_confirmations (
+            match_id TEXT PRIMARY KEY,
+            record JSONB NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
 }
 
 function generateCode() {
@@ -191,6 +201,7 @@ function sendCountdownSync(room) {
     }
     const packet = {
         type: 'game_countdown_sync',
+        matchId: room.matchId || null,
         serverTimeMs,
         battleStartAtMs: room.battleStartAtMs,
         countdownDelayMs: Math.max(0, room.battleStartAtMs - serverTimeMs),
@@ -410,8 +421,19 @@ async function handleHttpRequest(req, res) {
     }
 
     if (req.method === 'POST' && pathname === '/matches/pvp-result') {
-        const body = await readJsonRequest(req, res);
-        if (!body) return;
+        const submittedBody = await readJsonRequest(req, res);
+        if (!submittedBody) return;
+        const confirmed = await normalizeConfirmedPvpSubmission(submittedBody);
+        if (confirmed.error) {
+            sendHttpError(
+                res,
+                confirmed.error.status,
+                confirmed.error.code,
+                confirmed.error.message
+            );
+            return;
+        }
+        const body = confirmed.body;
         if (statsPool) {
             await handlePostgresPvpMatchResult(res, body);
         } else {
@@ -1012,7 +1034,7 @@ function handlePvpMatchResult(res, body) {
     const completedAt = body.completedAt || new Date().toISOString();
     const finishReason = typeof body.finishReason === 'string' ? body.finishReason : 'normal';
     const localReward = rewardForResult(outcome, finishReason);
-    const remoteReward = rewardForResult(remoteOutcome, finishReason);
+    const remoteReward = rewardForResult(remoteOutcome, body.remoteFinishReason || finishReason);
     const local = getOrCreatePlayer('multi', body.localPlayer);
     const remote = getOrCreatePlayer('multi', body.remotePlayer);
 
@@ -1175,7 +1197,7 @@ async function handlePostgresPvpMatchResult(res, body) {
     const completedAt = body.completedAt || new Date().toISOString();
     const finishReason = typeof body.finishReason === 'string' ? body.finishReason : 'normal';
     const localReward = rewardForResult(outcome, finishReason);
-    const remoteReward = rewardForResult(remoteOutcome, finishReason);
+    const remoteReward = rewardForResult(remoteOutcome, body.remoteFinishReason || finishReason);
     const matchId = matchRef || makeServerMatchId();
     const client = await statsPool.connect();
 
@@ -1260,6 +1282,216 @@ function makeMatchId() {
     return `PVP-${now}-${random}`;
 }
 
+function roomParticipant(room, role) {
+    const prefix = role === 'host' ? 'host' : 'guest';
+    return {
+        playerId: room[`${prefix}PlayerId`] || null,
+        nickname: room[`${prefix}Nickname`] || (role === 'host' ? 'Host' : 'Guest'),
+        characterId: room[`${prefix}CharacterId`] || null,
+        passiveId: room[`${prefix}PassiveId`] || null,
+    };
+}
+
+function opponentRole(role) {
+    return role === 'host' ? 'guest' : 'host';
+}
+
+function canonicalMatchReason(reason) {
+    if (reason === 'forfeit' || reason === 'local_forfeit' || reason === 'remote_forfeit') {
+        return 'forfeit';
+    }
+    if (reason === 'disconnect_timeout' || reason === 'remote_disconnect') {
+        return 'disconnect_timeout';
+    }
+    if (reason === 'timeout') return 'timeout';
+    return 'normal';
+}
+
+function reportedGameOutcome(msg) {
+    const explicit = outcomeValue(msg.outcome);
+    if (explicit) return explicit;
+    if (canonicalMatchReason(msg.reason) === 'forfeit') return 'loss';
+    return packetInt(msg, 'hp') === 0 ? 'loss' : 'win';
+}
+
+function resultOutcomeForRole(result, role) {
+    if (!result.winnerRole) return 'draw';
+    return result.winnerRole === role ? 'win' : 'loss';
+}
+
+function resultReasonForRole(result, role) {
+    if (result.reason === 'forfeit') {
+        return result.loserRole === role ? 'local_forfeit' : 'remote_forfeit';
+    }
+    if (result.reason === 'disconnect_timeout') {
+        return result.loserRole === role ? 'local_forfeit' : 'remote_disconnect';
+    }
+    return result.reason;
+}
+
+function resultPacketForRole(result, role) {
+    const localHp = role === 'host' ? result.hostHp : result.guestHp;
+    const remoteHp = role === 'host' ? result.guestHp : result.hostHp;
+    const packet = {
+        type: 'match_result',
+        matchId: result.matchId,
+        roundId: result.roundId,
+        outcome: resultOutcomeForRole(result, role),
+        finishReason: resultReasonForRole(result, role),
+        serverConfirmed: true,
+    };
+    if (Number.isInteger(localHp)) packet.localHp = localHp;
+    if (Number.isInteger(remoteHp)) packet.remoteHp = remoteHp;
+    return packet;
+}
+
+function confirmationRecord(room, result) {
+    return {
+        type: 'confirmed_pvp',
+        matchId: result.matchId,
+        host: roomParticipant(room, 'host'),
+        guest: roomParticipant(room, 'guest'),
+        hostOutcome: resultOutcomeForRole(result, 'host'),
+        guestOutcome: resultOutcomeForRole(result, 'guest'),
+        hostFinishReason: resultReasonForRole(result, 'host'),
+        guestFinishReason: resultReasonForRole(result, 'guest'),
+        hostHp: result.hostHp,
+        guestHp: result.guestHp,
+        arenaId: room.arenaId || null,
+        durationSec: result.durationSec,
+        completedAt: result.completedAt,
+        expiresAt: new Date(result.expiresAt).toISOString(),
+    };
+}
+
+function rememberConfirmedPvpMatch(room, result) {
+    const record = confirmationRecord(room, result);
+    confirmedPvpMatches.set(record.matchId, record);
+    if (statsPool) {
+        statsPool.query(
+            `INSERT INTO br_pvp_match_confirmations (match_id, record, expires_at)
+             VALUES ($1, $2::jsonb, $3)
+             ON CONFLICT (match_id) DO UPDATE
+                SET record = EXCLUDED.record, expires_at = EXCLUDED.expires_at`,
+            [record.matchId, JSON.stringify(record), record.expiresAt]
+        ).catch((err) => {
+            console.error('[stats] failed to persist confirmed PvP match:', err?.message || err);
+        });
+    }
+}
+
+function finalizeRoomMatch(room, reporterRole, msg) {
+    if (!room || !['host', 'guest'].includes(reporterRole)) return null;
+    if (room.finalResult) return room.finalResult;
+    if (!room.matchStarted || !room.matchId) return null;
+    const reporterOutcome = reportedGameOutcome(msg);
+    const winnerRole = reporterOutcome === 'draw'
+        ? null
+        : (reporterOutcome === 'win' ? reporterRole : opponentRole(reporterRole));
+    const loserRole = winnerRole ? opponentRole(winnerRole) : null;
+    const reporterHp = packetInt(msg, 'hp');
+    const remoteHp = packetInt(msg, 'remoteHp');
+    const completedAtMs = Date.now();
+    const completedAt = new Date(completedAtMs).toISOString();
+    const result = {
+        matchId: room.matchId,
+        roundId: packetInt(msg, 'roundId'),
+        winnerRole,
+        loserRole,
+        reason: canonicalMatchReason(msg.reason),
+        hostHp: reporterRole === 'host' ? reporterHp : remoteHp,
+        guestHp: reporterRole === 'guest' ? reporterHp : remoteHp,
+        durationSec: Math.max(1, Math.floor((completedAtMs - (room.matchStartedAtMs || completedAtMs)) / 1000)),
+        completedAt,
+        expiresAt: Date.now() + CONFIRMED_MATCH_TTL_MS,
+    };
+
+    room.finalResult = result;
+    room.matchStarted = false;
+    rememberConfirmedPvpMatch(room, result);
+    send(room.host, resultPacketForRole(result, 'host'));
+    send(room.guest, resultPacketForRole(result, 'guest'));
+    return result;
+}
+
+async function confirmedPvpMatch(matchId) {
+    const cached = confirmedPvpMatches.get(matchId);
+    if (cached) {
+        if (Date.parse(cached.expiresAt) > Date.now()) return cached;
+        confirmedPvpMatches.delete(matchId);
+    }
+    if (!statsPool) return null;
+
+    const result = await statsPool.query(
+        `SELECT record
+           FROM br_pvp_match_confirmations
+          WHERE match_id = $1 AND expires_at > NOW()`,
+        [matchId]
+    );
+    const record = result.rows[0]?.record || null;
+    if (record) confirmedPvpMatches.set(matchId, record);
+    return record;
+}
+
+function confirmationRole(record, player) {
+    const identity = playerIdentityKey(player);
+    if (!identity) return null;
+    if (identity === playerIdentityKey(record.host)) return 'host';
+    if (identity === playerIdentityKey(record.guest)) return 'guest';
+    return null;
+}
+
+async function normalizeConfirmedPvpSubmission(body) {
+    const matchId = normalizePlayerId(body.serverMatchId);
+    if (!matchId) {
+        return { error: { status: 409, code: 'match_not_confirmed', message: 'serverMatchId is required for PvP results' } };
+    }
+    const record = await confirmedPvpMatch(matchId);
+    if (!record) {
+        return { error: { status: 409, code: 'match_not_confirmed', message: 'PvP result was not confirmed by the battle server' } };
+    }
+
+    const localRole = confirmationRole(record, body.localPlayer);
+    const remoteRole = confirmationRole(record, body.remotePlayer);
+    if (!localRole || !remoteRole || localRole === remoteRole) {
+        return { error: { status: 409, code: 'participant_mismatch', message: 'PvP result players do not match the confirmed battle' } };
+    }
+
+    const expectedOutcome = localRole === 'host' ? record.hostOutcome : record.guestOutcome;
+    if (outcomeValue(body.outcome) !== expectedOutcome) {
+        return { error: { status: 409, code: 'result_mismatch', message: 'PvP outcome does not match the confirmed battle result' } };
+    }
+
+    const localParticipant = localRole === 'host' ? record.host : record.guest;
+    const remoteParticipant = remoteRole === 'host' ? record.host : record.guest;
+    const localHp = localRole === 'host' ? record.hostHp : record.guestHp;
+    const remoteHp = remoteRole === 'host' ? record.hostHp : record.guestHp;
+
+    return {
+        body: {
+            ...body,
+            serverMatchId: matchId,
+            clientMatchId: matchId,
+            outcome: expectedOutcome,
+            finishReason: localRole === 'host' ? record.hostFinishReason : record.guestFinishReason,
+            remoteFinishReason: remoteRole === 'host' ? record.hostFinishReason : record.guestFinishReason,
+            arenaId: record.arenaId || body.arenaId,
+            durationSec: record.durationSec || body.durationSec,
+            completedAt: record.completedAt,
+            localPlayer: {
+                ...body.localPlayer,
+                ...localParticipant,
+                hp: Number.isInteger(localHp) ? localHp : body.localPlayer?.hp,
+            },
+            remotePlayer: {
+                ...body.remotePlayer,
+                ...remoteParticipant,
+                hp: Number.isInteger(remoteHp) ? remoteHp : body.remotePlayer?.hp,
+            },
+        },
+    };
+}
+
 function enumToken(value) {
     return typeof value === 'string' && /^[A-Z0-9_]+$/.test(value) ? value : undefined;
 }
@@ -1302,7 +1534,11 @@ function resetGuestSlot(room) {
     room.guestArenaId = undefined;
     room.guestNickname = undefined;
     room.guestPlayerId = undefined;
+    room.matchStarted = false;
     room.matchId = null;
+    room.finalResult = null;
+    room.battleStartAtMs = null;
+    room.matchStartedAtMs = null;
 }
 
 function rateLimitBucket(type) {
@@ -1472,7 +1708,10 @@ wss.on('connection', (ws) => {
                     networkMode: networkMode(msg.networkMode),
                     matchStarted: false,
                     matchId: null,
+                    matchSequence: 0,
+                    finalResult: null,
                     battleStartAtMs: null,
+                    matchStartedAtMs: null,
                 };
                 ws.roomCode = code;
                 ws.role = 'host';
@@ -1516,7 +1755,6 @@ wss.on('connection', (ws) => {
                 room.guestArenaId = enumToken(msg.arenaId);
                 room.guestNickname = typeof msg.guestNickname === 'string' ? msg.guestNickname : undefined;
                 room.guestPlayerId = typeof msg.guestPlayerId === 'string' ? msg.guestPlayerId : undefined;
-                if (!room.matchId) room.matchId = makeMatchId();
                 ws.roomCode = code;
                 ws.role = 'guest';
 
@@ -1524,7 +1762,6 @@ wss.on('connection', (ws) => {
                 send(ws, {
                     type: 'room_joined',
                     code,
-                    matchId: room.matchId,
                     networkMode: room.networkMode || 'relay',
                     hostCharacterId: room.hostCharacterId,
                     hostPassiveId: room.hostPassiveId,
@@ -1535,7 +1772,6 @@ wss.on('connection', (ws) => {
                 });
                 send(room.host, {
                     type: 'guest_joined',
-                    matchId: room.matchId,
                     networkMode: room.networkMode || 'relay',
                     guestCharacterId: room.guestCharacterId,
                     guestPassiveId: room.guestPassiveId,
@@ -1610,7 +1846,17 @@ wss.on('connection', (ws) => {
             }
 
             // ── 게임 패킷 릴레이 ─────────────────────────────────────────
-            case 'game_over':
+            case 'game_over': {
+                const code = ws.roomCode;
+                const room = rooms[code];
+                if (!room) return;
+
+                const peer = ws.role === 'host' ? room.guest : room.host;
+                send(peer, { ...msg, matchId: room.matchId || null });
+                finalizeRoomMatch(room, ws.role, msg);
+                break;
+            }
+
             case 'game_start_failed':
             case 'rematch_accept':
             case 'rematch_decline':
@@ -1633,7 +1879,42 @@ wss.on('connection', (ws) => {
                 if (!room) return;
 
                 if (msg.type === 'game_start') {
-                    room.matchStarted = true;
+                    if (ws.role !== 'host') return;
+                    if (!room.matchStarted) {
+                        room.matchStarted = true;
+                        room.matchSequence = (room.matchSequence || 0) + 1;
+                        room.matchId = makeMatchId();
+                        room.finalResult = null;
+                        room.battleStartAtMs = null;
+                        room.matchStartedAtMs = Date.now();
+                    }
+                    room.hostCharacterId = enumToken(msg.hostCharacterId) || room.hostCharacterId;
+                    room.hostPassiveId = enumToken(msg.hostPassiveId) || room.hostPassiveId;
+                    room.hostNickname = typeof msg.hostNickname === 'string' ? msg.hostNickname : room.hostNickname;
+                    room.hostPlayerId = typeof msg.hostPlayerId === 'string' ? msg.hostPlayerId : room.hostPlayerId;
+                    room.arenaId = enumToken(msg.arenaId) || room.arenaId;
+                    const gameStartPacket = { ...msg, matchId: room.matchId };
+                    const peer = ws.role === 'host' ? room.guest : room.host;
+                    send(peer, gameStartPacket);
+                    send(ws, {
+                        type: 'match_assigned',
+                        matchId: room.matchId,
+                        matchSequence: room.matchSequence,
+                    });
+                    break;
+                }
+                if (msg.type === 'game_ready' && ws.role === 'guest') {
+                    room.guestCharacterId = enumToken(msg.guestCharacterId) || room.guestCharacterId;
+                    room.guestPassiveId = enumToken(msg.guestPassiveId) || room.guestPassiveId;
+                    room.guestNickname = typeof msg.guestNickname === 'string' ? msg.guestNickname : room.guestNickname;
+                    room.guestPlayerId = typeof msg.guestPlayerId === 'string' ? msg.guestPlayerId : room.guestPlayerId;
+                }
+                if (msg.type === 'rematch_ready') {
+                    const prefix = ws.role === 'host' ? 'host' : 'guest';
+                    room[`${prefix}CharacterId`] = enumToken(msg.characterId) || room[`${prefix}CharacterId`];
+                    room[`${prefix}PassiveId`] = enumToken(msg.passiveId) || room[`${prefix}PassiveId`];
+                    room[`${prefix}Nickname`] = typeof msg.nickname === 'string' ? msg.nickname : room[`${prefix}Nickname`];
+                    room[`${prefix}PlayerId`] = typeof msg.playerId === 'string' ? msg.playerId : room[`${prefix}PlayerId`];
                 }
                 const peer = ws.role === 'host' ? room.guest : room.host;
                 send(peer, msg);
@@ -1687,6 +1968,14 @@ wss.on('connection', (ws) => {
         }
 
         const peer = ws.role === 'host' ? room.guest : room.host;
+
+        if (room.matchStarted) {
+            finalizeRoomMatch(room, ws.role, {
+                outcome: 'loss',
+                reason: 'disconnect_timeout',
+                hp: 0,
+            });
+        }
 
         // 상대방에게 연결 끊김 알림
         send(peer, { type: 'peer_disconnected' });
