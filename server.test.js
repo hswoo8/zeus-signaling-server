@@ -143,6 +143,18 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         }),
     });
     assert.equal(singleAccepted.status, 202);
+    const usageEvents = [
+        { eventId: 'screen:home:1', eventName: 'screen_view', properties: { screen: 'home' } },
+        { eventId: 'feature:single:1', eventName: 'feature_use', properties: { feature: 'single_open' } },
+    ];
+    for (const usage of usageEvents) {
+        const response = await fetch(`${baseUrl}/analytics/events`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-country-code': 'KR' },
+            body: JSON.stringify({ ...launchEvent, ...usage }),
+        });
+        assert.equal(response.status, 202);
+    }
 
     const host = await connect(`ws://127.0.0.1:${port}`);
     const guest = await connect(`ws://127.0.0.1:${port}`);
@@ -312,6 +324,11 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(snapshot.periods.retention.launches, 1);
     assert.equal(snapshot.periods.retention.singleMatches, 1);
     assert.equal(snapshot.periods.retention.multiMatches, 3);
+    assert.equal(snapshot.kpis.dau, 2);
+    assert.equal(snapshot.kpis.wau, 2);
+    assert.equal(snapshot.kpis.mau, 2);
+    assert.equal(snapshot.screenViews[0].screen, 'home');
+    assert.equal(snapshot.featureUsage[0].feature, 'single_open');
     assert.equal(snapshot.countries.find((row) => row.country === 'KR').launches, 1);
     assert.equal(snapshot.suspiciousPairs[0].matches, 3);
 

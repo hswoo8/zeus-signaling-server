@@ -1,6 +1,11 @@
 const crypto = require('crypto');
 
-const EXTERNAL_EVENT_NAMES = new Set(['app_launch', 'single_match_complete']);
+const EXTERNAL_EVENT_NAMES = new Set([
+    'app_launch',
+    'single_match_complete',
+    'screen_view',
+    'feature_use',
+]);
 const INTERNAL_EVENT_NAMES = new Set([...EXTERNAL_EVENT_NAMES, 'multi_match_complete']);
 
 function cleanText(value, maxLength = 160, fallback = '') {
@@ -66,6 +71,12 @@ function sanitizeProperties(eventName, value) {
             arenaId: cleanText(source.arenaId, 40) || null,
             battleType: cleanText(source.battleType, 24) || null,
         };
+    }
+    if (eventName === 'screen_view') {
+        return { screen: cleanText(source.screen, 48) || null };
+    }
+    if (eventName === 'feature_use') {
+        return { feature: cleanText(source.feature, 64) || null };
     }
     return source;
 }
@@ -245,6 +256,8 @@ function aggregateEvents(events, runtime) {
     const daily = new Map();
     const reasons = new Map();
     const pairs = new Map();
+    const screenViews = new Map();
+    const featureUsage = new Map();
 
     const incrementVersion = (name, code, field) => {
         const key = `${name || 'unknown'} (${code ?? '-'})`;
@@ -285,10 +298,21 @@ function aggregateEvents(events, runtime) {
         }
 
         const dayKey = kstDayKey(timestamp);
-        const day = daily.get(dayKey) || { date: dayKey, launches: 0, singleMatches: 0, multiMatches: 0 };
+        const day = daily.get(dayKey) || {
+            date: dayKey,
+            launches: 0,
+            singleMatches: 0,
+            multiMatches: 0,
+            users: new Set(),
+        };
         if (isLaunch) day.launches += 1;
         if (isSingle) day.singleMatches += 1;
         if (isMulti) day.multiMatches += 1;
+        if (event.playerIdHash) day.users.add(event.playerIdHash);
+        if (isMulti) {
+            if (event.properties.hostPlayerHash) day.users.add(event.properties.hostPlayerHash);
+            if (event.properties.guestPlayerHash) day.users.add(event.properties.guestPlayerHash);
+        }
         daily.set(dayKey, day);
 
         if (isLaunch) {
@@ -326,6 +350,12 @@ function aggregateEvents(events, runtime) {
                 row.winnerCounts.set(winner, (row.winnerCounts.get(winner) || 0) + 1);
                 pairs.set(key, row);
             }
+        } else if (event.eventName === 'screen_view') {
+            const screen = cleanText(event.properties.screen, 48);
+            if (screen) screenViews.set(screen, (screenViews.get(screen) || 0) + 1);
+        } else if (event.eventName === 'feature_use') {
+            const feature = cleanText(event.properties.feature, 64);
+            if (feature) featureUsage.set(feature, (featureUsage.get(feature) || 0) + 1);
         }
     }
 
@@ -356,6 +386,19 @@ function aggregateEvents(events, runtime) {
     }).filter((row) => row.matches >= 2)
         .sort((a, b) => b.riskScore - a.riskScore || b.matches - a.matches)
         .slice(0, 50);
+    const dau = periods.today.uniqueUsers;
+    const wau = periods.days7.uniqueUsers;
+    const mau = periods.days30.uniqueUsers;
+    const kpis = {
+        dau,
+        wau,
+        mau,
+        dauMauPercent: mau > 0 ? Math.round(dau * 1000 / mau) / 10 : 0,
+        matchesPerMau: mau > 0 ? Math.round(periods.days30.totalMatches * 10 / mau) / 10 : 0,
+        multiSharePercent: periods.days30.totalMatches > 0
+            ? Math.round(periods.days30.multiMatches * 1000 / periods.days30.totalMatches) / 10
+            : 0,
+    };
 
     return {
         generatedAt: new Date(now).toISOString(),
@@ -364,11 +407,14 @@ function aggregateEvents(events, runtime) {
         uptimeSec: runtime.uptimeSec || 0,
         live: runtime.live || {},
         periods,
+        kpis,
         versions: Array.from(versions.values()).sort((a, b) => b.launches + b.singleMatches + b.multiParticipations - (a.launches + a.singleMatches + a.multiParticipations)),
         countries: Array.from(countries.values()).sort((a, b) => b.launches + b.singleMatches + b.multiParticipations - (a.launches + a.singleMatches + a.multiParticipations)),
         userAgents: Array.from(userAgents.values()).sort((a, b) => b.launches + b.multiConnections - (a.launches + a.multiConnections)).slice(0, 50),
         daily: filledDailyRows(daily, now, 30),
         finishReasons: Array.from(reasons.entries()).map(([reason, count]) => ({ reason, count })).sort((a, b) => b.count - a.count),
+        screenViews: Array.from(screenViews.entries()).map(([screen, count]) => ({ screen, count })).sort((a, b) => b.count - a.count),
+        featureUsage: Array.from(featureUsage.entries()).map(([feature, count]) => ({ feature, count })).sort((a, b) => b.count - a.count),
         suspiciousPairs,
     };
 }
@@ -388,7 +434,20 @@ function filledDailyRows(daily, now, count) {
     const todayStart = startOfKstDay(now);
     for (let offset = 0; offset < count; offset += 1) {
         const date = kstDayKey(todayStart - offset * 86400000);
-        rows.push(daily.get(date) || { date, launches: 0, singleMatches: 0, multiMatches: 0 });
+        const row = daily.get(date);
+        rows.push(row ? {
+            date: row.date,
+            launches: row.launches,
+            singleMatches: row.singleMatches,
+            multiMatches: row.multiMatches,
+            uniqueUsers: row.users.size,
+        } : {
+            date,
+            launches: 0,
+            singleMatches: 0,
+            multiMatches: 0,
+            uniqueUsers: 0,
+        });
     }
     return rows;
 }
@@ -417,7 +476,7 @@ function lineChart(dailyRows) {
     const margin = { left: 48, right: 18, top: 18, bottom: 40 };
     const plotWidth = width - margin.left - margin.right;
     const plotHeight = height - margin.top - margin.bottom;
-    const maxValue = Math.max(1, ...rows.flatMap((row) => [row.launches, row.singleMatches, row.multiMatches]));
+    const maxValue = Math.max(1, ...rows.flatMap((row) => [row.launches, row.singleMatches, row.multiMatches, row.uniqueUsers]));
     const x = (index) => margin.left + (rows.length <= 1 ? 0 : index * plotWidth / (rows.length - 1));
     const y = (value) => margin.top + plotHeight - value * plotHeight / maxValue;
     const points = (key) => rows.map((row, index) => `${x(index).toFixed(1)},${y(row[key]).toFixed(1)}`).join(' ');
@@ -431,9 +490,10 @@ function lineChart(dailyRows) {
         return `<text x="${x(index)}" y="${height - 13}" class="axis-label" text-anchor="middle">${escapeHtml(row.date.slice(5))}</text>`;
     }).join('');
     return `<div class="chart-panel">
-        <div class="legend"><span><i class="launch"></i>실행</span><span><i class="single"></i>싱글</span><span><i class="multi"></i>멀티</span></div>
+        <div class="legend"><span><i class="active"></i>활성 사용자</span><span><i class="launch"></i>실행</span><span><i class="single"></i>싱글</span><span><i class="multi"></i>멀티</span></div>
         <svg class="line-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="최근 30일 실행, 싱글, 멀티 추이">
             ${grid}${labels}
+            <polyline points="${points('uniqueUsers')}" class="series active-line"/>
             <polyline points="${points('launches')}" class="series launch-line"/>
             <polyline points="${points('singleMatches')}" class="series single-line"/>
             <polyline points="${points('multiMatches')}" class="series multi-line"/>
@@ -460,6 +520,7 @@ function renderAdminPage(snapshot) {
     const today = snapshot.periods.today;
     const days7 = snapshot.periods.days7;
     const live = snapshot.live;
+    const kpis = snapshot.kpis;
     const generated = new Date(snapshot.generatedAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
     const metric = (label, value, sub) => `
         <article class="metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(sub)}</small></article>`;
@@ -471,7 +532,7 @@ function renderAdminPage(snapshot) {
 <meta name="robots" content="noindex,nofollow,noarchive">
 <title>MiniZeus Admin Stats</title>
 <style>
-:root{color-scheme:light;--bg:#f4f5f2;--surface:#fff;--line:#d8ddd5;--text:#20231f;--muted:#697067;--green:#19764c;--orange:#c65d1b;--red:#b83b32}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Noto Sans KR",sans-serif;letter-spacing:0}header{background:#20231f;color:#fff;padding:18px 24px;border-bottom:4px solid var(--green)}header h1{font-size:20px;margin:0 0 4px}header p{margin:0;color:#cbd2c8;font-size:12px}main{max-width:1500px;margin:0 auto;padding:20px 24px 48px}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}.toolbar a{color:#fff;background:var(--green);padding:8px 12px;border-radius:4px;text-decoration:none;font-weight:700}.metrics{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:10px;margin-bottom:22px}.metric{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;min-height:92px}.metric span,.metric small{display:block;color:var(--muted)}.metric strong{display:block;font-size:26px;margin:5px 0;color:var(--green)}section{margin:24px 0}h2{font-size:15px;margin:0 0 9px;padding-left:9px;border-left:4px solid var(--orange)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.chart-panel{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;overflow:hidden}.legend{display:flex;justify-content:flex-end;gap:18px;color:var(--muted);font-size:12px}.legend span{display:flex;align-items:center;gap:6px}.legend i{width:18px;height:3px;display:inline-block}.legend .launch,.bar-fill{background:var(--green)}.legend .single,.single-fill{background:var(--orange)}.legend .multi,.reason-fill{background:var(--red)}.line-chart{display:block;width:100%;height:auto;min-height:210px}.chart-grid{stroke:#e3e7e1;stroke-width:1}.axis-label{fill:#737b72;font-size:11px}.series{fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}.launch-line{stroke:var(--green)}.single-line{stroke:var(--orange)}.multi-line{stroke:var(--red)}.bars{display:grid;gap:9px;min-height:180px}.bar-row{display:grid;grid-template-columns:minmax(72px,120px) minmax(100px,1fr) 44px;align-items:center;gap:9px}.bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#4d554c}.bar-track{height:12px;background:#e9ece7;border-radius:3px;overflow:hidden}.bar-track i{display:block;height:100%;border-radius:3px}.bar-row strong{text-align:right;font-variant-numeric:tabular-nums}.table-wrap{overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:6px}table{width:100%;border-collapse:collapse;min-width:560px}th,td{text-align:left;padding:9px 11px;border-bottom:1px solid #e7eae5;white-space:nowrap}th{position:sticky;top:0;background:#eef1ec;color:#4d554c;font-size:12px}tbody tr:hover{background:#fafbf9}.empty{text-align:center;color:var(--muted);padding:24px}.warn{color:var(--red);font-weight:700}.foot{color:var(--muted);font-size:12px;margin-top:24px}@media(max-width:900px){main{padding:14px}.metrics{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}header{padding:14px}.legend{justify-content:flex-start;flex-wrap:wrap}.line-chart{min-width:720px}.chart-panel:has(.line-chart){overflow:auto}}
+:root{color-scheme:light;--bg:#f4f5f2;--surface:#fff;--line:#d8ddd5;--text:#20231f;--muted:#697067;--green:#19764c;--orange:#c65d1b;--red:#b83b32;--ink:#38424b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Noto Sans KR",sans-serif;letter-spacing:0}header{background:#20231f;color:#fff;padding:18px 24px;border-bottom:4px solid var(--green)}header h1{font-size:20px;margin:0 0 4px}header p{margin:0;color:#cbd2c8;font-size:12px}main{max-width:1500px;margin:0 auto;padding:20px 24px 48px}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}.toolbar a{color:#fff;background:var(--green);padding:8px 12px;border-radius:4px;text-decoration:none;font-weight:700}.metrics{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:10px;margin-bottom:22px}.metric{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;min-height:92px}.metric span,.metric small{display:block;color:var(--muted)}.metric strong{display:block;font-size:26px;margin:5px 0;color:var(--green)}section{margin:24px 0}h2{font-size:15px;margin:0 0 9px;padding-left:9px;border-left:4px solid var(--orange)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.chart-panel{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;overflow:hidden}.legend{display:flex;justify-content:flex-end;gap:18px;color:var(--muted);font-size:12px}.legend span{display:flex;align-items:center;gap:6px}.legend i{width:18px;height:3px;display:inline-block}.legend .active{background:var(--ink)}.legend .launch,.bar-fill{background:var(--green)}.legend .single,.single-fill{background:var(--orange)}.legend .multi,.reason-fill{background:var(--red)}.line-chart{display:block;width:100%;height:auto;min-height:210px}.chart-grid{stroke:#e3e7e1;stroke-width:1}.axis-label{fill:#737b72;font-size:11px}.series{fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}.active-line{stroke:var(--ink)}.launch-line{stroke:var(--green)}.single-line{stroke:var(--orange)}.multi-line{stroke:var(--red)}.bars{display:grid;gap:9px;min-height:180px}.bar-row{display:grid;grid-template-columns:minmax(72px,120px) minmax(100px,1fr) 44px;align-items:center;gap:9px}.bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#4d554c}.bar-track{height:12px;background:#e9ece7;border-radius:3px;overflow:hidden}.bar-track i{display:block;height:100%;border-radius:3px}.bar-row strong{text-align:right;font-variant-numeric:tabular-nums}.table-wrap{overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:6px}table{width:100%;border-collapse:collapse;min-width:560px}th,td{text-align:left;padding:9px 11px;border-bottom:1px solid #e7eae5;white-space:nowrap}th{position:sticky;top:0;background:#eef1ec;color:#4d554c;font-size:12px}tbody tr:hover{background:#fafbf9}.empty{text-align:center;color:var(--muted);padding:24px}.warn{color:var(--red);font-weight:700}.foot{color:var(--muted);font-size:12px;margin-top:24px}@media(max-width:900px){main{padding:14px}.metrics{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}header{padding:14px}.legend{justify-content:flex-start;flex-wrap:wrap}.line-chart{min-width:720px}.chart-panel:has(.line-chart){overflow:auto}}
 </style>
 </head>
 <body>
@@ -482,7 +543,12 @@ function renderAdminPage(snapshot) {
 ${metric('오늘 실행', today.launches, `7일 ${days7.launches}`)}
 ${metric('오늘 싱글', today.singleMatches, `7일 ${days7.singleMatches}`)}
 ${metric('오늘 멀티', today.multiMatches, `7일 ${days7.multiMatches}`)}
-${metric('7일 익명 사용자', days7.uniqueUsers, 'playerId 해시 기준')}
+${metric('DAU', kpis.dau, '오늘 익명 사용자')}
+${metric('WAU', kpis.wau, '최근 7일')}
+${metric('MAU', kpis.mau, '최근 30일')}
+${metric('DAU / MAU', `${kpis.dauMauPercent}%`, '활성도')}
+${metric('사용자당 매치', kpis.matchesPerMau, '최근 30일')}
+${metric('멀티 비중', `${kpis.multiSharePercent}%`, '최근 30일 매치')}
 ${metric('현재 연결', live.connections || 0, `방 ${live.rooms || 0}`)}
 ${metric('진행 중 대전', live.activeMatches || 0, `대기 방 ${live.waitingRooms || 0}`)}
 </div>
@@ -490,6 +556,8 @@ ${metric('진행 중 대전', live.activeMatches || 0, `대기 방 ${live.waitin
 <div class="grid">
 <section><h2>국가/지역 활동량</h2>${barChart(snapshot.countries, 'country', (r) => r.launches + r.singleMatches + r.multiParticipations, 'bar-fill')}</section>
 <section><h2>멀티 종료 사유 분포</h2>${barChart(snapshot.finishReasons, 'reason', (r) => r.count, 'reason-fill')}</section>
+<section><h2>많이 본 화면</h2>${barChart(snapshot.screenViews, 'screen', (r) => r.count, 'bar-fill')}</section>
+<section><h2>많이 사용한 기능</h2>${barChart(snapshot.featureUsage, 'feature', (r) => r.count, 'single-fill')}</section>
 </div>
 <div class="grid">
 <section><h2>일자별 추이</h2>${table(['날짜','실행','싱글','멀티'], snapshot.daily.map((r) => [r.date,r.launches,r.singleMatches,r.multiMatches]))}</section>
