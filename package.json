@@ -1,11 +1,11 @@
 {
   "name": "zeus-signaling-server",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "WebRTC signaling server for Zeus 1v1 Battle",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test server.test.js"
+    "test": "node --test *.test.js"
   },
   "engines": {
     "node": ">=18"

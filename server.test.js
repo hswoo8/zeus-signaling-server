@@ -8,6 +8,7 @@ const versionFields = {
     clientVersionName: '1.2.3-debug',
     analyticsChannel: 'dev',
     protocolVersion: 1,
+    rulesetVersion: 1,
     balanceVersion: 1,
 };
 
@@ -93,6 +94,13 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
             DATABASE_URL: '',
             ADMIN_DASHBOARD_USERNAME: 'admin',
             ADMIN_DASHBOARD_PASSWORD: 'test-password',
+            SERVER_CHANNEL: 'dev',
+            SERVER_POOL_ID: 'test-pool',
+            SERVER_ALLOWED_CHANNELS: 'dev',
+            MULTIPLAYER_RULESET_VERSION: '1',
+            MULTIPLAYER_MAX_APP_VERSION_CODE: '1',
+            MULTIPLAYER_MAX_PROTOCOL_VERSION: '1',
+            MULTIPLAYER_MAX_BALANCE_VERSION: '1',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -102,6 +110,19 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         if (child.exitCode === null) child.kill('SIGTERM');
     });
     await waitForServer(baseUrl, child);
+
+    const health = await fetch(`${baseUrl}/health`).then((response) => response.json());
+    assert.equal(health.channel, 'dev');
+    assert.equal(health.poolId, 'test-pool');
+    assert.equal(health.rulesetVersion, 1);
+
+    const wrongEnvironmentCapacity = await fetch(
+        `${baseUrl}/capacity?clientVersionCode=1&protocolVersion=1&rulesetVersion=1&balanceVersion=1&channel=production`
+    );
+    assert.equal(wrongEnvironmentCapacity.status, 200);
+    const wrongEnvironmentStatus = await wrongEnvironmentCapacity.json();
+    assert.equal(wrongEnvironmentStatus.code, 'wrong_environment');
+    assert.equal(wrongEnvironmentStatus.canAcceptMatchmaking, false);
 
     const unauthorizedAdmin = await fetch(`${baseUrl}/admin`);
     assert.equal(unauthorizedAdmin.status, 401);

@@ -58,6 +58,22 @@ const MIN_BALANCE_VERSION = envInt(
     ['MULTIPLAYER_MIN_BALANCE_VERSION', 'MIN_BALANCE_VERSION'],
     1
 );
+const MAX_CLIENT_VERSION_CODE = envOptionalInt(
+    ['MULTIPLAYER_MAX_APP_VERSION_CODE', 'MAX_CLIENT_VERSION_CODE']
+) || Number.MAX_SAFE_INTEGER;
+const MAX_PROTOCOL_VERSION = envOptionalInt(
+    ['MULTIPLAYER_MAX_PROTOCOL_VERSION', 'MAX_PROTOCOL_VERSION']
+) || Number.MAX_SAFE_INTEGER;
+const MAX_BALANCE_VERSION = envOptionalInt(
+    ['MULTIPLAYER_MAX_BALANCE_VERSION', 'MAX_BALANCE_VERSION']
+) || Number.MAX_SAFE_INTEGER;
+const RULESET_VERSION = envOptionalInt(['MULTIPLAYER_RULESET_VERSION', 'RULESET_VERSION']);
+const SERVER_CHANNEL = envToken('SERVER_CHANNEL', 'unrestricted');
+const SERVER_POOL_ID = envToken('SERVER_POOL_ID', 'default');
+const SERVER_ALLOWED_CHANNELS = envTokenSet(
+    'SERVER_ALLOWED_CHANNELS',
+    SERVER_CHANNEL === 'unrestricted' ? [] : [SERVER_CHANNEL]
+);
 const NETWORK_MODES = new Set(['auto', 'relay', 'p2p']);
 const BATTLE_TYPES = new Set(['short', 'standard', 'long']);
 const statsPool = DATABASE_URL ? new Pool({
@@ -134,6 +150,22 @@ function envBool(names, fallback) {
         if (['0', 'false', 'no', 'off'].includes(raw)) return false;
     }
     return fallback;
+}
+
+function envToken(name, fallback) {
+    const value = String(process.env[name] || fallback || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]/g, '')
+        .slice(0, 48);
+    return value || fallback;
+}
+
+function envTokenSet(name, fallback) {
+    const source = String(process.env[name] || '').trim()
+        ? String(process.env[name])
+        : fallback.join(',');
+    return new Set(source.split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
 }
 
 function postgresSslConfig() {
@@ -435,6 +467,12 @@ function capacitySnapshot(options = {}) {
         requiredVersionCode: MIN_CLIENT_VERSION_CODE,
         requiredProtocolVersion: MIN_PROTOCOL_VERSION,
         requiredBalanceVersion: MIN_BALANCE_VERSION,
+        requiredRulesetVersion: RULESET_VERSION || null,
+        maxVersionCode: MAX_CLIENT_VERSION_CODE === Number.MAX_SAFE_INTEGER ? null : MAX_CLIENT_VERSION_CODE,
+        maxProtocolVersion: MAX_PROTOCOL_VERSION === Number.MAX_SAFE_INTEGER ? null : MAX_PROTOCOL_VERSION,
+        maxBalanceVersion: MAX_BALANCE_VERSION === Number.MAX_SAFE_INTEGER ? null : MAX_BALANCE_VERSION,
+        channel: SERVER_CHANNEL,
+        poolId: SERVER_POOL_ID,
     };
 }
 
@@ -526,6 +564,9 @@ async function handleHttpRequest(req, res) {
             ok: true,
             service: 'beerock-signaling-server',
             version: packageJson.version || '1.0.0',
+            channel: SERVER_CHANNEL,
+            poolId: SERVER_POOL_ID,
+            rulesetVersion: RULESET_VERSION || null,
             uptimeSec: Math.floor(process.uptime()),
             storage: storageMode(),
             rooms: Object.keys(rooms).length,
@@ -535,13 +576,13 @@ async function handleHttpRequest(req, res) {
     }
 
     if (req.method === 'GET' && pathname === '/capacity') {
-        const compatibilityMessage = compatibilityErrorFromQuery(url.searchParams);
-        if (compatibilityMessage) {
+        const compatibilityIssue = compatibilityErrorFromQuery(url.searchParams);
+        if (compatibilityIssue) {
             sendJson(res, 200, {
                 ...capacitySnapshot(),
-                status: 'update_required',
-                code: 'update_required',
-                message: compatibilityMessage,
+                status: compatibilityIssue.code === 'wrong_environment' ? 'wrong_environment' : 'update_required',
+                code: compatibilityIssue.code,
+                message: compatibilityIssue.message,
                 canConnect: false,
                 canCreateRoom: false,
                 canJoinRoom: false,
@@ -1506,6 +1547,7 @@ function confirmationRecord(room, result) {
         hostHp: result.hostHp,
         guestHp: result.guestHp,
         arenaId: room.arenaId || null,
+        rulesetVersion: room.rulesetVersion || null,
         durationSec: result.durationSec,
         completedAt: result.completedAt,
         expiresAt: new Date(result.expiresAt).toISOString(),
@@ -1565,6 +1607,7 @@ function recordMultiMatchAnalytics(room, result) {
             durationSec: result.durationSec,
             battleType: room.battleType || 'short',
             arenaId: room.arenaId || null,
+            rulesetVersion: room.rulesetVersion || null,
         },
     }).catch((err) => {
         console.error('[analytics] failed to record multi match:', err?.message || err);
@@ -1779,24 +1822,49 @@ function queryInt(params, field) {
     return Number.isFinite(parsed) ? parsed : null;
 }
 
-function clientCompatibilityError(clientVersionCode, protocolVersion, balanceVersion, requireAll) {
+function clientCompatibilityError(
+    clientVersionCode,
+    protocolVersion,
+    rulesetVersion,
+    balanceVersion,
+    channel,
+    requireAll
+) {
+    if (SERVER_ALLOWED_CHANNELS.size > 0 && !SERVER_ALLOWED_CHANNELS.has(channel)) {
+        return {
+            code: 'wrong_environment',
+            message: `${channel || 'unknown'} 앱은 ${SERVER_CHANNEL} 대전 서버를 사용할 수 없습니다.`,
+        };
+    }
     if (requireAll && clientVersionCode === null) {
-        return '앱 버전 정보를 확인할 수 없습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+        return { code: 'update_required', message: '앱 버전 정보를 확인할 수 없습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.' };
     }
     if (clientVersionCode !== null && clientVersionCode < MIN_CLIENT_VERSION_CODE) {
-        return `앱 업데이트가 필요합니다. 필요 버전 코드 ${MIN_CLIENT_VERSION_CODE} 이상에서 대전할 수 있습니다.`;
+        return { code: 'update_required', message: `앱 업데이트가 필요합니다. 필요 버전 코드 ${MIN_CLIENT_VERSION_CODE} 이상에서 대전할 수 있습니다.` };
+    }
+    if (clientVersionCode !== null && clientVersionCode > MAX_CLIENT_VERSION_CODE) {
+        return { code: 'incompatible_version', message: '이 서버보다 새로운 앱 버전입니다. 호환되는 대전 서버로 다시 연결해주세요.' };
     }
     if (requireAll && protocolVersion === null) {
-        return '대전 프로토콜 정보를 확인할 수 없습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+        return { code: 'update_required', message: '대전 프로토콜 정보를 확인할 수 없습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.' };
     }
     if (protocolVersion !== null && protocolVersion < MIN_PROTOCOL_VERSION) {
-        return '대전 프로토콜이 오래되었습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+        return { code: 'update_required', message: '대전 프로토콜이 오래되었습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.' };
+    }
+    if (protocolVersion !== null && protocolVersion > MAX_PROTOCOL_VERSION) {
+        return { code: 'incompatible_version', message: '이 서버와 대전 프로토콜이 맞지 않습니다.' };
+    }
+    if (RULESET_VERSION > 0 && rulesetVersion !== RULESET_VERSION) {
+        return { code: 'incompatible_ruleset', message: '이 서버와 대전 규칙 버전이 맞지 않습니다.' };
     }
     if (requireAll && balanceVersion === null) {
-        return '대전 밸런스 정보를 확인할 수 없습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+        return { code: 'update_required', message: '대전 밸런스 정보를 확인할 수 없습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.' };
     }
     if (balanceVersion !== null && balanceVersion < MIN_BALANCE_VERSION) {
-        return '대전 밸런스 데이터가 오래되었습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.';
+        return { code: 'update_required', message: '대전 밸런스 데이터가 오래되었습니다. 최신 앱으로 업데이트 후 다시 대전해주세요.' };
+    }
+    if (balanceVersion !== null && balanceVersion > MAX_BALANCE_VERSION) {
+        return { code: 'incompatible_version', message: '이 서버와 대전 밸런스 버전이 맞지 않습니다.' };
     }
     return null;
 }
@@ -1804,9 +1872,11 @@ function clientCompatibilityError(clientVersionCode, protocolVersion, balanceVer
 function compatibilityErrorFromQuery(params) {
     const clientVersionCode = queryInt(params, 'clientVersionCode');
     const protocolVersion = queryInt(params, 'protocolVersion');
+    const rulesetVersion = queryInt(params, 'rulesetVersion');
     const balanceVersion = queryInt(params, 'balanceVersion');
-    const hasAnyVersionField = clientVersionCode !== null || protocolVersion !== null || balanceVersion !== null;
-    return clientCompatibilityError(clientVersionCode, protocolVersion, balanceVersion, hasAnyVersionField);
+    const channel = String(params.get('channel') || '').trim().toLowerCase();
+    const hasAnyVersionField = clientVersionCode !== null || protocolVersion !== null || rulesetVersion !== null || balanceVersion !== null;
+    return clientCompatibilityError(clientVersionCode, protocolVersion, rulesetVersion, balanceVersion, channel, hasAnyVersionField);
 }
 
 function compatibilityError(msg) {
@@ -1814,9 +1884,11 @@ function compatibilityError(msg) {
 
     const clientVersionCode = packetInt(msg, 'clientVersionCode');
     const protocolVersion = packetInt(msg, 'protocolVersion');
+    const rulesetVersion = packetInt(msg, 'rulesetVersion');
     const balanceVersion = packetInt(msg, 'balanceVersion');
+    const channel = typeof msg.analyticsChannel === 'string' ? msg.analyticsChannel.trim().toLowerCase() : '';
 
-    return clientCompatibilityError(clientVersionCode, protocolVersion, balanceVersion, true);
+    return clientCompatibilityError(clientVersionCode, protocolVersion, rulesetVersion, balanceVersion, channel, true);
 }
 
 wss.on('connection', (ws, req) => {
@@ -1852,15 +1924,16 @@ wss.on('connection', (ws, req) => {
 
         if (!msg || typeof msg.type !== 'string' || !ALL_TYPES.has(msg.type)) return;
         if (!rateLimitOk(ws, msg.type)) return;
-        const compatibilityMessage = compatibilityError(msg);
-        if (compatibilityMessage) {
+        const compatibilityIssue = compatibilityError(msg);
+        if (compatibilityIssue) {
             send(ws, {
                 type: 'error',
-                code: 'update_required',
-                message: compatibilityMessage,
+                code: compatibilityIssue.code,
+                message: compatibilityIssue.message,
                 requiredVersionCode: MIN_CLIENT_VERSION_CODE,
                 requiredProtocolVersion: MIN_PROTOCOL_VERSION,
                 requiredBalanceVersion: MIN_BALANCE_VERSION,
+                requiredRulesetVersion: RULESET_VERSION || null,
             });
             return;
         }
@@ -1905,6 +1978,7 @@ wss.on('connection', (ws, req) => {
                     hostPassiveId: enumToken(msg.hostPassiveId),
                     arenaId: enumToken(msg.arenaId),
                     battleType: battleType(msg.battleType),
+                    rulesetVersion: packetInt(msg, 'rulesetVersion'),
                     hostNickname: typeof msg.hostNickname === 'string' ? msg.hostNickname : undefined,
                     hostPlayerId: typeof msg.hostPlayerId === 'string' ? msg.hostPlayerId : undefined,
                     hostVersionCode: packetInt(msg, 'clientVersionCode'),
