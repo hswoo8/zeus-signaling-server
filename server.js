@@ -1,7 +1,17 @@
 const http = require('http');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 const { Pool } = require('pg');
 const packageJson = require('./package.json');
+const {
+    AnalyticsStore,
+    eventFromHttpRequest,
+    hashIdentifier,
+    pairHash,
+    renderAdminPage,
+    requestCountry,
+    safeUserAgent,
+} = require('./analytics');
 
 const PORT = process.env.PORT || 8080;
 const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
@@ -30,6 +40,11 @@ const RATE_LIMITS = {
 };
 const BATTLE_COUNTDOWN_SYNC_DELAY_MS = Number(process.env.BATTLE_COUNTDOWN_SYNC_DELAY_MS || 4500);
 const CONFIRMED_MATCH_TTL_MS = Number(process.env.CONFIRMED_MATCH_TTL_MS || 24 * 60 * 60 * 1000);
+const ANALYTICS_RETENTION_DAYS = Number(process.env.ANALYTICS_RETENTION_DAYS || 90);
+const ANALYTICS_INGEST_ENABLED = envBool(['ANALYTICS_INGEST_ENABLED'], true);
+const ANALYTICS_RATE_LIMIT_PER_MINUTE = Number(process.env.ANALYTICS_RATE_LIMIT_PER_MINUTE || 120);
+const ADMIN_DASHBOARD_USERNAME = (process.env.ADMIN_DASHBOARD_USERNAME || 'admin').trim();
+const ADMIN_DASHBOARD_PASSWORD = (process.env.ADMIN_DASHBOARD_PASSWORD || '').trim();
 const MIN_CLIENT_VERSION_CODE = envInt(
     ['MULTIPLAYER_MIN_APP_VERSION_CODE', 'MIN_CLIENT_VERSION_CODE'],
     1
@@ -48,6 +63,7 @@ const statsPool = DATABASE_URL ? new Pool({
     connectionString: DATABASE_URL,
     ssl: postgresSslConfig(),
 }) : null;
+const analyticsStore = new AnalyticsStore(statsPool, { retentionDays: ANALYTICS_RETENTION_DAYS });
 const server = http.createServer((req, res) => {
     handleHttpRequest(req, res).catch((err) => {
         console.error('[http] unexpected error:', err?.message || err);
@@ -63,6 +79,7 @@ const rooms = {};
 const statsPlayers = new Map();
 const statsIdempotency = new Map();
 const confirmedPvpMatches = new Map();
+const analyticsRequestBuckets = new Map();
 let serverMatchCounter = 0;
 
 const LOBBY_TYPES = new Set([
@@ -224,8 +241,95 @@ function sendJson(res, statusCode, data) {
     res.end(body);
 }
 
+function sendHtml(res, statusCode, body) {
+    res.writeHead(statusCode, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+        'Referrer-Policy': 'no-referrer',
+        'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    });
+    res.end(body);
+}
+
 function sendHttpError(res, statusCode, code, message) {
     sendJson(res, statusCode, { error: { code, message } });
+}
+
+function secureEqual(left, right) {
+    const leftBuffer = Buffer.from(String(left));
+    const rightBuffer = Buffer.from(String(right));
+    return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function adminDashboardEnabled() {
+    return Boolean(ADMIN_DASHBOARD_USERNAME && ADMIN_DASHBOARD_PASSWORD);
+}
+
+function adminAuthorized(req) {
+    const authorization = String(req.headers.authorization || '');
+    if (!authorization.startsWith('Basic ')) return false;
+    let decoded;
+    try {
+        decoded = Buffer.from(authorization.slice(6), 'base64').toString('utf8');
+    } catch {
+        return false;
+    }
+    const separator = decoded.indexOf(':');
+    if (separator < 0) return false;
+    return secureEqual(decoded.slice(0, separator), ADMIN_DASHBOARD_USERNAME) &&
+        secureEqual(decoded.slice(separator + 1), ADMIN_DASHBOARD_PASSWORD);
+}
+
+function requireAdmin(req, res) {
+    if (!adminDashboardEnabled()) {
+        sendHttpError(res, 503, 'admin_disabled', 'Admin dashboard credentials are not configured');
+        return false;
+    }
+    if (!adminAuthorized(req)) {
+        res.writeHead(401, {
+            'WWW-Authenticate': 'Basic realm="MiniZeus Admin", charset="UTF-8"',
+            'Cache-Control': 'no-store',
+        });
+        res.end('Authentication required');
+        return false;
+    }
+    return true;
+}
+
+function analyticsRuntimeSnapshot() {
+    const roomStats = roomCounts();
+    return {
+        storage: storageMode(),
+        uptimeSec: Math.floor(process.uptime()),
+        live: {
+            connections: openConnectionCount(),
+            rooms: roomStats.rooms,
+            waitingRooms: roomStats.waitingRooms,
+            activeMatches: roomStats.activeMatches,
+        },
+    };
+}
+
+function analyticsRequestAllowed(req) {
+    const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const addressHash = hashIdentifier(forwarded || req.socket?.remoteAddress || 'unknown') || 'unknown';
+    const now = Date.now();
+    const bucket = analyticsRequestBuckets.get(addressHash) || { windowStart: now, count: 0 };
+    if (now - bucket.windowStart >= 60000) {
+        bucket.windowStart = now;
+        bucket.count = 0;
+    }
+    bucket.count += 1;
+    analyticsRequestBuckets.set(addressHash, bucket);
+    if (analyticsRequestBuckets.size > 5000) {
+        for (const [key, value] of analyticsRequestBuckets) {
+            if (now - value.windowStart >= 120000) analyticsRequestBuckets.delete(key);
+        }
+    }
+    return bucket.count <= ANALYTICS_RATE_LIMIT_PER_MINUTE;
 }
 
 function openConnectionCount() {
@@ -375,6 +479,40 @@ async function handleHttpRequest(req, res) {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = url.pathname;
 
+    if (req.method === 'GET' && (pathname === '/admin' || pathname === '/admin/')) {
+        if (!requireAdmin(req, res)) return;
+        const snapshot = await analyticsStore.snapshot(analyticsRuntimeSnapshot());
+        sendHtml(res, 200, renderAdminPage(snapshot));
+        return;
+    }
+
+    if (req.method === 'GET' && pathname === '/admin/api/stats') {
+        if (!requireAdmin(req, res)) return;
+        sendJson(res, 200, await analyticsStore.snapshot(analyticsRuntimeSnapshot()));
+        return;
+    }
+
+    if (req.method === 'POST' && pathname === '/analytics/events') {
+        if (!ANALYTICS_INGEST_ENABLED) {
+            sendHttpError(res, 503, 'analytics_disabled', 'Analytics ingestion is disabled');
+            return;
+        }
+        if (!analyticsRequestAllowed(req)) {
+            sendHttpError(res, 429, 'rate_limited', 'Too many analytics events');
+            return;
+        }
+        const body = await readJsonRequest(req, res);
+        if (!body) return;
+        const event = eventFromHttpRequest(req, body);
+        if (!event) {
+            sendHttpError(res, 400, 'invalid_event', 'Analytics event is invalid or unsupported');
+            return;
+        }
+        const result = await analyticsStore.record(event);
+        sendJson(res, result.duplicate ? 200 : 202, result);
+        return;
+    }
+
     if (req.method === 'GET' && pathname === '/health') {
         const players = statsPool ? await postgresPlayerCount() : statsPlayers.size;
         sendJson(res, 200, {
@@ -479,10 +617,13 @@ async function handleHttpRequest(req, res) {
         return;
     }
 
-    if (['/matches/result', '/matches/pvp-result'].includes(pathname) ||
+    if (['/matches/result', '/matches/pvp-result', '/analytics/events'].includes(pathname) ||
         pathname === '/health' ||
         pathname === '/capacity' ||
         pathname === '/rankings' ||
+        pathname === '/admin' ||
+        pathname === '/admin/' ||
+        pathname === '/admin/api/stats' ||
         playerStatsMatch) {
         sendHttpError(res, 405, 'method_not_allowed', 'Method not allowed');
         return;
@@ -1380,6 +1521,46 @@ function rememberConfirmedPvpMatch(room, result) {
     }
 }
 
+function recordMultiMatchAnalytics(room, result) {
+    const hostPlayerHash = hashIdentifier(room.hostPlayerId || room.hostNickname);
+    const guestPlayerHash = hashIdentifier(room.guestPlayerId || room.guestNickname);
+    const winnerPlayerHash = result.winnerRole === 'host'
+        ? hostPlayerHash
+        : (result.winnerRole === 'guest' ? guestPlayerHash : null);
+    analyticsStore.record({
+        eventId: `multi:${result.matchId}`,
+        eventName: 'multi_match_complete',
+        occurredAt: result.completedAt,
+        playerIdHash: winnerPlayerHash,
+        appVersionName: room.hostVersionName || room.guestVersionName || 'unknown',
+        appVersionCode: room.hostVersionCode || room.guestVersionCode || null,
+        buildType: 'multiplayer',
+        platform: 'server',
+        userAgent: 'server-confirmed',
+        countryCode: 'ZZ',
+        properties: {
+            pairHash: pairHash(room.hostPlayerId || room.hostNickname, room.guestPlayerId || room.guestNickname),
+            hostPlayerHash,
+            guestPlayerHash,
+            winnerPlayerHash,
+            hostVersionName: room.hostVersionName || 'unknown',
+            hostVersionCode: room.hostVersionCode || null,
+            guestVersionName: room.guestVersionName || 'unknown',
+            guestVersionCode: room.guestVersionCode || null,
+            hostCountryCode: room.hostCountryCode || 'ZZ',
+            guestCountryCode: room.guestCountryCode || 'ZZ',
+            hostUserAgent: room.hostUserAgent || 'unknown',
+            guestUserAgent: room.guestUserAgent || 'unknown',
+            finishReason: resultReasonForRole(result, result.winnerRole || 'host'),
+            durationSec: result.durationSec,
+            battleType: room.battleType || 'short',
+            arenaId: room.arenaId || null,
+        },
+    }).catch((err) => {
+        console.error('[analytics] failed to record multi match:', err?.message || err);
+    });
+}
+
 function finalizeRoomMatch(room, reporterRole, msg) {
     if (!room || !['host', 'guest'].includes(reporterRole)) return null;
     if (room.finalResult) return room.finalResult;
@@ -1409,6 +1590,7 @@ function finalizeRoomMatch(room, reporterRole, msg) {
     room.finalResult = result;
     room.matchStarted = false;
     rememberConfirmedPvpMatch(room, result);
+    recordMultiMatchAnalytics(room, result);
     send(room.host, resultPacketForRole(result, 'host'));
     send(room.guest, resultPacketForRole(result, 'guest'));
     return result;
@@ -1534,6 +1716,10 @@ function resetGuestSlot(room) {
     room.guestArenaId = undefined;
     room.guestNickname = undefined;
     room.guestPlayerId = undefined;
+    room.guestVersionCode = undefined;
+    room.guestVersionName = undefined;
+    room.guestCountryCode = undefined;
+    room.guestUserAgent = undefined;
     room.matchStarted = false;
     room.matchId = null;
     room.finalResult = null;
@@ -1614,9 +1800,11 @@ function compatibilityError(msg) {
     return clientCompatibilityError(clientVersionCode, protocolVersion, balanceVersion, true);
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
     ws.roomCode = null;
     ws.role = null; // 'host' | 'guest'
+    ws.analyticsCountryCode = requestCountry(req, null);
+    ws.analyticsUserAgent = safeUserAgent(req);
     markSocketAlive(ws);
 
     const connectionCapacity = capacitySnapshot({ connectionExtra: 0 });
@@ -1700,11 +1888,19 @@ wss.on('connection', (ws) => {
                     battleType: battleType(msg.battleType),
                     hostNickname: typeof msg.hostNickname === 'string' ? msg.hostNickname : undefined,
                     hostPlayerId: typeof msg.hostPlayerId === 'string' ? msg.hostPlayerId : undefined,
+                    hostVersionCode: packetInt(msg, 'clientVersionCode'),
+                    hostVersionName: typeof msg.clientVersionName === 'string' ? msg.clientVersionName : undefined,
+                    hostCountryCode: ws.analyticsCountryCode,
+                    hostUserAgent: ws.analyticsUserAgent,
                     guestCharacterId: undefined,
                     guestPassiveId: undefined,
                     guestArenaId: undefined,
                     guestNickname: undefined,
                     guestPlayerId: undefined,
+                    guestVersionCode: undefined,
+                    guestVersionName: undefined,
+                    guestCountryCode: undefined,
+                    guestUserAgent: undefined,
                     networkMode: networkMode(msg.networkMode),
                     matchStarted: false,
                     matchId: null,
@@ -1755,6 +1951,10 @@ wss.on('connection', (ws) => {
                 room.guestArenaId = enumToken(msg.arenaId);
                 room.guestNickname = typeof msg.guestNickname === 'string' ? msg.guestNickname : undefined;
                 room.guestPlayerId = typeof msg.guestPlayerId === 'string' ? msg.guestPlayerId : undefined;
+                room.guestVersionCode = packetInt(msg, 'clientVersionCode');
+                room.guestVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : undefined;
+                room.guestCountryCode = ws.analyticsCountryCode;
+                room.guestUserAgent = ws.analyticsUserAgent;
                 ws.roomCode = code;
                 ws.role = 'guest';
 
@@ -1892,6 +2092,8 @@ wss.on('connection', (ws) => {
                     room.hostPassiveId = enumToken(msg.hostPassiveId) || room.hostPassiveId;
                     room.hostNickname = typeof msg.hostNickname === 'string' ? msg.hostNickname : room.hostNickname;
                     room.hostPlayerId = typeof msg.hostPlayerId === 'string' ? msg.hostPlayerId : room.hostPlayerId;
+                    room.hostVersionCode = packetInt(msg, 'clientVersionCode') || room.hostVersionCode;
+                    room.hostVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : room.hostVersionName;
                     room.arenaId = enumToken(msg.arenaId) || room.arenaId;
                     const gameStartPacket = { ...msg, matchId: room.matchId };
                     const peer = ws.role === 'host' ? room.guest : room.host;
@@ -1908,6 +2110,8 @@ wss.on('connection', (ws) => {
                     room.guestPassiveId = enumToken(msg.guestPassiveId) || room.guestPassiveId;
                     room.guestNickname = typeof msg.guestNickname === 'string' ? msg.guestNickname : room.guestNickname;
                     room.guestPlayerId = typeof msg.guestPlayerId === 'string' ? msg.guestPlayerId : room.guestPlayerId;
+                    room.guestVersionCode = packetInt(msg, 'clientVersionCode') || room.guestVersionCode;
+                    room.guestVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : room.guestVersionName;
                 }
                 if (msg.type === 'rematch_ready') {
                     const prefix = ws.role === 'host' ? 'host' : 'guest';
@@ -1954,6 +2158,10 @@ wss.on('connection', (ws) => {
             room.arenaId = room.guestArenaId || room.arenaId;
             room.hostNickname = room.guestNickname;
             room.hostPlayerId = room.guestPlayerId;
+            room.hostVersionCode = room.guestVersionCode;
+            room.hostVersionName = room.guestVersionName;
+            room.hostCountryCode = room.guestCountryCode;
+            room.hostUserAgent = room.guestUserAgent;
             resetGuestSlot(room);
             promotedHost.role = 'host';
             promotedHost.roomCode = code;
@@ -2009,6 +2217,7 @@ wss.on('close', () => {
 });
 
 initializeStatsStorage()
+    .then(() => analyticsStore.initialize())
     .then(() => {
         server.listen(PORT, () => {
             console.log(`Signaling server running on port ${PORT} (${storageMode()} stats)`);

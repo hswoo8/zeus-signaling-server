@@ -22,6 +22,11 @@ Set these environment variables in production to block outdated multiplayer clie
 | `MAINTENANCE_MESSAGE` | Korean default | Message shown to clients during maintenance |
 | `DATABASE_URL` | unset | PostgreSQL connection string. When set, match results/rankings use Postgres instead of memory |
 | `CONFIRMED_MATCH_TTL_MS` | `86400000` | Time a server-confirmed PvP result remains eligible for stats submission |
+| `ANALYTICS_INGEST_ENABLED` | `true` | Accept debug/beta analytics events at `/analytics/events` |
+| `ANALYTICS_RETENTION_DAYS` | `90` | Analytics event retention and dashboard aggregation window |
+| `ANALYTICS_RATE_LIMIT_PER_MINUTE` | `120` | Per-source in-memory rate limit for analytics ingestion |
+| `ADMIN_DASHBOARD_USERNAME` | `admin` | Basic-auth username for `/admin` |
+| `ADMIN_DASHBOARD_PASSWORD` | unset | Required password; `/admin` stays disabled when unset |
 | `PGSSL` / `PGSSLMODE` | unset | Set `PGSSL=true` or `PGSSLMODE=require` if the Postgres provider requires SSL |
 
 If a client is missing or below the version values, the server returns `{ type: "error", code: "update_required", message }`.
@@ -62,6 +67,9 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 | `POST` | `/matches/pvp-result` | Store a server-confirmed PvP result for both players and return local reward/MMR data |
 | `GET` | `/rankings?mode=single|multi` | Return ranking rows from the active stats storage |
 | `GET` | `/players/:playerIdOrNickname/stats?mode=single|multi` | Return one player's aggregate stats |
+| `POST` | `/analytics/events` | Accept allowlisted debug/beta `app_launch` and `single_match_complete` events |
+| `GET` | `/admin` | Basic-auth operations dashboard; disabled until admin password is configured |
+| `GET` | `/admin/api/stats` | Basic-auth JSON snapshot used for operations or future admin tooling |
 
 Recommended Railway rollout:
 
@@ -75,3 +83,12 @@ PostgreSQL tables are created automatically at startup:
 - `br_player_stats`: aggregate MMR, wins/losses/draws, streaks, favorite character data, and coin totals.
 - `br_match_results`: idempotency records and stored result payloads.
 - `br_pvp_match_confirmations`: short-lived server-confirmed match participants and outcomes used to validate PvP result submissions.
+- `br_analytics_events`: anonymized launches, single matches, and server-confirmed multiplayer matches retained for the configured analytics window.
+
+## Admin analytics
+
+The dashboard reports launches, anonymous users, single/multiplayer match counts, live connections, versions, country/locale codes, User-Agent distribution, finish reasons, and repeated-opponent risk signals. Multiplayer matches are recorded from server-confirmed results. Android launch and single-match uploads are enabled only in debug builds until the release privacy policy and Play Data safety declaration are updated.
+
+Set `ADMIN_DASHBOARD_PASSWORD` in Railway, optionally change `ADMIN_DASHBOARD_USERNAME`, redeploy, then open `/admin`. The browser uses HTTP Basic authentication. Do not put the password in source control, a static webpage, or a query parameter.
+
+Analytics stores a one-way short hash of the anonymous player ID. It does not persist raw IP addresses. Country prefers a trusted proxy country header and falls back to the Android locale country code, so it is operational grouping rather than precise location. Persistent history requires `DATABASE_URL`; memory mode resets dashboard history whenever the server restarts.

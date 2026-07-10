@@ -85,7 +85,13 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     const baseUrl = `http://127.0.0.1:${port}`;
     const child = spawn(process.execPath, ['server.js'], {
         cwd: __dirname,
-        env: { ...process.env, PORT: String(port), DATABASE_URL: '' },
+        env: {
+            ...process.env,
+            PORT: String(port),
+            DATABASE_URL: '',
+            ADMIN_DASHBOARD_USERNAME: 'admin',
+            ADMIN_DASHBOARD_PASSWORD: 'test-password',
+        },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
     let serverErrors = '';
@@ -94,6 +100,49 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         if (child.exitCode === null) child.kill('SIGTERM');
     });
     await waitForServer(baseUrl, child);
+
+    const unauthorizedAdmin = await fetch(`${baseUrl}/admin`);
+    assert.equal(unauthorizedAdmin.status, 401);
+
+    const launchEvent = {
+        eventId: 'launch:test-1',
+        eventName: 'app_launch',
+        playerId: 'host-player-id',
+        appVersionName: '1.2.3-debug',
+        appVersionCode: 12,
+        buildType: 'debug',
+        platform: 'android',
+        countryCode: 'KR',
+        properties: { osVersion: '14', deviceModel: 'Test Phone' },
+    };
+    const launchAccepted = await fetch(`${baseUrl}/analytics/events`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'user-agent': 'MiniZeus/1.2.3-debug (Android 14; Test Phone)',
+            'x-country-code': 'KR',
+        },
+        body: JSON.stringify(launchEvent),
+    });
+    assert.equal(launchAccepted.status, 202);
+    const launchDuplicate = await fetch(`${baseUrl}/analytics/events`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-country-code': 'KR' },
+        body: JSON.stringify(launchEvent),
+    });
+    assert.equal(launchDuplicate.status, 200);
+
+    const singleAccepted = await fetch(`${baseUrl}/analytics/events`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-country-code': 'KR' },
+        body: JSON.stringify({
+            ...launchEvent,
+            eventId: 'single:test-1',
+            eventName: 'single_match_complete',
+            properties: { outcome: 'local_win', durationSec: 45, characterId: 'ZEUS' },
+        }),
+    });
+    assert.equal(singleAccepted.status, 202);
 
     const host = await connect(`ws://127.0.0.1:${port}`);
     const guest = await connect(`ws://127.0.0.1:${port}`);
@@ -252,4 +301,22 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     const finalStats = await fetch(`${baseUrl}/players/${hostPlayer.playerId}/stats?mode=multi`);
     assert.equal(finalStats.status, 200);
     assert.equal((await finalStats.json()).matches, 3);
+
+    const adminAuthorization = `Basic ${Buffer.from('admin:test-password').toString('base64')}`;
+    const adminStats = await fetch(`${baseUrl}/admin/api/stats`, {
+        headers: { authorization: adminAuthorization },
+    });
+    assert.equal(adminStats.status, 200);
+    const snapshot = await adminStats.json();
+    assert.equal(snapshot.periods.retention.launches, 1);
+    assert.equal(snapshot.periods.retention.singleMatches, 1);
+    assert.equal(snapshot.periods.retention.multiMatches, 3);
+    assert.equal(snapshot.countries.find((row) => row.country === 'KR').launches, 1);
+    assert.equal(snapshot.suspiciousPairs[0].matches, 3);
+
+    const adminPage = await fetch(`${baseUrl}/admin`, {
+        headers: { authorization: adminAuthorization },
+    });
+    assert.equal(adminPage.status, 200);
+    assert.match(await adminPage.text(), /MiniZeus 운영 통계/);
 });
