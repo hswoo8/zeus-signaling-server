@@ -308,6 +308,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     });
     assert.equal(adminStats.status, 200);
     const snapshot = await adminStats.json();
+    assert.equal(snapshot.daily.length, 30);
     assert.equal(snapshot.periods.retention.launches, 1);
     assert.equal(snapshot.periods.retention.singleMatches, 1);
     assert.equal(snapshot.periods.retention.multiMatches, 3);
@@ -318,5 +319,9 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         headers: { authorization: adminAuthorization },
     });
     assert.equal(adminPage.status, 200);
-    assert.match(await adminPage.text(), /MiniZeus 운영 통계/);
+    const adminHtml = await adminPage.text();
+    assert.match(adminHtml, /MiniZeus 운영 통계/);
+    assert.match(adminHtml, /최근 30일 활동 추이/);
+    assert.match(adminHtml, /class="line-chart"/);
+    assert.match(adminHtml, /국가\/지역 활동량/);
 });

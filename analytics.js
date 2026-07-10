@@ -367,7 +367,7 @@ function aggregateEvents(events, runtime) {
         versions: Array.from(versions.values()).sort((a, b) => b.launches + b.singleMatches + b.multiParticipations - (a.launches + a.singleMatches + a.multiParticipations)),
         countries: Array.from(countries.values()).sort((a, b) => b.launches + b.singleMatches + b.multiParticipations - (a.launches + a.singleMatches + a.multiParticipations)),
         userAgents: Array.from(userAgents.values()).sort((a, b) => b.launches + b.multiConnections - (a.launches + a.multiConnections)).slice(0, 50),
-        daily: Array.from(daily.values()).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 30),
+        daily: filledDailyRows(daily, now, 30),
         finishReasons: Array.from(reasons.entries()).map(([reason, count]) => ({ reason, count })).sort((a, b) => b.count - a.count),
         suspiciousPairs,
     };
@@ -381,6 +381,16 @@ function startOfKstDay(timestamp) {
 function kstDayKey(timestamp) {
     const offsetMs = 9 * 60 * 60 * 1000;
     return new Date(timestamp + offsetMs).toISOString().slice(0, 10);
+}
+
+function filledDailyRows(daily, now, count) {
+    const rows = [];
+    const todayStart = startOfKstDay(now);
+    for (let offset = 0; offset < count; offset += 1) {
+        const date = kstDayKey(todayStart - offset * 86400000);
+        rows.push(daily.get(date) || { date, launches: 0, singleMatches: 0, multiMatches: 0 });
+    }
+    return rows;
 }
 
 function escapeHtml(value) {
@@ -400,6 +410,52 @@ function table(headers, rows, emptyText = '데이터 없음') {
     return `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
+function lineChart(dailyRows) {
+    const rows = [...dailyRows].reverse();
+    const width = 960;
+    const height = 280;
+    const margin = { left: 48, right: 18, top: 18, bottom: 40 };
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+    const maxValue = Math.max(1, ...rows.flatMap((row) => [row.launches, row.singleMatches, row.multiMatches]));
+    const x = (index) => margin.left + (rows.length <= 1 ? 0 : index * plotWidth / (rows.length - 1));
+    const y = (value) => margin.top + plotHeight - value * plotHeight / maxValue;
+    const points = (key) => rows.map((row, index) => `${x(index).toFixed(1)},${y(row[key]).toFixed(1)}`).join(' ');
+    const grid = Array.from({ length: 5 }, (_, index) => {
+        const value = Math.round(maxValue * (4 - index) / 4);
+        const lineY = margin.top + plotHeight * index / 4;
+        return `<line x1="${margin.left}" y1="${lineY}" x2="${width - margin.right}" y2="${lineY}" class="chart-grid"/><text x="${margin.left - 8}" y="${lineY + 4}" class="axis-label" text-anchor="end">${value}</text>`;
+    }).join('');
+    const labels = rows.map((row, index) => {
+        if (index !== 0 && index !== rows.length - 1 && index % 5 !== 0) return '';
+        return `<text x="${x(index)}" y="${height - 13}" class="axis-label" text-anchor="middle">${escapeHtml(row.date.slice(5))}</text>`;
+    }).join('');
+    return `<div class="chart-panel">
+        <div class="legend"><span><i class="launch"></i>실행</span><span><i class="single"></i>싱글</span><span><i class="multi"></i>멀티</span></div>
+        <svg class="line-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="최근 30일 실행, 싱글, 멀티 추이">
+            ${grid}${labels}
+            <polyline points="${points('launches')}" class="series launch-line"/>
+            <polyline points="${points('singleMatches')}" class="series single-line"/>
+            <polyline points="${points('multiMatches')}" class="series multi-line"/>
+        </svg>
+    </div>`;
+}
+
+function barChart(rows, labelKey, value, colorClass, emptyText = '데이터 없음') {
+    const prepared = rows.map((row) => ({ label: row[labelKey], value: value(row) }))
+        .filter((row) => row.value > 0)
+        .sort((a, b) => b.value - a.value)
+        .slice(0, 12);
+    if (prepared.length === 0) return `<div class="chart-panel empty">${escapeHtml(emptyText)}</div>`;
+    const maxValue = Math.max(...prepared.map((row) => row.value));
+    return `<div class="chart-panel bars">${prepared.map((row) => `
+        <div class="bar-row">
+            <span class="bar-label" title="${escapeHtml(row.label)}">${escapeHtml(row.label)}</span>
+            <span class="bar-track"><i class="${colorClass}" style="width:${Math.max(2, row.value * 100 / maxValue).toFixed(1)}%"></i></span>
+            <strong>${escapeHtml(row.value)}</strong>
+        </div>`).join('')}</div>`;
+}
+
 function renderAdminPage(snapshot) {
     const today = snapshot.periods.today;
     const days7 = snapshot.periods.days7;
@@ -415,7 +471,7 @@ function renderAdminPage(snapshot) {
 <meta name="robots" content="noindex,nofollow,noarchive">
 <title>MiniZeus Admin Stats</title>
 <style>
-:root{color-scheme:light;--bg:#f4f5f2;--surface:#fff;--line:#d8ddd5;--text:#20231f;--muted:#697067;--green:#19764c;--orange:#c65d1b;--red:#b83b32}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Noto Sans KR",sans-serif;letter-spacing:0}header{background:#20231f;color:#fff;padding:18px 24px;border-bottom:4px solid var(--green)}header h1{font-size:20px;margin:0 0 4px}header p{margin:0;color:#cbd2c8;font-size:12px}main{max-width:1500px;margin:0 auto;padding:20px 24px 48px}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}.toolbar a{color:#fff;background:var(--green);padding:8px 12px;border-radius:4px;text-decoration:none;font-weight:700}.metrics{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:10px;margin-bottom:22px}.metric{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;min-height:92px}.metric span,.metric small{display:block;color:var(--muted)}.metric strong{display:block;font-size:26px;margin:5px 0;color:var(--green)}section{margin:24px 0}h2{font-size:15px;margin:0 0 9px;padding-left:9px;border-left:4px solid var(--orange)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.table-wrap{overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:6px}table{width:100%;border-collapse:collapse;min-width:560px}th,td{text-align:left;padding:9px 11px;border-bottom:1px solid #e7eae5;white-space:nowrap}th{position:sticky;top:0;background:#eef1ec;color:#4d554c;font-size:12px}tbody tr:hover{background:#fafbf9}.empty{text-align:center;color:var(--muted);padding:24px}.warn{color:var(--red);font-weight:700}.foot{color:var(--muted);font-size:12px;margin-top:24px}@media(max-width:900px){main{padding:14px}.metrics{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}header{padding:14px}}
+:root{color-scheme:light;--bg:#f4f5f2;--surface:#fff;--line:#d8ddd5;--text:#20231f;--muted:#697067;--green:#19764c;--orange:#c65d1b;--red:#b83b32}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Noto Sans KR",sans-serif;letter-spacing:0}header{background:#20231f;color:#fff;padding:18px 24px;border-bottom:4px solid var(--green)}header h1{font-size:20px;margin:0 0 4px}header p{margin:0;color:#cbd2c8;font-size:12px}main{max-width:1500px;margin:0 auto;padding:20px 24px 48px}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}.toolbar a{color:#fff;background:var(--green);padding:8px 12px;border-radius:4px;text-decoration:none;font-weight:700}.metrics{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:10px;margin-bottom:22px}.metric{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;min-height:92px}.metric span,.metric small{display:block;color:var(--muted)}.metric strong{display:block;font-size:26px;margin:5px 0;color:var(--green)}section{margin:24px 0}h2{font-size:15px;margin:0 0 9px;padding-left:9px;border-left:4px solid var(--orange)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.chart-panel{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;overflow:hidden}.legend{display:flex;justify-content:flex-end;gap:18px;color:var(--muted);font-size:12px}.legend span{display:flex;align-items:center;gap:6px}.legend i{width:18px;height:3px;display:inline-block}.legend .launch,.bar-fill{background:var(--green)}.legend .single,.single-fill{background:var(--orange)}.legend .multi,.reason-fill{background:var(--red)}.line-chart{display:block;width:100%;height:auto;min-height:210px}.chart-grid{stroke:#e3e7e1;stroke-width:1}.axis-label{fill:#737b72;font-size:11px}.series{fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}.launch-line{stroke:var(--green)}.single-line{stroke:var(--orange)}.multi-line{stroke:var(--red)}.bars{display:grid;gap:9px;min-height:180px}.bar-row{display:grid;grid-template-columns:minmax(72px,120px) minmax(100px,1fr) 44px;align-items:center;gap:9px}.bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#4d554c}.bar-track{height:12px;background:#e9ece7;border-radius:3px;overflow:hidden}.bar-track i{display:block;height:100%;border-radius:3px}.bar-row strong{text-align:right;font-variant-numeric:tabular-nums}.table-wrap{overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:6px}table{width:100%;border-collapse:collapse;min-width:560px}th,td{text-align:left;padding:9px 11px;border-bottom:1px solid #e7eae5;white-space:nowrap}th{position:sticky;top:0;background:#eef1ec;color:#4d554c;font-size:12px}tbody tr:hover{background:#fafbf9}.empty{text-align:center;color:var(--muted);padding:24px}.warn{color:var(--red);font-weight:700}.foot{color:var(--muted);font-size:12px;margin-top:24px}@media(max-width:900px){main{padding:14px}.metrics{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}header{padding:14px}.legend{justify-content:flex-start;flex-wrap:wrap}.line-chart{min-width:720px}.chart-panel:has(.line-chart){overflow:auto}}
 </style>
 </head>
 <body>
@@ -429,6 +485,11 @@ ${metric('오늘 멀티', today.multiMatches, `7일 ${days7.multiMatches}`)}
 ${metric('7일 익명 사용자', days7.uniqueUsers, 'playerId 해시 기준')}
 ${metric('현재 연결', live.connections || 0, `방 ${live.rooms || 0}`)}
 ${metric('진행 중 대전', live.activeMatches || 0, `대기 방 ${live.waitingRooms || 0}`)}
+</div>
+<section><h2>최근 30일 활동 추이</h2>${lineChart(snapshot.daily)}</section>
+<div class="grid">
+<section><h2>국가/지역 활동량</h2>${barChart(snapshot.countries, 'country', (r) => r.launches + r.singleMatches + r.multiParticipations, 'bar-fill')}</section>
+<section><h2>멀티 종료 사유 분포</h2>${barChart(snapshot.finishReasons, 'reason', (r) => r.count, 'reason-fill')}</section>
 </div>
 <div class="grid">
 <section><h2>일자별 추이</h2>${table(['날짜','실행','싱글','멀티'], snapshot.daily.map((r) => [r.date,r.launches,r.singleMatches,r.multiMatches]))}</section>
