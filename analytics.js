@@ -7,6 +7,8 @@ const EXTERNAL_EVENT_NAMES = new Set([
     'feature_use',
 ]);
 const INTERNAL_EVENT_NAMES = new Set([...EXTERNAL_EVENT_NAMES, 'multi_match_complete']);
+const ANALYTICS_CHANNELS = new Set(['dev', 'beta', 'production', 'mixed', 'unknown']);
+const ANALYTICS_FILTERS = new Set(['all', ...ANALYTICS_CHANNELS]);
 
 function cleanText(value, maxLength = 160, fallback = '') {
     if (typeof value !== 'string') return fallback;
@@ -21,6 +23,20 @@ function cleanInteger(value, fallback = null) {
 function cleanCountry(value) {
     const country = cleanText(value, 8).toUpperCase();
     return /^[A-Z]{2}$/.test(country) ? country : 'ZZ';
+}
+
+function normalizeAnalyticsChannel(value, buildType = 'unknown') {
+    const channel = cleanText(value, 24).toLowerCase();
+    if (ANALYTICS_CHANNELS.has(channel)) return channel;
+    const normalizedBuildType = cleanText(buildType, 24).toLowerCase();
+    if (normalizedBuildType === 'debug') return 'dev';
+    if (normalizedBuildType === 'release') return 'production';
+    return 'unknown';
+}
+
+function normalizeAnalyticsFilter(value) {
+    const channel = cleanText(value, 24, 'all').toLowerCase();
+    return ANALYTICS_FILTERS.has(channel) ? channel : 'all';
 }
 
 function requestCountry(req, fallback) {
@@ -84,6 +100,7 @@ function sanitizeProperties(eventName, value) {
 function eventFromHttpRequest(req, body) {
     const eventName = cleanText(body?.eventName, 48);
     if (!EXTERNAL_EVENT_NAMES.has(eventName)) return null;
+    const buildType = cleanText(body.buildType, 24, 'unknown');
     return {
         eventId: cleanText(body.eventId, 128),
         eventName,
@@ -91,7 +108,8 @@ function eventFromHttpRequest(req, body) {
         playerIdHash: hashIdentifier(body.playerId),
         appVersionName: cleanText(body.appVersionName, 40, 'unknown'),
         appVersionCode: cleanInteger(body.appVersionCode),
-        buildType: cleanText(body.buildType, 24, 'unknown'),
+        buildType,
+        analyticsChannel: normalizeAnalyticsChannel(body.analyticsChannel, buildType),
         platform: cleanText(body.platform, 24, 'android'),
         userAgent: safeUserAgent(req),
         countryCode: requestCountry(req, body.countryCode),
@@ -104,6 +122,7 @@ function normalizedEvent(event) {
     if (!INTERNAL_EVENT_NAMES.has(eventName)) return null;
     const occurredAt = new Date(event.occurredAt || Date.now());
     if (Number.isNaN(occurredAt.getTime())) return null;
+    const buildType = cleanText(event.buildType, 24, 'unknown');
     return {
         eventId: cleanText(event.eventId, 128),
         eventName,
@@ -111,7 +130,8 @@ function normalizedEvent(event) {
         playerIdHash: cleanText(event.playerIdHash, 32) || null,
         appVersionName: cleanText(event.appVersionName, 40, 'unknown'),
         appVersionCode: cleanInteger(event.appVersionCode),
-        buildType: cleanText(event.buildType, 24, 'unknown'),
+        buildType,
+        analyticsChannel: normalizeAnalyticsChannel(event.analyticsChannel, buildType),
         platform: cleanText(event.platform, 24, 'server'),
         userAgent: cleanText(event.userAgent, 200, 'unknown'),
         countryCode: cleanCountry(event.countryCode),
@@ -140,6 +160,7 @@ class AnalyticsStore {
                 app_version_name TEXT NOT NULL,
                 app_version_code INTEGER,
                 build_type TEXT NOT NULL,
+                analytics_channel TEXT NOT NULL DEFAULT 'unknown',
                 platform TEXT NOT NULL,
                 user_agent TEXT NOT NULL,
                 country_code TEXT NOT NULL,
@@ -148,12 +169,29 @@ class AnalyticsStore {
             )
         `);
         await this.pool.query(`
+            ALTER TABLE br_analytics_events
+            ADD COLUMN IF NOT EXISTS analytics_channel TEXT NOT NULL DEFAULT 'unknown'
+        `);
+        await this.pool.query(`
+            UPDATE br_analytics_events
+               SET analytics_channel = CASE
+                   WHEN build_type = 'debug' THEN 'dev'
+                   WHEN build_type = 'release' THEN 'production'
+                   ELSE 'unknown'
+               END
+             WHERE analytics_channel = 'unknown'
+        `);
+        await this.pool.query(`
             CREATE INDEX IF NOT EXISTS br_analytics_events_time_idx
                 ON br_analytics_events (occurred_at DESC)
         `);
         await this.pool.query(`
             CREATE INDEX IF NOT EXISTS br_analytics_events_name_time_idx
                 ON br_analytics_events (event_name, occurred_at DESC)
+        `);
+        await this.pool.query(`
+            CREATE INDEX IF NOT EXISTS br_analytics_events_channel_time_idx
+                ON br_analytics_events (analytics_channel, occurred_at DESC)
         `);
         await this.pool.query(
             `DELETE FROM br_analytics_events
@@ -180,9 +218,9 @@ class AnalyticsStore {
         const inserted = await this.pool.query(
             `INSERT INTO br_analytics_events (
                 event_id, event_name, occurred_at, player_id_hash,
-                app_version_name, app_version_code, build_type, platform,
-                user_agent, country_code, properties
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+                app_version_name, app_version_code, build_type, analytics_channel,
+                platform, user_agent, country_code, properties
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
              ON CONFLICT (event_id) DO NOTHING
              RETURNING id`,
             [
@@ -193,6 +231,7 @@ class AnalyticsStore {
                 event.appVersionName,
                 event.appVersionCode,
                 event.buildType,
+                event.analyticsChannel,
                 event.platform,
                 event.userAgent,
                 event.countryCode,
@@ -202,17 +241,27 @@ class AnalyticsStore {
         return { accepted: true, duplicate: inserted.rowCount === 0 };
     }
 
-    async recentEvents() {
-        if (!this.pool) return [...this.memoryEvents];
+    async recentEvents(channel = 'all') {
+        const selectedChannel = normalizeAnalyticsFilter(channel);
+        if (!this.pool) {
+            return selectedChannel === 'all'
+                ? [...this.memoryEvents]
+                : this.memoryEvents.filter((event) => event.analyticsChannel === selectedChannel);
+        }
+        const channelClause = selectedChannel === 'all' ? '' : 'AND analytics_channel = $2';
+        const params = selectedChannel === 'all'
+            ? [String(this.retentionDays)]
+            : [String(this.retentionDays), selectedChannel];
         const result = await this.pool.query(
             `SELECT event_id, event_name, occurred_at, player_id_hash,
-                    app_version_name, app_version_code, build_type, platform,
+                    app_version_name, app_version_code, build_type, analytics_channel, platform,
                     user_agent, country_code, properties
                FROM br_analytics_events
               WHERE occurred_at >= NOW() - ($1::text || ' days')::interval
+                ${channelClause}
               ORDER BY occurred_at DESC
               LIMIT 100000`,
-            [String(this.retentionDays)]
+            params
         );
         return result.rows.map((row) => ({
             eventId: row.event_id,
@@ -222,6 +271,7 @@ class AnalyticsStore {
             appVersionName: row.app_version_name,
             appVersionCode: row.app_version_code,
             buildType: row.build_type,
+            analyticsChannel: normalizeAnalyticsChannel(row.analytics_channel, row.build_type),
             platform: row.platform,
             userAgent: row.user_agent,
             countryCode: row.country_code,
@@ -229,9 +279,11 @@ class AnalyticsStore {
         }));
     }
 
-    async snapshot(runtime = {}) {
-        return aggregateEvents(await this.recentEvents(), {
+    async snapshot(runtime = {}, channel = 'all') {
+        const selectedChannel = normalizeAnalyticsFilter(channel);
+        return aggregateEvents(await this.recentEvents(selectedChannel), {
             retentionDays: this.retentionDays,
+            selectedChannel,
             ...runtime,
         });
     }
@@ -406,6 +458,7 @@ function aggregateEvents(events, runtime) {
         storage: runtime.storage || 'memory',
         uptimeSec: runtime.uptimeSec || 0,
         live: runtime.live || {},
+        selectedChannel: runtime.selectedChannel || 'all',
         periods,
         kpis,
         versions: Array.from(versions.values()).sort((a, b) => b.launches + b.singleMatches + b.multiParticipations - (a.launches + a.singleMatches + a.multiParticipations)),
@@ -521,6 +574,16 @@ function renderAdminPage(snapshot) {
     const days7 = snapshot.periods.days7;
     const live = snapshot.live;
     const kpis = snapshot.kpis;
+    const selectedChannel = normalizeAnalyticsFilter(snapshot.selectedChannel);
+    const channelTabs = [
+        ['all', '전체'],
+        ['beta', '베타'],
+        ['production', '운영'],
+        ['dev', '개발'],
+    ].map(([channel, label]) => {
+        const current = channel === selectedChannel;
+        return `<a href="/admin?channel=${channel}" class="${current ? 'current' : ''}"${current ? ' aria-current="page"' : ''}>${label}</a>`;
+    }).join('');
     const generated = new Date(snapshot.generatedAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
     const metric = (label, value, sub) => `
         <article class="metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(sub)}</small></article>`;
@@ -532,13 +595,14 @@ function renderAdminPage(snapshot) {
 <meta name="robots" content="noindex,nofollow,noarchive">
 <title>MiniZeus Admin Stats</title>
 <style>
-:root{color-scheme:light;--bg:#f4f5f2;--surface:#fff;--line:#d8ddd5;--text:#20231f;--muted:#697067;--green:#19764c;--orange:#c65d1b;--red:#b83b32;--ink:#38424b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Noto Sans KR",sans-serif;letter-spacing:0}header{background:#20231f;color:#fff;padding:18px 24px;border-bottom:4px solid var(--green)}header h1{font-size:20px;margin:0 0 4px}header p{margin:0;color:#cbd2c8;font-size:12px}main{max-width:1500px;margin:0 auto;padding:20px 24px 48px}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}.toolbar a{color:#fff;background:var(--green);padding:8px 12px;border-radius:4px;text-decoration:none;font-weight:700}.metrics{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:10px;margin-bottom:22px}.metric{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;min-height:92px}.metric span,.metric small{display:block;color:var(--muted)}.metric strong{display:block;font-size:26px;margin:5px 0;color:var(--green)}section{margin:24px 0}h2{font-size:15px;margin:0 0 9px;padding-left:9px;border-left:4px solid var(--orange)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.chart-panel{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;overflow:hidden}.legend{display:flex;justify-content:flex-end;gap:18px;color:var(--muted);font-size:12px}.legend span{display:flex;align-items:center;gap:6px}.legend i{width:18px;height:3px;display:inline-block}.legend .active{background:var(--ink)}.legend .launch,.bar-fill{background:var(--green)}.legend .single,.single-fill{background:var(--orange)}.legend .multi,.reason-fill{background:var(--red)}.line-chart{display:block;width:100%;height:auto;min-height:210px}.chart-grid{stroke:#e3e7e1;stroke-width:1}.axis-label{fill:#737b72;font-size:11px}.series{fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}.active-line{stroke:var(--ink)}.launch-line{stroke:var(--green)}.single-line{stroke:var(--orange)}.multi-line{stroke:var(--red)}.bars{display:grid;gap:9px;min-height:180px}.bar-row{display:grid;grid-template-columns:minmax(72px,120px) minmax(100px,1fr) 44px;align-items:center;gap:9px}.bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#4d554c}.bar-track{height:12px;background:#e9ece7;border-radius:3px;overflow:hidden}.bar-track i{display:block;height:100%;border-radius:3px}.bar-row strong{text-align:right;font-variant-numeric:tabular-nums}.table-wrap{overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:6px}table{width:100%;border-collapse:collapse;min-width:560px}th,td{text-align:left;padding:9px 11px;border-bottom:1px solid #e7eae5;white-space:nowrap}th{position:sticky;top:0;background:#eef1ec;color:#4d554c;font-size:12px}tbody tr:hover{background:#fafbf9}.empty{text-align:center;color:var(--muted);padding:24px}.warn{color:var(--red);font-weight:700}.foot{color:var(--muted);font-size:12px;margin-top:24px}@media(max-width:900px){main{padding:14px}.metrics{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}header{padding:14px}.legend{justify-content:flex-start;flex-wrap:wrap}.line-chart{min-width:720px}.chart-panel:has(.line-chart){overflow:auto}}
+:root{color-scheme:light;--bg:#f4f5f2;--surface:#fff;--line:#d8ddd5;--text:#20231f;--muted:#697067;--green:#19764c;--orange:#c65d1b;--red:#b83b32;--ink:#38424b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Noto Sans KR",sans-serif;letter-spacing:0}header{background:#20231f;color:#fff;padding:18px 24px;border-bottom:4px solid var(--green)}header h1{font-size:20px;margin:0 0 4px}header p{margin:0;color:#cbd2c8;font-size:12px}main{max-width:1500px;margin:0 auto;padding:20px 24px 48px}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}.toolbar a{color:#fff;background:var(--green);padding:8px 12px;border-radius:4px;text-decoration:none;font-weight:700}.channel-filter{display:inline-grid;grid-template-columns:repeat(4,minmax(70px,1fr));border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-bottom:22px;background:var(--surface)}.channel-filter a{padding:9px 14px;text-align:center;text-decoration:none;color:var(--text);font-weight:700;border-right:1px solid var(--line)}.channel-filter a:last-child{border-right:0}.channel-filter a.current{background:var(--ink);color:#fff}.metrics{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:10px;margin-bottom:22px}.metric{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;min-height:92px}.metric span,.metric small{display:block;color:var(--muted)}.metric strong{display:block;font-size:26px;margin:5px 0;color:var(--green)}section{margin:24px 0}h2{font-size:15px;margin:0 0 9px;padding-left:9px;border-left:4px solid var(--orange)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.chart-panel{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;overflow:hidden}.legend{display:flex;justify-content:flex-end;gap:18px;color:var(--muted);font-size:12px}.legend span{display:flex;align-items:center;gap:6px}.legend i{width:18px;height:3px;display:inline-block}.legend .active{background:var(--ink)}.legend .launch,.bar-fill{background:var(--green)}.legend .single,.single-fill{background:var(--orange)}.legend .multi,.reason-fill{background:var(--red)}.line-chart{display:block;width:100%;height:auto;min-height:210px}.chart-grid{stroke:#e3e7e1;stroke-width:1}.axis-label{fill:#737b72;font-size:11px}.series{fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}.active-line{stroke:var(--ink)}.launch-line{stroke:var(--green)}.single-line{stroke:var(--orange)}.multi-line{stroke:var(--red)}.bars{display:grid;gap:9px;min-height:180px}.bar-row{display:grid;grid-template-columns:minmax(72px,120px) minmax(100px,1fr) 44px;align-items:center;gap:9px}.bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#4d554c}.bar-track{height:12px;background:#e9ece7;border-radius:3px;overflow:hidden}.bar-track i{display:block;height:100%;border-radius:3px}.bar-row strong{text-align:right;font-variant-numeric:tabular-nums}.table-wrap{overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:6px}table{width:100%;border-collapse:collapse;min-width:560px}th,td{text-align:left;padding:9px 11px;border-bottom:1px solid #e7eae5;white-space:nowrap}th{position:sticky;top:0;background:#eef1ec;color:#4d554c;font-size:12px}tbody tr:hover{background:#fafbf9}.empty{text-align:center;color:var(--muted);padding:24px}.warn{color:var(--red);font-weight:700}.foot{color:var(--muted);font-size:12px;margin-top:24px}@media(max-width:900px){main{padding:14px}.metrics{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}header{padding:14px}.legend{justify-content:flex-start;flex-wrap:wrap}.line-chart{min-width:720px}.chart-panel:has(.line-chart){overflow:auto}.channel-filter{display:grid}.channel-filter a{padding:9px 8px}}
 </style>
 </head>
 <body>
 <header><h1>MiniZeus 운영 통계</h1><p>관리자 전용 · 원 IP와 실제 기기 식별자는 저장하지 않음</p></header>
 <main>
-<div class="toolbar"><div>생성 ${escapeHtml(generated)} · 저장소 ${escapeHtml(snapshot.storage)}</div><a href="/admin">새로고침</a></div>
+<div class="toolbar"><div>생성 ${escapeHtml(generated)} · 저장소 ${escapeHtml(snapshot.storage)}</div><a href="/admin?channel=${selectedChannel}">새로고침</a></div>
+<nav class="channel-filter" aria-label="배포 채널">${channelTabs}</nav>
 <div class="metrics">
 ${metric('오늘 실행', today.launches, `7일 ${days7.launches}`)}
 ${metric('오늘 싱글', today.singleMatches, `7일 ${days7.singleMatches}`)}
@@ -549,8 +613,8 @@ ${metric('MAU', kpis.mau, '최근 30일')}
 ${metric('DAU / MAU', `${kpis.dauMauPercent}%`, '활성도')}
 ${metric('사용자당 매치', kpis.matchesPerMau, '최근 30일')}
 ${metric('멀티 비중', `${kpis.multiSharePercent}%`, '최근 30일 매치')}
-${metric('현재 연결', live.connections || 0, `방 ${live.rooms || 0}`)}
-${metric('진행 중 대전', live.activeMatches || 0, `대기 방 ${live.waitingRooms || 0}`)}
+${metric('현재 연결', live.connections || 0, `전체 채널 · 방 ${live.rooms || 0}`)}
+${metric('진행 중 대전', live.activeMatches || 0, `전체 채널 · 대기 방 ${live.waitingRooms || 0}`)}
 </div>
 <section><h2>최근 30일 활동 추이</h2>${lineChart(snapshot.daily)}</section>
 <div class="grid">
@@ -567,7 +631,7 @@ ${metric('진행 중 대전', live.activeMatches || 0, `대기 방 ${live.waitin
 </div>
 <section><h2>반복 매칭 / 패작 의심 관찰</h2>${table(['익명 상대 조합','매치','우세 승률','기권','이탈','30초 이하','위험 점수'], snapshot.suspiciousPairs.map((r) => [r.pairHash,r.matches,`${r.dominantWinRate}%`,r.forfeits,r.disconnects,r.shortMatches,r.riskScore]))}</section>
 <section><h2>User-Agent</h2>${table(['User-Agent','실행','멀티 연결'], snapshot.userAgents.map((r) => [r.userAgent,r.launches,r.multiConnections]))}</section>
-<p class="foot">날짜 기준 KST · 통계 보존 ${escapeHtml(snapshot.retentionDays)}일 · release 분석은 개인정보/Data Safety 업데이트 전까지 앱 빌드에서 비활성화</p>
+<p class="foot">날짜 기준 KST · 통계 보존 ${escapeHtml(snapshot.retentionDays)}일 · 선택 채널 ${escapeHtml(selectedChannel)}</p>
 </main>
 </body></html>`;
 }
@@ -576,6 +640,7 @@ module.exports = {
     AnalyticsStore,
     eventFromHttpRequest,
     hashIdentifier,
+    normalizeAnalyticsChannel,
     pairHash,
     renderAdminPage,
     requestCountry,

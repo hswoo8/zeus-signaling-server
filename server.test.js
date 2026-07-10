@@ -5,6 +5,8 @@ const WebSocket = require('ws');
 
 const versionFields = {
     clientVersionCode: 1,
+    clientVersionName: '1.2.3-debug',
+    analyticsChannel: 'dev',
     protocolVersion: 1,
     balanceVersion: 1,
 };
@@ -111,6 +113,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         appVersionName: '1.2.3-debug',
         appVersionCode: 12,
         buildType: 'debug',
+        analyticsChannel: 'dev',
         platform: 'android',
         countryCode: 'KR',
         properties: { osVersion: '14', deviceModel: 'Test Phone' },
@@ -131,6 +134,24 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         body: JSON.stringify(launchEvent),
     });
     assert.equal(launchDuplicate.status, 200);
+
+    const betaLaunchAccepted = await fetch(`${baseUrl}/analytics/events`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'user-agent': 'MiniZeus/1.2.3 (Android 14; Test Phone; release; beta)',
+            'x-country-code': 'KR',
+        },
+        body: JSON.stringify({
+            ...launchEvent,
+            eventId: 'launch:beta-1',
+            playerId: 'beta-player-id',
+            appVersionName: '1.2.3',
+            buildType: 'release',
+            analyticsChannel: 'beta',
+        }),
+    });
+    assert.equal(betaLaunchAccepted.status, 202);
 
     const singleAccepted = await fetch(`${baseUrl}/analytics/events`, {
         method: 'POST',
@@ -321,16 +342,42 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(adminStats.status, 200);
     const snapshot = await adminStats.json();
     assert.equal(snapshot.daily.length, 30);
-    assert.equal(snapshot.periods.retention.launches, 1);
+    assert.equal(snapshot.periods.retention.launches, 2);
     assert.equal(snapshot.periods.retention.singleMatches, 1);
     assert.equal(snapshot.periods.retention.multiMatches, 3);
-    assert.equal(snapshot.kpis.dau, 2);
-    assert.equal(snapshot.kpis.wau, 2);
-    assert.equal(snapshot.kpis.mau, 2);
+    assert.equal(snapshot.kpis.dau, 3);
+    assert.equal(snapshot.kpis.wau, 3);
+    assert.equal(snapshot.kpis.mau, 3);
     assert.equal(snapshot.screenViews[0].screen, 'home');
     assert.equal(snapshot.featureUsage[0].feature, 'single_open');
-    assert.equal(snapshot.countries.find((row) => row.country === 'KR').launches, 1);
+    assert.equal(snapshot.countries.find((row) => row.country === 'KR').launches, 2);
     assert.equal(snapshot.suspiciousPairs[0].matches, 3);
+
+    const betaStats = await fetch(`${baseUrl}/admin/api/stats?channel=beta`, {
+        headers: { authorization: adminAuthorization },
+    });
+    assert.equal(betaStats.status, 200);
+    const betaSnapshot = await betaStats.json();
+    assert.equal(betaSnapshot.selectedChannel, 'beta');
+    assert.equal(betaSnapshot.periods.retention.launches, 1);
+    assert.equal(betaSnapshot.periods.retention.multiMatches, 0);
+    assert.equal(betaSnapshot.kpis.dau, 1);
+
+    const productionStats = await fetch(`${baseUrl}/admin/api/stats?channel=production`, {
+        headers: { authorization: adminAuthorization },
+    });
+    assert.equal(productionStats.status, 200);
+    const productionSnapshot = await productionStats.json();
+    assert.equal(productionSnapshot.selectedChannel, 'production');
+    assert.equal(productionSnapshot.periods.retention.launches, 0);
+
+    const devStats = await fetch(`${baseUrl}/admin/api/stats?channel=dev`, {
+        headers: { authorization: adminAuthorization },
+    });
+    assert.equal(devStats.status, 200);
+    const devSnapshot = await devStats.json();
+    assert.equal(devSnapshot.periods.retention.launches, 1);
+    assert.equal(devSnapshot.periods.retention.multiMatches, 3);
 
     const adminPage = await fetch(`${baseUrl}/admin`, {
         headers: { authorization: adminAuthorization },
@@ -341,4 +388,9 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.match(adminHtml, /최근 30일 활동 추이/);
     assert.match(adminHtml, /class="line-chart"/);
     assert.match(adminHtml, /국가\/지역 활동량/);
+    assert.match(adminHtml, /class="channel-filter"/);
+    assert.match(adminHtml, /전체/);
+    assert.match(adminHtml, /베타/);
+    assert.match(adminHtml, /운영/);
+    assert.match(adminHtml, /개발/);
 });

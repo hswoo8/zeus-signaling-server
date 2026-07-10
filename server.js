@@ -7,6 +7,7 @@ const {
     AnalyticsStore,
     eventFromHttpRequest,
     hashIdentifier,
+    normalizeAnalyticsChannel,
     pairHash,
     renderAdminPage,
     requestCountry,
@@ -481,14 +482,20 @@ async function handleHttpRequest(req, res) {
 
     if (req.method === 'GET' && (pathname === '/admin' || pathname === '/admin/')) {
         if (!requireAdmin(req, res)) return;
-        const snapshot = await analyticsStore.snapshot(analyticsRuntimeSnapshot());
+        const snapshot = await analyticsStore.snapshot(
+            analyticsRuntimeSnapshot(),
+            url.searchParams.get('channel')
+        );
         sendHtml(res, 200, renderAdminPage(snapshot));
         return;
     }
 
     if (req.method === 'GET' && pathname === '/admin/api/stats') {
         if (!requireAdmin(req, res)) return;
-        sendJson(res, 200, await analyticsStore.snapshot(analyticsRuntimeSnapshot()));
+        sendJson(res, 200, await analyticsStore.snapshot(
+            analyticsRuntimeSnapshot(),
+            url.searchParams.get('channel')
+        ));
         return;
     }
 
@@ -1535,6 +1542,7 @@ function recordMultiMatchAnalytics(room, result) {
         appVersionName: room.hostVersionName || room.guestVersionName || 'unknown',
         appVersionCode: room.hostVersionCode || room.guestVersionCode || null,
         buildType: 'multiplayer',
+        analyticsChannel: roomAnalyticsChannel(room),
         platform: 'server',
         userAgent: 'server-confirmed',
         countryCode: 'ZZ',
@@ -1545,8 +1553,10 @@ function recordMultiMatchAnalytics(room, result) {
             winnerPlayerHash,
             hostVersionName: room.hostVersionName || 'unknown',
             hostVersionCode: room.hostVersionCode || null,
+            hostAnalyticsChannel: room.hostAnalyticsChannel || 'unknown',
             guestVersionName: room.guestVersionName || 'unknown',
             guestVersionCode: room.guestVersionCode || null,
+            guestAnalyticsChannel: room.guestAnalyticsChannel || 'unknown',
             hostCountryCode: room.hostCountryCode || 'ZZ',
             guestCountryCode: room.guestCountryCode || 'ZZ',
             hostUserAgent: room.hostUserAgent || 'unknown',
@@ -1559,6 +1569,15 @@ function recordMultiMatchAnalytics(room, result) {
     }).catch((err) => {
         console.error('[analytics] failed to record multi match:', err?.message || err);
     });
+}
+
+function roomAnalyticsChannel(room) {
+    const hostChannel = normalizeAnalyticsChannel(room.hostAnalyticsChannel);
+    const guestChannel = normalizeAnalyticsChannel(room.guestAnalyticsChannel);
+    if (hostChannel === guestChannel) return hostChannel;
+    if (hostChannel === 'unknown') return guestChannel;
+    if (guestChannel === 'unknown') return hostChannel;
+    return 'mixed';
 }
 
 function finalizeRoomMatch(room, reporterRole, msg) {
@@ -1890,6 +1909,7 @@ wss.on('connection', (ws, req) => {
                     hostPlayerId: typeof msg.hostPlayerId === 'string' ? msg.hostPlayerId : undefined,
                     hostVersionCode: packetInt(msg, 'clientVersionCode'),
                     hostVersionName: typeof msg.clientVersionName === 'string' ? msg.clientVersionName : undefined,
+                    hostAnalyticsChannel: normalizeAnalyticsChannel(msg.analyticsChannel),
                     hostCountryCode: ws.analyticsCountryCode,
                     hostUserAgent: ws.analyticsUserAgent,
                     guestCharacterId: undefined,
@@ -1899,6 +1919,7 @@ wss.on('connection', (ws, req) => {
                     guestPlayerId: undefined,
                     guestVersionCode: undefined,
                     guestVersionName: undefined,
+                    guestAnalyticsChannel: undefined,
                     guestCountryCode: undefined,
                     guestUserAgent: undefined,
                     networkMode: networkMode(msg.networkMode),
@@ -1953,6 +1974,7 @@ wss.on('connection', (ws, req) => {
                 room.guestPlayerId = typeof msg.guestPlayerId === 'string' ? msg.guestPlayerId : undefined;
                 room.guestVersionCode = packetInt(msg, 'clientVersionCode');
                 room.guestVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : undefined;
+                room.guestAnalyticsChannel = normalizeAnalyticsChannel(msg.analyticsChannel);
                 room.guestCountryCode = ws.analyticsCountryCode;
                 room.guestUserAgent = ws.analyticsUserAgent;
                 ws.roomCode = code;
@@ -2094,6 +2116,7 @@ wss.on('connection', (ws, req) => {
                     room.hostPlayerId = typeof msg.hostPlayerId === 'string' ? msg.hostPlayerId : room.hostPlayerId;
                     room.hostVersionCode = packetInt(msg, 'clientVersionCode') || room.hostVersionCode;
                     room.hostVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : room.hostVersionName;
+                    room.hostAnalyticsChannel = normalizeAnalyticsChannel(msg.analyticsChannel || room.hostAnalyticsChannel);
                     room.arenaId = enumToken(msg.arenaId) || room.arenaId;
                     const gameStartPacket = { ...msg, matchId: room.matchId };
                     const peer = ws.role === 'host' ? room.guest : room.host;
@@ -2112,6 +2135,7 @@ wss.on('connection', (ws, req) => {
                     room.guestPlayerId = typeof msg.guestPlayerId === 'string' ? msg.guestPlayerId : room.guestPlayerId;
                     room.guestVersionCode = packetInt(msg, 'clientVersionCode') || room.guestVersionCode;
                     room.guestVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : room.guestVersionName;
+                    room.guestAnalyticsChannel = normalizeAnalyticsChannel(msg.analyticsChannel || room.guestAnalyticsChannel);
                 }
                 if (msg.type === 'rematch_ready') {
                     const prefix = ws.role === 'host' ? 'host' : 'guest';
@@ -2119,6 +2143,9 @@ wss.on('connection', (ws, req) => {
                     room[`${prefix}PassiveId`] = enumToken(msg.passiveId) || room[`${prefix}PassiveId`];
                     room[`${prefix}Nickname`] = typeof msg.nickname === 'string' ? msg.nickname : room[`${prefix}Nickname`];
                     room[`${prefix}PlayerId`] = typeof msg.playerId === 'string' ? msg.playerId : room[`${prefix}PlayerId`];
+                    room[`${prefix}AnalyticsChannel`] = normalizeAnalyticsChannel(
+                        msg.analyticsChannel || room[`${prefix}AnalyticsChannel`]
+                    );
                 }
                 const peer = ws.role === 'host' ? room.guest : room.host;
                 send(peer, msg);

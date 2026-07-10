@@ -67,7 +67,7 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 | `POST` | `/matches/pvp-result` | Store a server-confirmed PvP result for both players and return local reward/MMR data |
 | `GET` | `/rankings?mode=single|multi` | Return ranking rows from the active stats storage |
 | `GET` | `/players/:playerIdOrNickname/stats?mode=single|multi` | Return one player's aggregate stats |
-| `POST` | `/analytics/events` | Accept allowlisted debug/beta `app_launch` and `single_match_complete` events |
+| `POST` | `/analytics/events` | Accept allowlisted launch, screen, feature, and single-match analytics events |
 | `GET` | `/admin` | Basic-auth operations dashboard; disabled until admin password is configured |
 | `GET` | `/admin/api/stats` | Basic-auth JSON snapshot used for operations or future admin tooling |
 
@@ -87,7 +87,7 @@ PostgreSQL tables are created automatically at startup:
 
 ## Admin analytics
 
-The dashboard reports DAU/WAU/MAU, DAU/MAU stickiness, launches, screen and feature usage, single/multiplayer match counts, matches per active user, live connections, versions, country/locale codes, User-Agent distribution, finish reasons, and repeated-opponent risk signals. It includes a 30-day activity line chart plus country, feature, screen, and finish-reason distribution bars. Multiplayer matches are recorded from server-confirmed results. Android launch, screen, feature, and single-match uploads are enabled only in debug builds until the release privacy policy and Play Data safety declaration are updated.
+The dashboard reports DAU/WAU/MAU, DAU/MAU stickiness, launches, screen and feature usage, single/multiplayer match counts, matches per active user, live connections, versions, country/locale codes, User-Agent distribution, finish reasons, and repeated-opponent risk signals. It includes a 30-day activity line chart plus country, feature, screen, and finish-reason distribution bars. Multiplayer matches are recorded from server-confirmed results. All metrics can be filtered by `dev`, `beta`, or `production` distribution channel. Android debug and release builds upload launch, screen, feature, and single-match events; closed-beta release artifacts must set `ANALYTICS_CHANNEL=beta` at build time.
 
 Set `ADMIN_DASHBOARD_PASSWORD` in Railway, optionally change `ADMIN_DASHBOARD_USERNAME`, redeploy, then open `/admin`. The browser uses HTTP Basic authentication. Do not put the password in source control, a static webpage, or a query parameter.
 
