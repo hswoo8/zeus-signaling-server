@@ -8,9 +8,17 @@ Set these environment variables in production to block outdated multiplayer clie
 
 | env | Default | Description |
 | --- | --- | --- |
+| `SERVICE_ROLE` | `game` | Run `game` signaling/stats server or stateless `router` from the same image |
+| `SERVER_CHANNEL` | `unrestricted` | Game environment label such as `production` or `beta` |
+| `SERVER_POOL_ID` | `default` | Blue/green or beta pool identifier returned by health/capacity |
+| `SERVER_ALLOWED_CHANNELS` | channel default | Comma-separated app channels accepted by WebSocket and stats endpoints |
 | `MULTIPLAYER_MIN_APP_VERSION_CODE` | `1` | Minimum Android `clientVersionCode` allowed to use lobby/match start messages |
+| `MULTIPLAYER_MAX_APP_VERSION_CODE` | unset | Optional maximum Android version for this pool |
 | `MULTIPLAYER_MIN_PROTOCOL_VERSION` | `1` | Minimum network protocol version |
+| `MULTIPLAYER_MAX_PROTOCOL_VERSION` | unset | Optional maximum protocol version for this pool |
+| `MULTIPLAYER_RULESET_VERSION` | unset | Exact gameplay ruleset required by this pool |
 | `MULTIPLAYER_MIN_BALANCE_VERSION` | `1` | Minimum gameplay balance/data version |
+| `MULTIPLAYER_MAX_BALANCE_VERSION` | unset | Optional maximum balance version for this pool |
 | `HEARTBEAT_INTERVAL_MS` | `15000` | Server WebSocket ping interval |
 | `HEARTBEAT_TIMEOUT_MS` | `45000` | Time since last message/pong before a socket is terminated |
 | `MAX_CONNECTIONS` | unset | Optional hard cap for simultaneous WebSocket clients |
@@ -31,6 +39,12 @@ Set these environment variables in production to block outdated multiplayer clie
 
 If a client is missing or below the version values, the server returns `{ type: "error", code: "update_required", message }`.
 If capacity or maintenance gates block entry, the server returns `{ type: "error", code: "server_busy" | "server_maintenance", message, retryAfterSec }`.
+
+## Match router
+
+Set `SERVICE_ROLE=router` to run the stateless `/route` service. Configure `ROUTER_CHANNEL`, `ROUTER_ALLOWED_CHANNELS`, and `ROUTER_ROUTES_JSON`. Each route defines a pool, secure WebSocket/stats URLs, app version bounds, an exact protocol/ruleset, and balance bounds. Unsupported combinations return `update_required`; cross-environment requests return `wrong_environment`.
+
+Clients must route before capacity/WebSocket connection. The selected game server repeats the channel and version validation, so a bad or stale route cannot mix beta and production rooms. Android debug uses the beta router; production candidates use the production router.
 
 ## Lobby messages
 
@@ -61,10 +75,10 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/health` | Process health, version, storage mode, room/player counts |
+| `GET` | `/health` | Process health, version, channel, pool, ruleset, storage mode, room/player counts |
 | `GET` | `/capacity` | Multiplayer entry status, current counts, optional caps, retry delay, and minimum version requirements |
-| `POST` | `/matches/result` | Store a single-player result for one player |
-| `POST` | `/matches/pvp-result` | Store a server-confirmed PvP result for both players and return local reward/MMR data |
+| `POST` | `/matches/result` | Store a single-player result for one player; requires an allowed `X-App-Channel` |
+| `POST` | `/matches/pvp-result` | Store a server-confirmed PvP result for both players; requires an allowed `X-App-Channel` |
 | `GET` | `/rankings?mode=single|multi` | Return ranking rows from the active stats storage |
 | `GET` | `/players/:playerIdOrNickname/stats?mode=single|multi` | Return one player's aggregate stats |
 | `POST` | `/analytics/events` | Accept allowlisted launch, screen, feature, and single-match analytics events |
