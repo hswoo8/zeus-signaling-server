@@ -11,6 +11,8 @@ const versionFields = {
     rulesetVersion: 1,
     balanceVersion: 1,
 };
+const appJsonHeaders = { 'content-type': 'application/json', 'x-app-channel': 'dev' };
+const appHeaders = { 'x-app-channel': 'dev' };
 
 function createInbox(ws) {
     const messages = [];
@@ -96,7 +98,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
             ADMIN_DASHBOARD_PASSWORD: 'test-password',
             SERVER_CHANNEL: 'dev',
             SERVER_POOL_ID: 'test-pool',
-            SERVER_ALLOWED_CHANNELS: 'dev',
+            SERVER_ALLOWED_CHANNELS: 'dev,beta',
             MULTIPLAYER_RULESET_VERSION: '1',
             MULTIPLAYER_MAX_APP_VERSION_CODE: '1',
             MULTIPLAYER_MAX_PROTOCOL_VERSION: '1',
@@ -271,7 +273,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
 
     const mismatch = await fetch(`${baseUrl}/matches/pvp-result`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: appJsonHeaders,
         body: JSON.stringify(resultBody(assigned.matchId, guestPlayer, hostPlayer, 'win')),
     });
     assert.equal(mismatch.status, 409);
@@ -279,20 +281,20 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
 
     const accepted = await fetch(`${baseUrl}/matches/pvp-result`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: appJsonHeaders,
         body: JSON.stringify(resultBody(assigned.matchId, hostPlayer, guestPlayer, 'win')),
     });
     assert.equal(accepted.status, 201, serverErrors);
 
     const duplicate = await fetch(`${baseUrl}/matches/pvp-result`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: appJsonHeaders,
         body: JSON.stringify(resultBody(assigned.matchId, guestPlayer, hostPlayer, 'loss')),
     });
     assert.equal(duplicate.status, 200, serverErrors);
     assert.equal((await duplicate.json()).duplicate, true);
 
-    const stats = await fetch(`${baseUrl}/players/${hostPlayer.playerId}/stats?mode=multi`);
+    const stats = await fetch(`${baseUrl}/players/${hostPlayer.playerId}/stats?mode=multi`, { headers: appHeaders });
     assert.equal(stats.status, 200);
     assert.equal((await stats.json()).matches, 1);
 
@@ -322,14 +324,14 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
 
     const forfeitAccepted = await fetch(`${baseUrl}/matches/pvp-result`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: appJsonHeaders,
         body: JSON.stringify(resultBody(rematchAssigned.matchId, hostPlayer, guestPlayer, 'win')),
     });
     assert.equal(forfeitAccepted.status, 201, serverErrors);
     const forfeitResponse = await forfeitAccepted.json();
     assert.equal(forfeitResponse.players.local.rewardCoins, 20);
 
-    const updatedStats = await fetch(`${baseUrl}/players/${hostPlayer.playerId}/stats?mode=multi`);
+    const updatedStats = await fetch(`${baseUrl}/players/${hostPlayer.playerId}/stats?mode=multi`, { headers: appHeaders });
     assert.equal(updatedStats.status, 200);
     assert.equal((await updatedStats.json()).matches, 2);
 
@@ -346,13 +348,13 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
 
     const disconnectAccepted = await fetch(`${baseUrl}/matches/pvp-result`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: appJsonHeaders,
         body: JSON.stringify(resultBody(disconnectAssigned.matchId, hostPlayer, guestPlayer, 'win')),
     });
     assert.equal(disconnectAccepted.status, 201, serverErrors);
     assert.equal((await disconnectAccepted.json()).players.local.rewardCoins, 20);
 
-    const finalStats = await fetch(`${baseUrl}/players/${hostPlayer.playerId}/stats?mode=multi`);
+    const finalStats = await fetch(`${baseUrl}/players/${hostPlayer.playerId}/stats?mode=multi`, { headers: appHeaders });
     assert.equal(finalStats.status, 200);
     assert.equal((await finalStats.json()).matches, 3);
 

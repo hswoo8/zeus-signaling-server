@@ -168,6 +168,26 @@ function envTokenSet(name, fallback) {
     return new Set(source.split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
 }
 
+function appChannelAllowed(channel) {
+    return SERVER_ALLOWED_CHANNELS.size === 0 || SERVER_ALLOWED_CHANNELS.has(channel);
+}
+
+function requestAppChannel(req) {
+    return String(req.headers['x-app-channel'] || '').trim().toLowerCase();
+}
+
+function requireHttpAppChannel(req, res) {
+    const channel = requestAppChannel(req);
+    if (appChannelAllowed(channel)) return true;
+    sendHttpError(
+        res,
+        409,
+        'wrong_environment',
+        `${channel || 'unknown'} 앱은 ${SERVER_CHANNEL} 서버 데이터를 사용할 수 없습니다.`
+    );
+    return false;
+}
+
 function postgresSslConfig() {
     const sslMode = String(process.env.PGSSLMODE || '').toLowerCase();
     const explicit = String(process.env.PGSSL || '').toLowerCase();
@@ -553,6 +573,10 @@ async function handleHttpRequest(req, res) {
             sendHttpError(res, 400, 'invalid_event', 'Analytics event is invalid or unsupported');
             return;
         }
+        if (!appChannelAllowed(event.analyticsChannel)) {
+            sendHttpError(res, 409, 'wrong_environment', 'Analytics channel does not match this server');
+            return;
+        }
         const result = await analyticsStore.record(event);
         sendJson(res, result.duplicate ? 200 : 202, result);
         return;
@@ -596,6 +620,7 @@ async function handleHttpRequest(req, res) {
     }
 
     if (req.method === 'POST' && pathname === '/matches/result') {
+        if (!requireHttpAppChannel(req, res)) return;
         const body = await readJsonRequest(req, res);
         if (!body) return;
         if (statsPool) {
@@ -607,6 +632,7 @@ async function handleHttpRequest(req, res) {
     }
 
     if (req.method === 'POST' && pathname === '/matches/pvp-result') {
+        if (!requireHttpAppChannel(req, res)) return;
         const submittedBody = await readJsonRequest(req, res);
         if (!submittedBody) return;
         const confirmed = await normalizeConfirmedPvpSubmission(submittedBody);
@@ -629,6 +655,7 @@ async function handleHttpRequest(req, res) {
     }
 
     if (req.method === 'GET' && pathname === '/rankings') {
+        if (!requireHttpAppChannel(req, res)) return;
         const mode = normalizeMode(url.searchParams.get('mode') || 'single');
         if (!mode) {
             sendHttpError(res, 400, 'invalid_request', 'mode must be single or multi');
@@ -645,6 +672,7 @@ async function handleHttpRequest(req, res) {
 
     const playerStatsMatch = pathname.match(/^\/players\/([^/]+)\/stats$/);
     if (req.method === 'GET' && playerStatsMatch) {
+        if (!requireHttpAppChannel(req, res)) return;
         const mode = normalizeMode(url.searchParams.get('mode') || 'single');
         if (!mode) {
             sendHttpError(res, 400, 'invalid_request', 'mode must be single or multi');
