@@ -100,7 +100,7 @@ const analyticsRequestBuckets = new Map();
 let serverMatchCounter = 0;
 
 const LOBBY_TYPES = new Set([
-    'create_room', 'join_room', 'get_room_list', 'ping_check', 'selection_update',
+    'create_room', 'join_room', 'leave_room', 'get_room_list', 'ping_check', 'selection_update',
     'offer', 'answer', 'ice_candidate',
 ]);
 
@@ -114,7 +114,7 @@ const GAME_TYPES = new Set([
 const ALL_TYPES = new Set([...LOBBY_TYPES, ...GAME_TYPES]);
 
 const COMPATIBILITY_TYPES = new Set([
-    'create_room', 'join_room', 'get_room_list', 'ping_check',
+    'create_room', 'join_room', 'leave_room', 'get_room_list', 'ping_check',
     'selection_update', 'game_start', 'game_ready', 'rematch_ready',
 ]);
 
@@ -1817,6 +1817,53 @@ function resetGuestSlot(room) {
     room.matchStartedAtMs = null;
 }
 
+function leaveWaitingRoom(ws, notifyLeaver = false) {
+    const code = ws?.roomCode;
+    const room = code ? rooms[code] : null;
+    if (!room || room.matchStarted) return false;
+
+    if (ws.role === 'guest') {
+        send(room.host, { type: 'peer_disconnected' });
+        resetGuestSlot(room);
+        console.log(`[-] Guest left waiting room: ${code}`);
+    } else if (ws.role === 'host' && room.guest?.readyState === WebSocket.OPEN) {
+        const promotedHost = room.guest;
+        room.host = promotedHost;
+        room.guest = null;
+        room.hostRttMs = socketRttMs(promotedHost);
+        room.hostCharacterId = room.guestCharacterId;
+        room.hostPassiveId = room.guestPassiveId;
+        room.arenaId = room.guestArenaId || room.arenaId;
+        room.hostNickname = room.guestNickname;
+        room.hostPlayerId = room.guestPlayerId;
+        room.hostVersionCode = room.guestVersionCode;
+        room.hostVersionName = room.guestVersionName;
+        room.hostAnalyticsChannel = room.guestAnalyticsChannel;
+        room.hostCountryCode = room.guestCountryCode;
+        room.hostUserAgent = room.guestUserAgent;
+        resetGuestSlot(room);
+        promotedHost.role = 'host';
+        promotedHost.roomCode = code;
+        send(promotedHost, {
+            type: 'host_migrated',
+            code,
+            networkMode: room.networkMode || 'relay',
+            arenaId: room.arenaId,
+        });
+        console.log(`[~] Host migrated after waiting host left: ${code}`);
+    } else if (ws.role === 'host') {
+        delete rooms[code];
+        console.log(`[-] Empty waiting room removed: ${code}`);
+    } else {
+        return false;
+    }
+
+    ws.roomCode = null;
+    ws.role = null;
+    if (notifyLeaver) send(ws, { type: 'room_left', code });
+    return true;
+}
+
 function rateLimitBucket(type) {
     if (type === 'game_state') return 'gameState';
     if (type === 'offer' || type === 'answer' || type === 'ice_candidate') return 'signaling';
@@ -2108,6 +2155,23 @@ wss.on('connection', (ws, req) => {
                 break;
             }
 
+            case 'leave_room': {
+                if (!ws.roomCode || !rooms[ws.roomCode]) {
+                    ws.roomCode = null;
+                    ws.role = null;
+                    send(ws, { type: 'room_left', code: null });
+                    break;
+                }
+                if (!leaveWaitingRoom(ws, true)) {
+                    send(ws, {
+                        type: 'error',
+                        code: 'match_in_progress',
+                        message: 'Cannot leave an active match from the lobby',
+                    });
+                }
+                break;
+            }
+
             // ── WebRTC 시그널링 릴레이 ───────────────────────────────────
             // offer / answer / ice_candidate 모두 상대방에게 그대로 중계
             case 'offer':
@@ -2267,42 +2331,7 @@ wss.on('connection', (ws, req) => {
         if (!code || !rooms[code]) return;
 
         const room = rooms[code];
-
-        if (ws.role === 'guest' && !room.matchStarted) {
-            send(room.host, { type: 'peer_disconnected' });
-            resetGuestSlot(room);
-            console.log(`[-] Guest left waiting room: ${code}`);
-            return;
-        }
-
-        if (ws.role === 'host' &&
-            !room.matchStarted &&
-            room.guest?.readyState === WebSocket.OPEN) {
-            const promotedHost = room.guest;
-            room.host = promotedHost;
-            room.guest = null;
-            room.hostRttMs = socketRttMs(promotedHost);
-            room.hostCharacterId = room.guestCharacterId;
-            room.hostPassiveId = room.guestPassiveId;
-            room.arenaId = room.guestArenaId || room.arenaId;
-            room.hostNickname = room.guestNickname;
-            room.hostPlayerId = room.guestPlayerId;
-            room.hostVersionCode = room.guestVersionCode;
-            room.hostVersionName = room.guestVersionName;
-            room.hostCountryCode = room.guestCountryCode;
-            room.hostUserAgent = room.guestUserAgent;
-            resetGuestSlot(room);
-            promotedHost.role = 'host';
-            promotedHost.roomCode = code;
-            send(promotedHost, {
-                type: 'host_migrated',
-                code,
-                networkMode: room.networkMode || 'relay',
-                arenaId: room.arenaId,
-            });
-            console.log(`[~] Host migrated after waiting host left: ${code}`);
-            return;
-        }
+        if (leaveWaitingRoom(ws)) return;
 
         const peer = ws.role === 'host' ? room.guest : room.host;
 

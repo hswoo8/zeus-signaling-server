@@ -55,6 +55,8 @@ Clients must route before capacity/WebSocket connection. The selected game serve
 | `join_room` | Client -> Server | Compatibility metadata and `{ code, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
 | `room_joined` | Server -> Guest | `{ code, networkMode, battleType, hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId }` |
 | `guest_joined` | Server -> Host | `{ networkMode, battleType, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
+| `leave_room` | Client -> Server | Leave the waiting/rematch room while keeping the WebSocket connected |
+| `room_left` | Server -> Client | Confirms that room state was cleared; the client can return to room-list polling |
 | `selection_update` | Client -> Server -> Peer | Live setup selection and ready state: `{ characterId, passiveId, arenaId, battleType, nickname, playerId, ready, networkMode }`; room `battleType` is fixed at `create_room` |
 | `ping_check` | Client -> Server | `{ clientTime, rttMs? }` |
 | `ping_check_ack` | Server -> Client | `{ clientTime, serverTime }` |

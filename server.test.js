@@ -200,6 +200,76 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         assert.equal(response.status, 202);
     }
 
+    const soloHost = await connect(`ws://127.0.0.1:${port}`);
+    const soloInbox = createInbox(soloHost);
+    soloHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        hostCharacterId: 'ZEUS',
+        hostPassiveId: 'IRON_WILL',
+        arenaId: 'CLASSIC_OLYMPUS',
+    }));
+    const soloCreated = await soloInbox.type('room_created');
+    soloHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    const soloLeft = await soloInbox.type('room_left');
+    assert.equal(soloLeft.code, soloCreated.code);
+    soloHost.send(JSON.stringify({ type: 'get_room_list', ...versionFields }));
+    const soloRooms = await soloInbox.type('room_list');
+    assert.equal(soloRooms.rooms.some((room) => room.code === soloCreated.code), false);
+    soloHost.close();
+
+    const departingHost = await connect(`ws://127.0.0.1:${port}`);
+    const promotedGuest = await connect(`ws://127.0.0.1:${port}`);
+    const replacementGuest = await connect(`ws://127.0.0.1:${port}`);
+    const departingInbox = createInbox(departingHost);
+    const promotedInbox = createInbox(promotedGuest);
+    const replacementInbox = createInbox(replacementGuest);
+    departingHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        hostCharacterId: 'ZEUS',
+        hostPassiveId: 'IRON_WILL',
+        arenaId: 'CLASSIC_OLYMPUS',
+    }));
+    const migrationRoom = await departingInbox.type('room_created');
+    promotedGuest.send(JSON.stringify({
+        type: 'join_room',
+        ...versionFields,
+        code: migrationRoom.code,
+        guestCharacterId: 'ZEUS',
+        guestPassiveId: 'STORM_MASTERY',
+        arenaId: 'CLASSIC_OLYMPUS',
+    }));
+    await Promise.all([departingInbox.type('guest_joined'), promotedInbox.type('room_joined')]);
+    departingHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    const [departingLeft, migrated] = await Promise.all([
+        departingInbox.type('room_left'),
+        promotedInbox.type('host_migrated'),
+    ]);
+    assert.equal(departingLeft.code, migrationRoom.code);
+    assert.equal(migrated.code, migrationRoom.code);
+
+    replacementGuest.send(JSON.stringify({
+        type: 'join_room',
+        ...versionFields,
+        code: migrationRoom.code,
+        guestCharacterId: 'ZEUS',
+        guestPassiveId: 'IRON_WILL',
+        arenaId: 'CLASSIC_OLYMPUS',
+    }));
+    await Promise.all([promotedInbox.type('guest_joined'), replacementInbox.type('room_joined')]);
+    replacementGuest.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    const [replacementLeft] = await Promise.all([
+        replacementInbox.type('room_left'),
+        promotedInbox.type('peer_disconnected'),
+    ]);
+    assert.equal(replacementLeft.code, migrationRoom.code);
+    promotedGuest.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await promotedInbox.type('room_left');
+    departingHost.close();
+    promotedGuest.close();
+    replacementGuest.close();
+
     const host = await connect(`ws://127.0.0.1:${port}`);
     const guest = await connect(`ws://127.0.0.1:${port}`);
     t.after(() => {
