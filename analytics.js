@@ -623,6 +623,9 @@ ${metric('현재 연결', live.connections || 0, `전체 채널 · 방 ${live.ro
 ${metric('진행 중 대전', live.activeMatches || 0, `전체 채널 · 대기 방 ${live.waitingRooms || 0}`)}
 ${metric('Relay / P2P', `${live.activeRelayMatches || 0} / ${live.activeP2pMatches || 0}`, '현재 진행 중 대전')}
 ${metric('Relay 전송', relay.packets || 0, `재시작 후 ${megabytes(relay.bytes)}`)}
+${metric('Relay 상태', relay.canStartNewMatch === false ? '제한 중' : '정상', `${relay.code || 'ok'} · 진행 ${relay.activeMatches || 0}/${relay.maxActiveMatches || '∞'}`)}
+${metric('Relay 최근 1시간', `${relay.lastHourMb || 0} MB`, `경고 ${relay.warningMbPerHour || '-'} · 차단 ${relay.limitMbPerHour || '-'} MB`)}
+${metric('Relay 진입 거부', relay.admissionRejections || 0, `전투 중 fallback ${relay.runtimeFallbacks || 0}`)}
 ${metric('혼잡 거부', operations.capacityRejections || 0, '재시작 후 누적')}
 ${metric('이벤트 루프 p95', `${eventLoopLag.p95 || 0} ms`, `최근 60초 · 최대 ${eventLoopLag.max || 0} ms`)}
 ${metric('송신 지연 보호', backpressure.droppedStatePackets || 0, `연결 종료 ${backpressure.closedConnections || 0}`)}

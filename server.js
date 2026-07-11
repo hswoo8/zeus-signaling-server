@@ -25,6 +25,10 @@ const WS_BACKPRESSURE_HARD_BYTES = Number(process.env.WS_BACKPRESSURE_HARD_BYTES
 const MAX_CONNECTIONS = envOptionalInt(['MAX_CONNECTIONS', 'MULTIPLAYER_MAX_CONNECTIONS']);
 const MAX_ACTIVE_ROOMS = envOptionalInt(['MAX_ACTIVE_ROOMS', 'MULTIPLAYER_MAX_ACTIVE_ROOMS']);
 const MAX_ACTIVE_MATCHES = envOptionalInt(['MAX_ACTIVE_MATCHES', 'MULTIPLAYER_MAX_ACTIVE_MATCHES']);
+const RELAY_MATCHES_ENABLED = envBool(['RELAY_MATCHES_ENABLED'], true);
+const MAX_ACTIVE_RELAY_MATCHES = envOptionalInt(['MAX_ACTIVE_RELAY_MATCHES']);
+const RELAY_EGRESS_WARNING_MB_PER_HOUR = envOptionalInt(['RELAY_EGRESS_WARNING_MB_PER_HOUR']);
+const RELAY_EGRESS_LIMIT_MB_PER_HOUR = envOptionalInt(['RELAY_EGRESS_LIMIT_MB_PER_HOUR']);
 const CAPACITY_BUSY_RATIO = envFloat(['CAPACITY_BUSY_RATIO', 'MULTIPLAYER_CAPACITY_BUSY_RATIO'], 0.9, 0.1, 1);
 const CAPACITY_RETRY_AFTER_SEC = envInt(['CAPACITY_RETRY_AFTER_SEC', 'MULTIPLAYER_CAPACITY_RETRY_AFTER_SEC'], 30);
 const MAINTENANCE_MODE = envBool(['MAINTENANCE_MODE', 'MULTIPLAYER_MAINTENANCE'], false);
@@ -116,8 +120,11 @@ let backpressureClosedConnections = 0;
 let capacityRejections = 0;
 let relayedPackets = 0;
 let relayedBytes = 0;
+let relayAdmissionRejections = 0;
+let relayRuntimeFallbacks = 0;
 let eventLoopLagLatestMs = 0;
 const eventLoopLagSamples = [];
+const relayMinuteBytes = new Map();
 
 const LOBBY_TYPES = new Set([
     'create_room', 'join_room', 'leave_room', 'get_room_list', 'ping_check', 'selection_update',
@@ -294,7 +301,9 @@ function send(ws, data, options = {}) {
         ws.send(payload);
         if (options.relay === true) {
             relayedPackets += 1;
-            relayedBytes += Buffer.byteLength(payload, 'utf8');
+            const payloadBytes = Buffer.byteLength(payload, 'utf8');
+            relayedBytes += payloadBytes;
+            recordRelayBytes(payloadBytes);
         }
         return true;
     } catch {
@@ -527,13 +536,13 @@ function roomCounts() {
         room.host?.readyState === WebSocket.OPEN &&
         room.guest?.readyState === WebSocket.OPEN &&
         room.matchStarted &&
-        room.networkMode !== 'p2p'
+        room.activeTransport === 'relay'
     ).length;
     const activeP2pMatches = roomValues.filter((room) =>
         room.host?.readyState === WebSocket.OPEN &&
         room.guest?.readyState === WebSocket.OPEN &&
         room.matchStarted &&
-        room.networkMode === 'p2p'
+        room.activeTransport === 'p2p'
     ).length;
     return {
         rooms: roomValues.length,
@@ -542,6 +551,61 @@ function roomCounts() {
         matchSlots,
         activeRelayMatches,
         activeP2pMatches,
+    };
+}
+
+function recordRelayBytes(bytes) {
+    const minute = Math.floor(Date.now() / 60000);
+    relayMinuteBytes.set(minute, (relayMinuteBytes.get(minute) || 0) + bytes);
+    for (const key of relayMinuteBytes.keys()) {
+        if (key < minute - 59) relayMinuteBytes.delete(key);
+    }
+}
+
+function relayBytesLastHour() {
+    const currentMinute = Math.floor(Date.now() / 60000);
+    let bytes = 0;
+    for (const [minute, value] of relayMinuteBytes) {
+        if (minute >= currentMinute - 59) {
+            bytes += value;
+        } else {
+            relayMinuteBytes.delete(minute);
+        }
+    }
+    return bytes;
+}
+
+function relayAvailabilitySnapshot(additionalMatches = 1) {
+    const activeMatches = roomCounts().activeRelayMatches;
+    const lastHourBytes = relayBytesLastHour();
+    const lastHourMb = Math.round(lastHourBytes * 10 / 1048576) / 10;
+    const warning = RELAY_EGRESS_WARNING_MB_PER_HOUR > 0 &&
+        lastHourBytes >= RELAY_EGRESS_WARNING_MB_PER_HOUR * 1048576;
+    let code = 'ok';
+    let message = 'Relay 대전 이용 가능';
+    if (!RELAY_MATCHES_ENABLED) {
+        code = 'relay_disabled';
+        message = '현재 Relay 대전이 일시 중단되었습니다. P2P 모드로 다시 시도해주세요.';
+    } else if (MAX_ACTIVE_RELAY_MATCHES > 0 && activeMatches + additionalMatches > MAX_ACTIVE_RELAY_MATCHES) {
+        code = 'relay_capacity';
+        message = '현재 Relay 대전이 혼잡합니다. P2P 모드로 다시 시도해주세요.';
+    } else if (RELAY_EGRESS_LIMIT_MB_PER_HOUR > 0 &&
+        lastHourBytes >= RELAY_EGRESS_LIMIT_MB_PER_HOUR * 1048576) {
+        code = 'relay_egress_limited';
+        message = 'Relay 트래픽 보호가 작동 중입니다. P2P 모드로 다시 시도해주세요.';
+    }
+    return {
+        enabled: RELAY_MATCHES_ENABLED,
+        canStartNewMatch: code === 'ok',
+        code,
+        message,
+        activeMatches,
+        maxActiveMatches: limitValue(MAX_ACTIVE_RELAY_MATCHES),
+        lastHourBytes,
+        lastHourMb,
+        warning,
+        warningMbPerHour: limitValue(RELAY_EGRESS_WARNING_MB_PER_HOUR),
+        limitMbPerHour: limitValue(RELAY_EGRESS_LIMIT_MB_PER_HOUR),
     };
 }
 
@@ -565,6 +629,9 @@ function operationsSnapshot() {
         relay: {
             packets: relayedPackets,
             bytes: relayedBytes,
+            admissionRejections: relayAdmissionRejections,
+            runtimeFallbacks: relayRuntimeFallbacks,
+            ...relayAvailabilitySnapshot(),
         },
         backpressure: {
             droppedStatePackets: backpressureDroppedStatePackets,
@@ -659,6 +726,7 @@ function capacitySnapshot(options = {}) {
             closedConnections: backpressureClosedConnections,
         },
         operations: operationsSnapshot(),
+        relay: relayAvailabilitySnapshot(),
         requiredVersionCode: MIN_CLIENT_VERSION_CODE,
         requiredProtocolVersion: MIN_PROTOCOL_VERSION,
         requiredBalanceVersion: MIN_BALANCE_VERSION,
@@ -2030,6 +2098,12 @@ function networkMode(value) {
     return NETWORK_MODES.has(normalized) ? normalized : 'relay';
 }
 
+function battleTransport(value, roomMode) {
+    const normalized = typeof value === 'string' ? value.toLowerCase() : '';
+    if (normalized === 'p2p' || normalized === 'relay') return normalized;
+    return roomMode === 'p2p' ? 'p2p' : 'relay';
+}
+
 function validateJoinCode(code) {
     return typeof code === 'string' && /^\d{4}$/.test(code);
 }
@@ -2052,6 +2126,9 @@ function roomQuality(hostRttMs, guestRttMs) {
 function roomListEntry(code, room, viewer) {
     if (!room || room.host?.readyState !== WebSocket.OPEN ||
         (room.guest && room.guest.readyState === WebSocket.OPEN)) {
+        return null;
+    }
+    if (room.networkMode === 'relay' && !relayAvailabilitySnapshot().canStartNewMatch) {
         return null;
     }
     return {
@@ -2110,10 +2187,43 @@ function resetGuestSlot(room) {
     room.guestCountryCode = undefined;
     room.guestUserAgent = undefined;
     room.matchStarted = false;
+    room.activeTransport = null;
     room.matchId = null;
     room.finalResult = null;
     room.battleStartAtMs = null;
     room.matchStartedAtMs = null;
+}
+
+function sendRelayAdmissionError(ws, relayStatus) {
+    relayAdmissionRejections += 1;
+    send(ws, {
+        type: 'error',
+        code: relayStatus.code,
+        message: relayStatus.message,
+        retryAfterSec: CAPACITY_RETRY_AFTER_SEC,
+        relay: relayStatus,
+    });
+}
+
+function rejectRoomRelayStart(code, room, relayStatus) {
+    relayAdmissionRejections += 1;
+    const packet = {
+        type: 'error',
+        code: relayStatus.code,
+        message: relayStatus.message,
+        retryAfterSec: CAPACITY_RETRY_AFTER_SEC,
+        relay: relayStatus,
+    };
+    for (const participant of [room.host, room.guest]) {
+        send(participant, packet);
+        if (participant) {
+            participant.roomCode = null;
+            participant.role = null;
+        }
+    }
+    delete rooms[code];
+    broadcastRoomRemoved(code);
+    console.log(`[!] Relay match rejected: ${code} (${relayStatus.code})`);
 }
 
 function leaveWaitingRoom(ws, notifyLeaver = false) {
@@ -2334,6 +2444,14 @@ wss.on('connection', (ws, req) => {
 
             // ── 방 만들기 ────────────────────────────────────────────────
             case 'create_room': {
+                const requestedNetworkMode = networkMode(msg.networkMode);
+                if (requestedNetworkMode === 'relay') {
+                    const relayStatus = relayAvailabilitySnapshot();
+                    if (!relayStatus.canStartNewMatch) {
+                        sendRelayAdmissionError(ws, relayStatus);
+                        return;
+                    }
+                }
                 const capacity = capacitySnapshot({ connectionExtra: 0 });
                 if (!capacity.canCreateRoom) {
                     sendCapacityWsError(ws, capacity);
@@ -2375,7 +2493,8 @@ wss.on('connection', (ws, req) => {
                     guestAnalyticsChannel: undefined,
                     guestCountryCode: undefined,
                     guestUserAgent: undefined,
-                    networkMode: networkMode(msg.networkMode),
+                    networkMode: requestedNetworkMode,
+                    activeTransport: null,
                     matchStarted: false,
                     matchId: null,
                     matchSequence: 0,
@@ -2418,6 +2537,13 @@ wss.on('connection', (ws, req) => {
                 if (room.guest && room.guest.readyState === WebSocket.OPEN) {
                     send(ws, { type: 'error', message: 'Room is full' });
                     return;
+                }
+                if (room.networkMode === 'relay') {
+                    const relayStatus = relayAvailabilitySnapshot();
+                    if (!relayStatus.canStartNewMatch) {
+                        sendRelayAdmissionError(ws, relayStatus);
+                        return;
+                    }
                 }
 
                 room.guest = ws;
@@ -2558,8 +2684,19 @@ wss.on('connection', (ws, req) => {
 
                 if (msg.type === 'game_start') {
                     if (ws.role !== 'host') return;
+                    const requestedTransport = room.matchStarted
+                        ? (room.activeTransport || battleTransport(msg.activeTransport, room.networkMode))
+                        : battleTransport(msg.activeTransport, room.networkMode);
+                    if (!room.matchStarted && requestedTransport === 'relay') {
+                        const relayStatus = relayAvailabilitySnapshot();
+                        if (!relayStatus.canStartNewMatch) {
+                            rejectRoomRelayStart(code, room, relayStatus);
+                            return;
+                        }
+                    }
                     if (!room.matchStarted) {
                         room.matchStarted = true;
+                        room.activeTransport = requestedTransport;
                         room.matchSequence = (room.matchSequence || 0) + 1;
                         room.matchId = makeMatchId();
                         room.finalResult = null;
@@ -2574,7 +2711,11 @@ wss.on('connection', (ws, req) => {
                     room.hostVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : room.hostVersionName;
                     room.hostAnalyticsChannel = normalizeAnalyticsChannel(msg.analyticsChannel || room.hostAnalyticsChannel);
                     room.arenaId = enumToken(msg.arenaId) || room.arenaId;
-                    const gameStartPacket = { ...msg, matchId: room.matchId };
+                    const gameStartPacket = {
+                        ...msg,
+                        activeTransport: requestedTransport,
+                        matchId: room.matchId,
+                    };
                     const peer = ws.role === 'host' ? room.guest : room.host;
                     send(peer, gameStartPacket, { relay: true });
                     send(ws, {
@@ -2602,6 +2743,10 @@ wss.on('connection', (ws, req) => {
                     room[`${prefix}AnalyticsChannel`] = normalizeAnalyticsChannel(
                         msg.analyticsChannel || room[`${prefix}AnalyticsChannel`]
                     );
+                }
+                if (msg.type === 'game_state' && room.matchStarted && room.activeTransport === 'p2p') {
+                    room.activeTransport = 'relay';
+                    relayRuntimeFallbacks += 1;
                 }
                 const peer = ws.role === 'host' ? room.guest : room.host;
                 send(peer, msg, { relay: true });

@@ -252,6 +252,10 @@ function operationDelta(before, after) {
         capacityRejections: (second.capacityRejections || 0) - (first.capacityRejections || 0),
         relayPackets: (second.relay?.packets || 0) - (first.relay?.packets || 0),
         relayBytes: (second.relay?.bytes || 0) - (first.relay?.bytes || 0),
+        relayAdmissionRejections: (second.relay?.admissionRejections || 0) -
+            (first.relay?.admissionRejections || 0),
+        relayRuntimeFallbacks: (second.relay?.runtimeFallbacks || 0) -
+            (first.relay?.runtimeFallbacks || 0),
         droppedStatePackets: (second.backpressure?.droppedStatePackets || 0) -
             (first.backpressure?.droppedStatePackets || 0),
         closedConnections: (second.backpressure?.closedConnections || 0) -

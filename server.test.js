@@ -124,6 +124,8 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(health.rulesetVersion, 1);
     assert.equal(health.operations.capacityRejections, 0);
     assert.equal(health.operations.relay.packets, 0);
+    assert.equal(health.operations.relay.canStartNewMatch, true);
+    assert.equal(health.operations.relay.maxActiveMatches, null);
     assert.equal(typeof health.operations.eventLoopLagMs.p95, 'number');
 
     const wrongEnvironmentCapacity = await fetch(
@@ -352,6 +354,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(backpressureCapacity.operations.relay.packets, 1);
     assert.ok(backpressureCapacity.operations.relay.bytes > 0);
     assert.equal(backpressureCapacity.operations.backpressure.droppedStatePackets, 1);
+    assert.equal(backpressureCapacity.relay.canStartNewMatch, true);
 
     host.send(JSON.stringify({
         type: 'game_over',
@@ -518,8 +521,93 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.match(adminHtml, /운영/);
     assert.match(adminHtml, /개발/);
     assert.match(adminHtml, /Relay 전송/);
+    assert.match(adminHtml, /Relay 최근 1시간/);
+    assert.match(adminHtml, /Relay 진입 거부/);
     assert.match(adminHtml, /이벤트 루프 p95/);
     assert.match(adminHtml, /송신 지연 보호/);
+});
+
+test('relay admission limits preserve P2P matches and reject new relay starts', async (t) => {
+    const port = 22000 + Math.floor(Math.random() * 1000);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const child = spawn(process.execPath, ['server.js'], {
+        cwd: __dirname,
+        env: {
+            ...process.env,
+            PORT: String(port),
+            DATABASE_URL: '',
+            SERVER_CHANNEL: 'dev',
+            SERVER_ALLOWED_CHANNELS: 'dev',
+            MULTIPLAYER_RULESET_VERSION: '1',
+            MAX_ACTIVE_RELAY_MATCHES: '1',
+            AUTH_TOKEN_SECRET: '',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let serverErrors = '';
+    child.stderr.on('data', (chunk) => { serverErrors += chunk.toString(); });
+    t.after(() => {
+        if (child.exitCode === null) child.kill('SIGTERM');
+    });
+    await waitForServer(baseUrl, child);
+
+    const relayHost = await connect(`ws://127.0.0.1:${port}`);
+    const relayGuest = await connect(`ws://127.0.0.1:${port}`);
+    const candidateHost = await connect(`ws://127.0.0.1:${port}`);
+    const candidateGuest = await connect(`ws://127.0.0.1:${port}`);
+    const relayHostInbox = createInbox(relayHost);
+    const relayGuestInbox = createInbox(relayGuest);
+    const candidateHostInbox = createInbox(candidateHost);
+    const candidateGuestInbox = createInbox(candidateGuest);
+    t.after(() => {
+        relayHost.close();
+        relayGuest.close();
+        candidateHost.close();
+        candidateGuest.close();
+    });
+
+    const createPair = async (host, hostInbox, guest, guestInbox, mode) => {
+        host.send(JSON.stringify({ type: 'create_room', ...versionFields, networkMode: mode }));
+        const created = await hostInbox.type('room_created');
+        guest.send(JSON.stringify({ type: 'join_room', ...versionFields, code: created.code }));
+        await Promise.all([hostInbox.type('guest_joined'), guestInbox.type('room_joined')]);
+        return created.code;
+    };
+
+    await createPair(relayHost, relayHostInbox, relayGuest, relayGuestInbox, 'relay');
+    relayHost.send(JSON.stringify({ type: 'game_start', ...versionFields, activeTransport: 'relay' }));
+    await Promise.all([relayHostInbox.type('match_assigned'), relayGuestInbox.type('game_start')]);
+
+    candidateHost.send(JSON.stringify({ type: 'create_room', ...versionFields, networkMode: 'relay' }));
+    const explicitRelayError = await candidateHostInbox.type('error');
+    assert.equal(explicitRelayError.code, 'relay_capacity');
+
+    await createPair(candidateHost, candidateHostInbox, candidateGuest, candidateGuestInbox, 'auto');
+    candidateHost.send(JSON.stringify({ type: 'game_start', ...versionFields, activeTransport: 'relay' }));
+    const [hostFallbackError, guestFallbackError] = await Promise.all([
+        candidateHostInbox.type('error'),
+        candidateGuestInbox.type('error'),
+    ]);
+    assert.equal(hostFallbackError.code, 'relay_capacity');
+    assert.equal(guestFallbackError.code, 'relay_capacity');
+
+    await createPair(candidateHost, candidateHostInbox, candidateGuest, candidateGuestInbox, 'auto');
+    candidateHost.send(JSON.stringify({ type: 'game_start', ...versionFields, activeTransport: 'p2p' }));
+    await Promise.all([candidateHostInbox.type('match_assigned'), candidateGuestInbox.type('game_start')]);
+
+    const capacity = await fetch(`${baseUrl}/capacity`).then((response) => response.json());
+    assert.equal(capacity.counts.activeRelayMatches, 1, serverErrors);
+    assert.equal(capacity.counts.activeP2pMatches, 1, serverErrors);
+    assert.equal(capacity.relay.canStartNewMatch, false);
+    assert.equal(capacity.relay.code, 'relay_capacity');
+    assert.equal(capacity.operations.relay.admissionRejections, 2);
+
+    candidateHost.send(JSON.stringify({ type: 'game_state', seq: 1, x: 10, y: 20 }));
+    await candidateGuestInbox.type('game_state');
+    const fallbackCapacity = await fetch(`${baseUrl}/capacity`).then((response) => response.json());
+    assert.equal(fallbackCapacity.counts.activeRelayMatches, 2);
+    assert.equal(fallbackCapacity.counts.activeP2pMatches, 0);
+    assert.equal(fallbackCapacity.operations.relay.runtimeFallbacks, 1);
 });
 
 test('guest access tokens issue one-time WebSocket tickets', async (t) => {

@@ -26,6 +26,10 @@ Set these environment variables in production to block outdated multiplayer clie
 | `MAX_CONNECTIONS` | unset | Optional hard cap for simultaneous WebSocket clients |
 | `MAX_ACTIVE_ROOMS` | unset | Optional cap for total in-memory rooms |
 | `MAX_ACTIVE_MATCHES` | unset | Optional cap for active two-player matches |
+| `RELAY_MATCHES_ENABLED` | `true` | When false, keep signaling/P2P available but reject new Relay rooms and AUTO-to-Relay starts |
+| `MAX_ACTIVE_RELAY_MATCHES` | unset | Optional cap for concurrently active Relay transports; existing matches are not interrupted |
+| `RELAY_EGRESS_WARNING_MB_PER_HOUR` | unset | Mark Relay traffic warning state when rolling 60-minute WebSocket payload bytes reach this value |
+| `RELAY_EGRESS_LIMIT_MB_PER_HOUR` | unset | Reject new Relay starts when rolling 60-minute WebSocket payload bytes reach this value |
 | `CAPACITY_BUSY_RATIO` | `0.9` | When below `1`, block new matchmaking before a cap is fully reached |
 | `CAPACITY_RETRY_AFTER_SEC` | `30` | Suggested retry delay returned by `/capacity` and server-busy WebSocket errors |
 | `MAINTENANCE_MODE` | `false` | When true, block new multiplayer entry with a maintenance message |
@@ -46,6 +50,8 @@ Set these environment variables in production to block outdated multiplayer clie
 
 If a client is missing or below the version values, the server returns `{ type: "error", code: "update_required", message }`.
 If capacity or maintenance gates block entry, the server returns `{ type: "error", code: "server_busy" | "server_maintenance", message, retryAfterSec }`.
+Relay admission failures return `relay_disabled`, `relay_capacity`, or `relay_egress_limited`. An AUTO room may still start over P2P while Relay admission is blocked. If AUTO falls back to Relay and admission fails, the server removes the waiting room and returns both players to the lobby without interrupting existing matches.
+If a running P2P match later sends `game_state` over WebSocket, the server reclassifies it as a runtime Relay fallback for metrics and admission decisions. The existing match continues even when this temporarily moves active Relay usage above its configured cap.
 
 ## Match router
 
@@ -98,7 +104,7 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 | `GET` | `/admin` | Basic-auth operations dashboard; disabled until admin password is configured |
 | `GET` | `/admin/api/stats` | Basic-auth JSON snapshot used for operations or future admin tooling |
 
-`/health`, `/capacity`, and the admin snapshot expose process-local operational metrics: active relay/P2P matches, relay packet/byte totals, capacity rejections, WebSocket backpressure drops/closes, and rolling 60-second event-loop lag. These counters reset when the service restarts.
+`/health`, `/capacity`, and the admin snapshot expose process-local operational metrics: active Relay/P2P matches, Relay packet/byte totals, rolling 60-minute Relay bytes, Relay/capacity rejections, WebSocket backpressure drops/closes, and rolling 60-second event-loop lag. Counters reset when the service restarts. The rolling egress value measures WebSocket payload bytes and is an application-level estimate; Railway Network Egress remains the billing source of truth.
 
 Recommended Railway rollout:
 
