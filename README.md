@@ -39,6 +39,10 @@ Set these environment variables in production to block outdated multiplayer clie
 | `ANALYTICS_INGEST_ENABLED` | `true` | Accept debug/beta analytics events at `/analytics/events` |
 | `ANALYTICS_RETENTION_DAYS` | `90` | Analytics event retention and dashboard aggregation window |
 | `ANALYTICS_RATE_LIMIT_PER_MINUTE` | `120` | Per-source in-memory rate limit for analytics ingestion |
+| `SUPPORT_INGEST_ENABLED` | `true` | Accept in-app support inquiries at `/support/inquiries` |
+| `SUPPORT_RETENTION_DAYS` | `180` | Retention period for support messages and optional reply email |
+| `SUPPORT_RATE_LIMIT_PER_HOUR` | `5` | Per-anonymous-player support inquiry rate limit |
+| `SUPPORT_ADDRESS_RATE_LIMIT_PER_HOUR` | `10` | Per-source-address in-memory support inquiry rate limit; raw address is never persisted |
 | `ADMIN_DASHBOARD_USERNAME` | `admin` | Basic-auth username for `/admin` |
 | `ADMIN_DASHBOARD_PASSWORD` | unset | Required password; `/admin` stays disabled when unset |
 | `AUTH_TOKEN_SECRET` | unset | At least 32 characters enables guest/access/WebSocket ticket authentication |
@@ -101,8 +105,12 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 | `GET` | `/rankings?mode=single|multi` | Return ranking rows from the active stats storage |
 | `GET` | `/players/:playerIdOrNickname/stats?mode=single|multi` | Return one player's aggregate stats |
 | `POST` | `/analytics/events` | Accept allowlisted launch, screen, feature, and single-match analytics events |
+| `POST` | `/support/inquiries` | Store one in-app support inquiry; requires `X-Player-Id`, allowed `X-App-Channel`, app metadata headers, category, message, and optional reply email |
 | `GET` | `/admin` | Basic-auth operations dashboard; disabled until admin password is configured |
 | `GET` | `/admin/api/stats` | Basic-auth JSON snapshot used for operations or future admin tooling |
+| `GET` | `/admin/support` | Basic-auth support inbox with linked single/multi MMR and record context |
+| `GET` | `/admin/api/support` | Basic-auth JSON support inbox; filter with `channel` and `status` |
+| `POST` | `/admin/api/support/:inquiryId/status` | Basic-auth support status update: `open`, `review`, or `closed` |
 
 `/health`, `/capacity`, and the admin snapshot expose process-local operational metrics: active Relay/P2P matches, Relay packet/byte totals, rolling 60-minute Relay bytes, Relay/capacity rejections, WebSocket backpressure drops/closes, and rolling 60-second event-loop lag. Counters reset when the service restarts. The rolling egress value measures WebSocket payload bytes and is an application-level estimate; Railway Network Egress remains the billing source of truth.
 
@@ -119,11 +127,14 @@ PostgreSQL tables are created automatically at startup:
 - `br_match_results`: idempotency records and stored result payloads.
 - `br_pvp_match_confirmations`: short-lived server-confirmed match participants and outcomes used to validate PvP result submissions.
 - `br_analytics_events`: anonymized launches, single matches, and server-confirmed multiplayer matches retained for the configured analytics window.
+- `br_support_inquiries`: in-app support messages, optional reply email, anonymous player ID, app/device/country metadata, and support status retained separately from analytics.
 
 ## Admin analytics
 
 The dashboard reports DAU/WAU/MAU, DAU/MAU stickiness, launches, screen and feature usage, single/multiplayer match counts, matches per active user, live connections, versions, country/locale codes, User-Agent distribution, finish reasons, and repeated-opponent risk signals. It includes a 30-day activity line chart plus country, feature, screen, and finish-reason distribution bars. Multiplayer matches are recorded from server-confirmed results. All metrics can be filtered by `dev`, `beta`, or `production` distribution channel. Android debug and release builds upload launch, screen, feature, and single-match events; closed-beta release artifacts must set `ANALYTICS_CHANNEL=beta` at build time.
 
 Set `ADMIN_DASHBOARD_PASSWORD` in Railway, optionally change `ADMIN_DASHBOARD_USERNAME`, redeploy, then open `/admin`. The browser uses HTTP Basic authentication. Do not put the password in source control, a static webpage, or a query parameter.
+
+The same administrator credentials protect `/admin/support`. Each inquiry links the submitted anonymous `playerId` to the current `br_player_stats` single/multi MMR and record snapshot for support handling. Support messages and optional reply emails are not analytics events. They are retained for `SUPPORT_RETENTION_DAYS` and should only be accessed for support operations.
 
 Analytics stores a one-way short hash of the anonymous player ID. It does not persist raw IP addresses. Country prefers a trusted proxy country header and falls back to the Android locale country code, so it is operational grouping rather than precise location. Persistent history requires `DATABASE_URL`; memory mode resets dashboard history whenever the server restarts.

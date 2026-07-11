@@ -675,3 +675,114 @@ test('guest access tokens issue one-time WebSocket tickets', async (t) => {
         headers: { authorization: `Bearer ${ticket.ticket}` },
     }), /401/);
 });
+
+test('support inquiries retain support metadata and expose player context to admins', async (t) => {
+    const port = 23000 + Math.floor(Math.random() * 1000);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const child = spawn(process.execPath, ['server.js'], {
+        cwd: __dirname,
+        env: {
+            ...process.env,
+            PORT: String(port),
+            DATABASE_URL: '',
+            SERVER_CHANNEL: 'dev',
+            SERVER_ALLOWED_CHANNELS: 'dev',
+            ADMIN_DASHBOARD_USERNAME: 'admin',
+            ADMIN_DASHBOARD_PASSWORD: 'test-password',
+            SUPPORT_RATE_LIMIT_PER_HOUR: '1',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let serverErrors = '';
+    child.stderr.on('data', (chunk) => { serverErrors += chunk.toString(); });
+    t.after(() => {
+        if (child.exitCode === null) child.kill('SIGTERM');
+    });
+    await waitForServer(baseUrl, child);
+
+    const playerId = 'support-player-id';
+    const matchResponse = await fetch(`${baseUrl}/matches/result`, {
+        method: 'POST',
+        headers: appJsonHeaders,
+        body: JSON.stringify({
+            mode: 'single',
+            clientMatchId: 'support-single-match',
+            outcome: 'win',
+            finishReason: 'normal',
+            durationSec: 40,
+            completedAt: new Date().toISOString(),
+            nickname: 'Support Player',
+            playerId,
+            characterId: 'ZEUS',
+            passiveId: 'STORM_MASTERY',
+            arenaId: 'CLASSIC_OLYMPUS',
+            localHp: 120,
+            remoteHp: 0,
+        }),
+    });
+    assert.equal(matchResponse.status, 201, serverErrors);
+
+    const supportHeaders = {
+        'content-type': 'application/json',
+        'x-app-channel': 'dev',
+        'x-player-id': playerId,
+        'x-app-version-name': '1.2.3-debug',
+        'x-app-version-code': '123',
+        'x-build-type': 'debug',
+        'x-country-code': 'KR',
+        'user-agent': 'MiniZeus/1.2.3-debug (Android 14; Test Phone; debug; dev)',
+    };
+    const submitted = await fetch(`${baseUrl}/support/inquiries`, {
+        method: 'POST',
+        headers: supportHeaders,
+        body: JSON.stringify({
+            category: 'bug',
+            message: '전투 결과 화면에서 버튼이 눌리지 않습니다.',
+            replyEmail: 'tester@example.com',
+        }),
+    });
+    assert.equal(submitted.status, 201, serverErrors);
+    const receipt = await submitted.json();
+    assert.match(receipt.inquiryId, /^sup_/);
+    assert.equal(receipt.status, 'open');
+
+    const rateLimited = await fetch(`${baseUrl}/support/inquiries`, {
+        method: 'POST',
+        headers: supportHeaders,
+        body: JSON.stringify({ category: 'other', message: '두 번째 문의입니다.' }),
+    });
+    assert.equal(rateLimited.status, 429);
+
+    const adminAuthorization = `Basic ${Buffer.from('admin:test-password').toString('base64')}`;
+    const listed = await fetch(`${baseUrl}/admin/api/support?channel=dev`, {
+        headers: { authorization: adminAuthorization },
+    });
+    assert.equal(listed.status, 200);
+    const supportSnapshot = await listed.json();
+    assert.equal(supportSnapshot.retentionDays, 180);
+    assert.equal(supportSnapshot.inquiries.length, 1);
+    assert.equal(supportSnapshot.inquiries[0].countryCode, 'KR');
+    assert.equal(supportSnapshot.inquiries[0].replyEmail, 'tester@example.com');
+    assert.equal(supportSnapshot.inquiries[0].playerStats.single.rating, 1016);
+    assert.match(supportSnapshot.inquiries[0].userAgent, /MiniZeus/);
+
+    const updated = await fetch(`${baseUrl}/admin/api/support/${receipt.inquiryId}/status`, {
+        method: 'POST',
+        headers: {
+            authorization: adminAuthorization,
+            'content-type': 'application/json',
+        },
+        body: JSON.stringify({ status: 'review' }),
+    });
+    assert.equal(updated.status, 200);
+    assert.equal((await updated.json()).status, 'review');
+
+    const adminPage = await fetch(`${baseUrl}/admin/support?channel=dev`, {
+        headers: { authorization: adminAuthorization },
+    });
+    assert.equal(adminPage.status, 200);
+    const adminHtml = await adminPage.text();
+    assert.match(adminHtml, /MiniZeus 문의 관리/);
+    assert.match(adminHtml, /전투 결과 화면/);
+    assert.match(adminHtml, /MMR 1016/);
+});

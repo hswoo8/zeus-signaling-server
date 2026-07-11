@@ -50,6 +50,13 @@ const CONFIRMED_MATCH_TTL_MS = Number(process.env.CONFIRMED_MATCH_TTL_MS || 24 *
 const ANALYTICS_RETENTION_DAYS = Number(process.env.ANALYTICS_RETENTION_DAYS || 90);
 const ANALYTICS_INGEST_ENABLED = envBool(['ANALYTICS_INGEST_ENABLED'], true);
 const ANALYTICS_RATE_LIMIT_PER_MINUTE = Number(process.env.ANALYTICS_RATE_LIMIT_PER_MINUTE || 120);
+const SUPPORT_INGEST_ENABLED = envBool(['SUPPORT_INGEST_ENABLED'], true);
+const SUPPORT_RETENTION_DAYS = Math.min(3650, envInt(['SUPPORT_RETENTION_DAYS'], 180));
+const SUPPORT_RATE_LIMIT_PER_HOUR = Math.min(20, envInt(['SUPPORT_RATE_LIMIT_PER_HOUR'], 5));
+const SUPPORT_ADDRESS_RATE_LIMIT_PER_HOUR = Math.min(
+    100,
+    envInt(['SUPPORT_ADDRESS_RATE_LIMIT_PER_HOUR'], Math.max(10, SUPPORT_RATE_LIMIT_PER_HOUR * 2))
+);
 const ADMIN_DASHBOARD_USERNAME = (process.env.ADMIN_DASHBOARD_USERNAME || 'admin').trim();
 const ADMIN_DASHBOARD_PASSWORD = (process.env.ADMIN_DASHBOARD_PASSWORD || '').trim();
 const AUTH_TOKEN_SECRET = String(process.env.AUTH_TOKEN_SECRET || '').trim();
@@ -114,6 +121,9 @@ const statsPlayers = new Map();
 const statsIdempotency = new Map();
 const confirmedPvpMatches = new Map();
 const analyticsRequestBuckets = new Map();
+const supportRequestBuckets = new Map();
+const supportAddressBuckets = new Map();
+const supportInquiries = new Map();
 let serverMatchCounter = 0;
 let backpressureDroppedStatePackets = 0;
 let backpressureClosedConnections = 0;
@@ -273,6 +283,40 @@ async function initializeStatsStorage() {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
+    await statsPool.query(`
+        CREATE TABLE IF NOT EXISTS br_support_inquiries (
+            id BIGSERIAL PRIMARY KEY,
+            public_id TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'open',
+            category TEXT NOT NULL,
+            message TEXT NOT NULL,
+            reply_email TEXT,
+            player_id TEXT NOT NULL,
+            player_id_hash TEXT NOT NULL,
+            app_version_name TEXT NOT NULL,
+            app_version_code INTEGER,
+            build_type TEXT NOT NULL,
+            analytics_channel TEXT NOT NULL,
+            country_code TEXT NOT NULL,
+            user_agent TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            closed_at TIMESTAMPTZ
+        )
+    `);
+    await statsPool.query(`
+        CREATE INDEX IF NOT EXISTS br_support_inquiries_channel_status_time_idx
+            ON br_support_inquiries (analytics_channel, status, created_at DESC)
+    `);
+    await statsPool.query(`
+        CREATE INDEX IF NOT EXISTS br_support_inquiries_player_time_idx
+            ON br_support_inquiries (player_id, created_at DESC)
+    `);
+    await statsPool.query(
+        `DELETE FROM br_support_inquiries
+          WHERE created_at < NOW() - ($1::text || ' days')::interval`,
+        [String(SUPPORT_RETENTION_DAYS)]
+    );
 }
 
 function generateCode() {
@@ -357,6 +401,77 @@ function sendHtml(res, statusCode, body) {
 
 function sendHttpError(res, statusCode, code, message) {
     sendJson(res, statusCode, { error: { code, message } });
+}
+
+function sendRedirect(res, location) {
+    res.writeHead(303, {
+        Location: location,
+        'Cache-Control': 'no-store',
+    });
+    res.end();
+}
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function supportStatsText(stats) {
+    const lines = [];
+    for (const mode of ['single', 'multi']) {
+        const row = stats?.[mode];
+        if (!row) continue;
+        lines.push(`${mode} · MMR ${row.rating} · #${row.rank || '-'} · ${row.wins}W ${row.losses}L ${row.draws}D`);
+    }
+    return lines.join('\n') || '기록 없음';
+}
+
+function renderAdminSupportPage(inquiries, options = {}) {
+    const selectedChannel = options.channel || 'all';
+    const selectedStatus = options.status || 'all';
+    const filters = [
+        ['all', '전체'],
+        ['beta', '베타'],
+        ['production', '운영'],
+        ['dev', '개발'],
+    ].map(([channel, label]) => {
+        const query = new URLSearchParams({ channel, status: selectedStatus }).toString();
+        return `<a href="/admin/support?${query}" class="${channel === selectedChannel ? 'current' : ''}">${label}</a>`;
+    }).join('');
+    const statuses = ['all', 'open', 'review', 'closed'].map((status) => {
+        const label = { all: '전체', open: '접수', review: '검토', closed: '완료' }[status];
+        const query = new URLSearchParams({ channel: selectedChannel, status }).toString();
+        return `<a href="/admin/support?${query}" class="${status === selectedStatus ? 'current' : ''}">${label}</a>`;
+    }).join('');
+    const rows = inquiries.length > 0 ? inquiries.map((inquiry) => {
+        const encodedId = encodeURIComponent(inquiry.id);
+        const statusButtons = ['open', 'review', 'closed'].map((status) => {
+            const label = { open: '접수', review: '검토', closed: '완료' }[status];
+            return `<form method="post" action="/admin/support/${encodedId}/status?status=${status}&channel=${encodeURIComponent(selectedChannel)}&filter=${encodeURIComponent(selectedStatus)}"><button${inquiry.status === status ? ' disabled' : ''}>${label}</button></form>`;
+        }).join('');
+        return `<article class="ticket">
+            <header><strong>${escapeHtml(inquiry.category)}</strong><span class="status ${escapeHtml(inquiry.status)}">${escapeHtml(inquiry.status)}</span><time>${escapeHtml(new Date(inquiry.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' }))}</time></header>
+            <pre class="message">${escapeHtml(inquiry.message)}</pre>
+            <dl>
+                <div><dt>회신 이메일</dt><dd>${escapeHtml(inquiry.replyEmail || '-')}</dd></div>
+                <div><dt>플레이어 ID</dt><dd><code>${escapeHtml(inquiry.playerId)}</code><small>${escapeHtml(inquiry.playerIdHash)}</small></dd></div>
+                <div><dt>앱</dt><dd>${escapeHtml(inquiry.appVersionName)} (${escapeHtml(inquiry.appVersionCode ?? '-')}) · ${escapeHtml(inquiry.buildType)} · ${escapeHtml(inquiry.analyticsChannel)}</dd></div>
+                <div><dt>국가 / User-Agent</dt><dd>${escapeHtml(inquiry.countryCode)} · ${escapeHtml(inquiry.userAgent)}</dd></div>
+                <div><dt>현재 전적</dt><dd><pre>${escapeHtml(supportStatsText(inquiry.playerStats))}</pre></dd></div>
+            </dl>
+            <div class="actions">${statusButtons}</div>
+        </article>`;
+    }).join('') : '<p class="empty">조건에 맞는 문의가 없습니다.</p>';
+    return `<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow,noarchive"><title>MiniZeus Support Admin</title>
+<style>:root{--bg:#f4f5f2;--surface:#fff;--line:#d8ddd5;--text:#20231f;--muted:#697067;--green:#19764c;--orange:#c65d1b;--red:#b83b32;--ink:#38424b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Noto Sans KR",sans-serif}header.page{background:#20231f;color:#fff;padding:18px 24px;border-bottom:4px solid var(--green)}header.page h1{font-size:20px;margin:0 0 4px}header.page p{margin:0;color:#cbd2c8;font-size:12px}main{max-width:1240px;margin:0 auto;padding:20px 24px 48px}.toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}.toolbar a{color:#fff;background:var(--green);padding:8px 12px;border-radius:4px;text-decoration:none;font-weight:700}.filters{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}.filter{display:inline-grid;grid-auto-flow:column;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--surface)}.filter a{padding:8px 12px;color:var(--text);text-decoration:none;font-weight:700;border-right:1px solid var(--line)}.filter a:last-child{border-right:0}.filter a.current{background:var(--ink);color:#fff}.ticket{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:16px;margin:12px 0}.ticket>header{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.ticket time{margin-left:auto;color:var(--muted);font-size:12px}.status{font-size:12px;font-weight:700;padding:2px 7px;border-radius:999px;background:#e9ece7}.status.review{background:#ffe1bb}.status.closed{background:#d8ecdf}.message{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8faf7;border:1px solid #e7eae5;padding:10px;margin:12px 0;font:inherit}dl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:0}dl div{border-top:1px solid #e7eae5;padding-top:8px}dt{font-size:12px;color:var(--muted)}dd{margin:2px 0 0;overflow-wrap:anywhere}dd small{display:block;color:var(--muted)}dd pre{margin:0;white-space:pre-wrap;font:inherit}.actions{display:flex;gap:8px;margin-top:14px}.actions form{margin:0}.actions button{border:1px solid var(--green);background:#fff;color:var(--green);border-radius:4px;padding:6px 10px;font-weight:700;cursor:pointer}.actions button:disabled{opacity:.45;cursor:default}.empty{color:var(--muted);padding:24px;text-align:center;background:var(--surface);border:1px solid var(--line);border-radius:6px}@media(max-width:760px){main{padding:14px}dl{grid-template-columns:1fr}.ticket time{margin-left:0;width:100%}.filter{overflow:auto;max-width:100%}}</style></head>
+<body><header class="page"><h1>MiniZeus 문의 관리</h1><p>관리자 전용 · 문의 본문과 선택 회신 이메일은 지원 처리 목적으로만 보관</p></header><main>
+<div class="toolbar"><span>보관 ${SUPPORT_RETENTION_DAYS}일 · ${escapeHtml(storageMode())}</span><a href="/admin?channel=${encodeURIComponent(selectedChannel)}">운영 통계</a></div>
+<div class="filters"><nav class="filter">${filters}</nav><nav class="filter">${statuses}</nav></div>${rows}</main></body></html>`;
 }
 
 function bearerToken(req) {
@@ -511,6 +626,97 @@ function analyticsRequestAllowed(req) {
         }
     }
     return bucket.count <= ANALYTICS_RATE_LIMIT_PER_MINUTE;
+}
+
+const SUPPORT_CATEGORIES = new Set(['bug', 'account', 'gameplay', 'other']);
+const SUPPORT_STATUSES = new Set(['open', 'review', 'closed']);
+
+function cleanSupportText(value, maxLength, fallback = '') {
+    if (typeof value !== 'string') return fallback;
+    const cleaned = value
+        .replace(/\r\n?/g, '\n')
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
+        .trim();
+    return cleaned ? cleaned.slice(0, maxLength) : fallback;
+}
+
+function normalizeSupportCategory(value) {
+    const category = cleanSupportText(value, 24).toLowerCase();
+    return SUPPORT_CATEGORIES.has(category) ? category : null;
+}
+
+function normalizeSupportStatus(value, fallback = null) {
+    const status = cleanSupportText(value, 24).toLowerCase();
+    return SUPPORT_STATUSES.has(status) ? status : fallback;
+}
+
+function normalizeReplyEmail(value) {
+    const email = cleanSupportText(value, 254);
+    if (!email) return null;
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
+}
+
+function supportHeader(req, name, maxLength, fallback = '') {
+    return cleanSupportText(String(req.headers[name] || ''), maxLength, fallback);
+}
+
+function supportInquiryFromRequest(req, body) {
+    const playerId = normalizePlayerId(req.headers['x-player-id']);
+    const category = normalizeSupportCategory(body?.category);
+    const message = cleanSupportText(body?.message, 2000);
+    const replyEmailRaw = cleanSupportText(body?.replyEmail, 254);
+    const replyEmail = normalizeReplyEmail(replyEmailRaw);
+    if (!playerId || !category || message.length < 4 || (replyEmailRaw && !replyEmail)) return null;
+    const appVersionCode = Number.parseInt(String(req.headers['x-app-version-code'] || ''), 10);
+    return {
+        playerId,
+        playerIdHash: hashIdentifier(playerId) || 'unknown',
+        category,
+        message,
+        replyEmail,
+        appVersionName: supportHeader(req, 'x-app-version-name', 40, 'unknown'),
+        appVersionCode: Number.isFinite(appVersionCode) && appVersionCode >= 0 && appVersionCode <= 1000000000
+            ? appVersionCode
+            : null,
+        buildType: supportHeader(req, 'x-build-type', 24, 'unknown'),
+        analyticsChannel: normalizeAnalyticsChannel(requestAppChannel(req), supportHeader(req, 'x-build-type', 24, 'unknown')),
+        countryCode: requestCountry(req),
+        userAgent: safeUserAgent(req),
+    };
+}
+
+function consumeRateLimit(bucketMap, key, maxRequests) {
+    const now = Date.now();
+    const bucket = bucketMap.get(key) || { windowStart: now, count: 0 };
+    if (now - bucket.windowStart >= 3600000) {
+        bucket.windowStart = now;
+        bucket.count = 0;
+    }
+    bucket.count += 1;
+    bucketMap.set(key, bucket);
+    if (bucketMap.size > 5000) {
+        for (const [entryKey, value] of bucketMap) {
+            if (now - value.windowStart >= 7200000) bucketMap.delete(entryKey);
+        }
+    }
+    return bucket.count <= maxRequests;
+}
+
+function supportRequestAllowed(req, playerId) {
+    const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const addressKey = hashIdentifier(forwarded || req.socket?.remoteAddress || 'unknown') || 'unknown';
+    const playerKey = hashIdentifier(playerId) || 'unknown';
+    const playerAllowed = consumeRateLimit(
+        supportRequestBuckets,
+        playerKey,
+        SUPPORT_RATE_LIMIT_PER_HOUR
+    );
+    const addressAllowed = consumeRateLimit(
+        supportAddressBuckets,
+        addressKey,
+        SUPPORT_ADDRESS_RATE_LIMIT_PER_HOUR
+    );
+    return playerAllowed && addressAllowed;
 }
 
 function openConnectionCount() {
@@ -781,6 +987,8 @@ function readJsonBody(req) {
 async function handleHttpRequest(req, res) {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = url.pathname;
+    const adminSupportStatusMatch = pathname.match(/^\/admin\/support\/([^/]+)\/status$/);
+    const adminSupportApiStatusMatch = pathname.match(/^\/admin\/api\/support\/([^/]+)\/status$/);
 
     if (req.method === 'POST' && pathname === '/auth/guest/register') {
         if (!AUTH_ENABLED) {
@@ -895,6 +1103,92 @@ async function handleHttpRequest(req, res) {
         }
         const result = await analyticsStore.record(event);
         sendJson(res, result.duplicate ? 200 : 202, result);
+        return;
+    }
+
+    if (req.method === 'POST' && pathname === '/support/inquiries') {
+        if (!SUPPORT_INGEST_ENABLED) {
+            sendHttpError(res, 503, 'support_disabled', 'Support inquiries are temporarily unavailable');
+            return;
+        }
+        if (!requireHttpAppChannel(req, res)) return;
+        const body = await readJsonRequest(req, res);
+        if (!body) return;
+        const inquiry = supportInquiryFromRequest(req, body);
+        if (!inquiry) {
+            sendHttpError(res, 400, 'invalid_inquiry', 'Inquiry content or metadata is invalid');
+            return;
+        }
+        if (!supportRequestAllowed(req, inquiry.playerId)) {
+            sendHttpError(res, 429, 'rate_limited', 'Too many support inquiries. Please try again later.');
+            return;
+        }
+        const saved = await createSupportInquiry(inquiry);
+        sendJson(res, 201, {
+            inquiryId: saved.id,
+            status: saved.status,
+            receivedAt: saved.createdAt,
+        });
+        return;
+    }
+
+    if (req.method === 'GET' && (pathname === '/admin/support' || pathname === '/admin/support/')) {
+        if (!requireAdmin(req, res)) return;
+        const channel = url.searchParams.get('channel') || 'all';
+        const status = url.searchParams.get('status') || 'all';
+        const inquiries = await supportInquiryList(channel, status);
+        sendHtml(res, 200, renderAdminSupportPage(inquiries, {
+            channel: normalizeAnalyticsChannel(channel, 'unknown') === 'unknown' && channel !== 'unknown' ? 'all' : channel,
+            status: normalizeSupportStatus(status) || 'all',
+        }));
+        return;
+    }
+
+    if (req.method === 'GET' && pathname === '/admin/api/support') {
+        if (!requireAdmin(req, res)) return;
+        const channel = url.searchParams.get('channel') || 'all';
+        const status = url.searchParams.get('status') || 'all';
+        sendJson(res, 200, {
+            storage: storageMode(),
+            retentionDays: SUPPORT_RETENTION_DAYS,
+            inquiries: await supportInquiryList(channel, status),
+        });
+        return;
+    }
+
+    if (req.method === 'POST' && adminSupportStatusMatch) {
+        if (!requireAdmin(req, res)) return;
+        const status = normalizeSupportStatus(url.searchParams.get('status'));
+        const updated = await updateSupportInquiryStatus(
+            decodeURIComponent(adminSupportStatusMatch[1]),
+            status
+        );
+        if (!updated) {
+            sendHttpError(res, 404, 'inquiry_not_found', 'Support inquiry was not found');
+            return;
+        }
+        const channel = url.searchParams.get('channel') || 'all';
+        const filter = url.searchParams.get('filter') || 'all';
+        sendRedirect(
+            res,
+            `/admin/support?${new URLSearchParams({ channel, status: filter }).toString()}`
+        );
+        return;
+    }
+
+    if (req.method === 'POST' && adminSupportApiStatusMatch) {
+        if (!requireAdmin(req, res)) return;
+        const body = await readJsonRequest(req, res);
+        if (!body) return;
+        const updated = await updateSupportInquiryStatus(
+            decodeURIComponent(adminSupportApiStatusMatch[1]),
+            body.status
+        );
+        if (!updated) {
+            sendHttpError(res, 404, 'inquiry_not_found', 'Support inquiry was not found');
+            return;
+        }
+        sendJson(res, 200, updated);
         return;
     }
 
@@ -1015,7 +1309,7 @@ async function handleHttpRequest(req, res) {
         return;
     }
 
-    if (['/matches/result', '/matches/pvp-result', '/analytics/events'].includes(pathname) ||
+    if (['/matches/result', '/matches/pvp-result', '/analytics/events', '/support/inquiries'].includes(pathname) ||
         pathname === '/health' ||
         pathname === '/capacity' ||
         pathname === '/rankings' ||
@@ -1025,6 +1319,11 @@ async function handleHttpRequest(req, res) {
         pathname === '/admin' ||
         pathname === '/admin/' ||
         pathname === '/admin/api/stats' ||
+        pathname === '/admin/support' ||
+        pathname === '/admin/support/' ||
+        pathname === '/admin/api/support' ||
+        adminSupportStatusMatch ||
+        adminSupportApiStatusMatch ||
         playerStatsMatch) {
         sendHttpError(res, 405, 'method_not_allowed', 'Method not allowed');
         return;
@@ -1399,6 +1698,156 @@ async function postgresRankForPlayer(mode, key) {
     const rows = await postgresPlayersByMode(mode);
     const index = rows.findIndex((player) => player.key === key);
     return index >= 0 ? index + 1 : null;
+}
+
+function supportInquiryId() {
+    return `sup_${crypto.randomBytes(12).toString('base64url')}`;
+}
+
+function supportInquiryFromRow(row) {
+    return {
+        id: row.public_id,
+        status: normalizeSupportStatus(row.status, 'open'),
+        category: row.category,
+        message: row.message,
+        replyEmail: row.reply_email || null,
+        playerId: row.player_id,
+        playerIdHash: row.player_id_hash,
+        appVersionName: row.app_version_name,
+        appVersionCode: row.app_version_code,
+        buildType: row.build_type,
+        analyticsChannel: normalizeAnalyticsChannel(row.analytics_channel, row.build_type),
+        countryCode: row.country_code,
+        userAgent: row.user_agent,
+        createdAt: new Date(row.created_at).toISOString(),
+        updatedAt: new Date(row.updated_at).toISOString(),
+        closedAt: row.closed_at ? new Date(row.closed_at).toISOString() : null,
+    };
+}
+
+async function createSupportInquiry(input) {
+    const publicId = supportInquiryId();
+    if (!statsPool) {
+        const now = new Date().toISOString();
+        const inquiry = {
+            id: publicId,
+            status: 'open',
+            category: input.category,
+            message: input.message,
+            replyEmail: input.replyEmail,
+            playerId: input.playerId,
+            playerIdHash: input.playerIdHash,
+            appVersionName: input.appVersionName,
+            appVersionCode: input.appVersionCode,
+            buildType: input.buildType,
+            analyticsChannel: input.analyticsChannel,
+            countryCode: input.countryCode,
+            userAgent: input.userAgent,
+            createdAt: now,
+            updatedAt: now,
+            closedAt: null,
+        };
+        supportInquiries.set(publicId, inquiry);
+        return inquiry;
+    }
+    const result = await statsPool.query(
+        `INSERT INTO br_support_inquiries (
+            public_id, category, message, reply_email, player_id, player_id_hash,
+            app_version_name, app_version_code, build_type, analytics_channel,
+            country_code, user_agent
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         RETURNING *`,
+        [
+            publicId,
+            input.category,
+            input.message,
+            input.replyEmail,
+            input.playerId,
+            input.playerIdHash,
+            input.appVersionName,
+            input.appVersionCode,
+            input.buildType,
+            input.analyticsChannel,
+            input.countryCode,
+            input.userAgent,
+        ]
+    );
+    return supportInquiryFromRow(result.rows[0]);
+}
+
+async function supportPlayerStats(playerId) {
+    const result = {};
+    for (const mode of ['single', 'multi']) {
+        const player = statsPool
+            ? await postgresFindPlayerByRef(mode, playerId)
+            : findPlayerByRef(mode, playerId);
+        if (!player) continue;
+        const rank = statsPool
+            ? await postgresRankForPlayer(mode, player.key)
+            : rankForPlayer(mode, player.key);
+        result[mode] = playerStatsResponse(player, rank);
+    }
+    return result;
+}
+
+async function supportInquiryList(channel = 'all', status = 'all') {
+    const selectedChannel = normalizeAnalyticsChannel(channel, 'unknown') === 'unknown' && channel !== 'unknown'
+        ? 'all'
+        : channel;
+    const selectedStatus = normalizeSupportStatus(status) || 'all';
+    let inquiries;
+    if (!statsPool) {
+        inquiries = Array.from(supportInquiries.values())
+            .filter((inquiry) => selectedChannel === 'all' || inquiry.analyticsChannel === selectedChannel)
+            .filter((inquiry) => selectedStatus === 'all' || inquiry.status === selectedStatus)
+            .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+            .slice(0, 200);
+    } else {
+        const clauses = [];
+        const params = [];
+        if (selectedChannel !== 'all') {
+            params.push(selectedChannel);
+            clauses.push(`analytics_channel = $${params.length}`);
+        }
+        if (selectedStatus !== 'all') {
+            params.push(selectedStatus);
+            clauses.push(`status = $${params.length}`);
+        }
+        const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+        const rows = await statsPool.query(
+            `SELECT * FROM br_support_inquiries ${where} ORDER BY created_at DESC LIMIT 200`,
+            params
+        );
+        inquiries = rows.rows.map(supportInquiryFromRow);
+    }
+    return Promise.all(inquiries.map(async (inquiry) => ({
+        ...inquiry,
+        playerStats: await supportPlayerStats(inquiry.playerId),
+    })));
+}
+
+async function updateSupportInquiryStatus(publicId, status) {
+    const safeId = cleanSupportText(publicId, 64);
+    const safeStatus = normalizeSupportStatus(status);
+    if (!safeId || !safeStatus) return null;
+    if (!statsPool) {
+        const inquiry = supportInquiries.get(safeId);
+        if (!inquiry) return null;
+        inquiry.status = safeStatus;
+        inquiry.updatedAt = new Date().toISOString();
+        inquiry.closedAt = safeStatus === 'closed' ? inquiry.updatedAt : null;
+        return inquiry;
+    }
+    const result = await statsPool.query(
+        `UPDATE br_support_inquiries
+            SET status = $2,
+                updated_at = NOW(),
+                closed_at = CASE WHEN $2 = 'closed' THEN NOW() ELSE NULL END
+          WHERE public_id = $1
+        RETURNING *`,
+        [safeId, safeStatus]
+    );
+    return result.rows[0] ? supportInquiryFromRow(result.rows[0]) : null;
 }
 
 async function upsertPostgresPlayerResult(client, mode, playerInput, outcome, metadata) {

@@ -607,7 +607,7 @@ function renderAdminPage(snapshot) {
 <body>
 <header><h1>MiniZeus 운영 통계</h1><p>관리자 전용 · 원 IP와 실제 기기 식별자는 저장하지 않음</p></header>
 <main>
-<div class="toolbar"><div>생성 ${escapeHtml(generated)} · 저장소 ${escapeHtml(snapshot.storage)}</div><a href="/admin?channel=${selectedChannel}">새로고침</a></div>
+<div class="toolbar"><div>생성 ${escapeHtml(generated)} · 저장소 ${escapeHtml(snapshot.storage)}</div><div><a href="/admin/support?channel=${selectedChannel}">문의 관리</a> <a href="/admin?channel=${selectedChannel}">새로고침</a></div></div>
 <nav class="channel-filter" aria-label="배포 채널">${channelTabs}</nav>
 <div class="metrics">
 ${metric('오늘 실행', today.launches, `7일 ${days7.launches}`)}
