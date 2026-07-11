@@ -321,11 +321,12 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         hostNickname: hostPlayer.nickname,
         hostPlayerId: hostPlayer.playerId,
         arenaId: 'CLASSIC_OLYMPUS',
-        battleType: 'short',
+        battleType: 'standard',
+        matchMode: 'ranked',
     }));
     const created = await hostInbox.type('room_created');
     guest.send(JSON.stringify({
-        type: 'join_room',
+        type: 'join_ranked_room',
         ...versionFields,
         code: created.code,
         guestCharacterId: guestPlayer.characterId,
