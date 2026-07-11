@@ -20,6 +20,8 @@ const MAX_MSG_BYTES = Number(process.env.MAX_MSG_BYTES || 16 * 1024);
 const HTTP_BODY_LIMIT_BYTES = Number(process.env.HTTP_BODY_LIMIT_BYTES || MAX_MSG_BYTES);
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 15000);
 const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS || 45000);
+const WS_BACKPRESSURE_SOFT_BYTES = Number(process.env.WS_BACKPRESSURE_SOFT_BYTES || 256 * 1024);
+const WS_BACKPRESSURE_HARD_BYTES = Number(process.env.WS_BACKPRESSURE_HARD_BYTES || 1024 * 1024);
 const MAX_CONNECTIONS = envOptionalInt(['MAX_CONNECTIONS', 'MULTIPLAYER_MAX_CONNECTIONS']);
 const MAX_ACTIVE_ROOMS = envOptionalInt(['MAX_ACTIVE_ROOMS', 'MULTIPLAYER_MAX_ACTIVE_ROOMS']);
 const MAX_ACTIVE_MATCHES = envOptionalInt(['MAX_ACTIVE_MATCHES', 'MULTIPLAYER_MAX_ACTIVE_MATCHES']);
@@ -98,6 +100,8 @@ const statsIdempotency = new Map();
 const confirmedPvpMatches = new Map();
 const analyticsRequestBuckets = new Map();
 let serverMatchCounter = 0;
+let backpressureDroppedStatePackets = 0;
+let backpressureClosedConnections = 0;
 
 const LOBBY_TYPES = new Set([
     'create_room', 'join_room', 'leave_room', 'get_room_list', 'ping_check', 'selection_update',
@@ -258,8 +262,22 @@ function battleType(value) {
 }
 
 function send(ws, data) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    const bufferedBytes = Number(ws.bufferedAmount || 0);
+    if (bufferedBytes >= WS_BACKPRESSURE_HARD_BYTES) {
+        backpressureClosedConnections += 1;
+        ws.terminate();
+        return false;
+    }
+    if (data?.type === 'game_state' && bufferedBytes >= WS_BACKPRESSURE_SOFT_BYTES) {
+        backpressureDroppedStatePackets += 1;
+        return false;
+    }
+    try {
         ws.send(JSON.stringify(data));
+        return true;
+    } catch {
+        return false;
     }
 }
 
@@ -362,6 +380,10 @@ function analyticsRuntimeSnapshot() {
             rooms: roomStats.rooms,
             waitingRooms: roomStats.waitingRooms,
             activeMatches: roomStats.activeMatches,
+        },
+        backpressure: {
+            droppedStatePackets: backpressureDroppedStatePackets,
+            closedConnections: backpressureClosedConnections,
         },
     };
 }
@@ -484,6 +506,10 @@ function capacitySnapshot(options = {}) {
         retryAfterSec: status === 'available' ? 0 : CAPACITY_RETRY_AFTER_SEC,
         counts,
         limits,
+        backpressure: {
+            droppedStatePackets: backpressureDroppedStatePackets,
+            closedConnections: backpressureClosedConnections,
+        },
         requiredVersionCode: MIN_CLIENT_VERSION_CODE,
         requiredProtocolVersion: MIN_PROTOCOL_VERSION,
         requiredBalanceVersion: MIN_BALANCE_VERSION,
@@ -595,6 +621,10 @@ async function handleHttpRequest(req, res) {
             storage: storageMode(),
             rooms: Object.keys(rooms).length,
             players,
+            backpressure: {
+                droppedStatePackets: backpressureDroppedStatePackets,
+                closedConnections: backpressureClosedConnections,
+            },
         });
         return;
     }
@@ -1792,6 +1822,48 @@ function roomQuality(hostRttMs, guestRttMs) {
     };
 }
 
+function roomListEntry(code, room, viewer) {
+    if (!room || room.host?.readyState !== WebSocket.OPEN ||
+        (room.guest && room.guest.readyState === WebSocket.OPEN)) {
+        return null;
+    }
+    return {
+        code,
+        ...roomQuality(room.hostRttMs, socketRttMs(viewer)),
+        hostCharacterId: room.hostCharacterId,
+        arenaId: room.arenaId,
+        battleType: room.battleType,
+        networkMode: room.networkMode || 'relay',
+        region: room.hostRegion || null,
+        relayRegion: SERVER_POOL_ID,
+    };
+}
+
+function roomListSnapshot(viewer) {
+    return Object.keys(rooms)
+        .map((code) => roomListEntry(code, rooms[code], viewer))
+        .filter(Boolean);
+}
+
+function broadcastRoomUpsert(code) {
+    const room = rooms[code];
+    wss.clients.forEach((client) => {
+        if (!client.roomListSubscribed || client.readyState !== WebSocket.OPEN) return;
+        const entry = roomListEntry(code, room, client);
+        if (entry) {
+            send(client, { type: 'room_updated', room: entry });
+        } else {
+            send(client, { type: 'room_removed', code });
+        }
+    });
+}
+
+function broadcastRoomRemoved(code) {
+    wss.clients.forEach((client) => {
+        if (client.roomListSubscribed) send(client, { type: 'room_removed', code });
+    });
+}
+
 function smoothedRttMs(previous, sample) {
     if (!Number.isFinite(sample)) return previous;
     if (!Number.isFinite(previous)) return sample;
@@ -1825,6 +1897,7 @@ function leaveWaitingRoom(ws, notifyLeaver = false) {
     if (ws.role === 'guest') {
         send(room.host, { type: 'peer_disconnected' });
         resetGuestSlot(room);
+        broadcastRoomUpsert(code);
         console.log(`[-] Guest left waiting room: ${code}`);
     } else if (ws.role === 'host' && room.guest?.readyState === WebSocket.OPEN) {
         const promotedHost = room.guest;
@@ -1850,9 +1923,11 @@ function leaveWaitingRoom(ws, notifyLeaver = false) {
             networkMode: room.networkMode || 'relay',
             arenaId: room.arenaId,
         });
+        broadcastRoomUpsert(code);
         console.log(`[~] Host migrated after waiting host left: ${code}`);
     } else if (ws.role === 'host') {
         delete rooms[code];
+        broadcastRoomRemoved(code);
         console.log(`[-] Empty waiting room removed: ${code}`);
     } else {
         return false;
@@ -1969,6 +2044,7 @@ function compatibilityError(msg) {
 wss.on('connection', (ws, req) => {
     ws.roomCode = null;
     ws.role = null; // 'host' | 'guest'
+    ws.roomListSubscribed = false;
     ws.analyticsCountryCode = requestCountry(req, null);
     ws.analyticsUserAgent = safeUserAgent(req);
     markSocketAlive(ws);
@@ -2049,6 +2125,7 @@ wss.on('connection', (ws, req) => {
                     guest: null,
                     createdAt: Date.now(),
                     hostRttMs: socketRttMs(ws),
+                    hostRegion: typeof msg.region === 'string' ? msg.region.slice(0, 24) : undefined,
                     hostCharacterId: enumToken(msg.hostCharacterId),
                     hostPassiveId: enumToken(msg.hostPassiveId),
                     arenaId: enumToken(msg.arenaId),
@@ -2088,6 +2165,7 @@ wss.on('connection', (ws, req) => {
                     networkMode: rooms[code].networkMode,
                     battleType: rooms[code].battleType,
                 });
+                broadcastRoomUpsert(code);
                 console.log(`[+] Room created: ${code}`);
                 break;
             }
@@ -2151,6 +2229,7 @@ wss.on('connection', (ws, req) => {
                     guestNickname: room.guestNickname,
                     guestPlayerId: room.guestPlayerId,
                 });
+                broadcastRoomRemoved(code);
                 console.log(`[+] Room joined: ${code}`);
                 break;
             }
@@ -2206,30 +2285,14 @@ wss.on('connection', (ws, req) => {
                 }
                 const peer = ws.role === 'host' ? room.guest : room.host;
                 send(peer, msg);
+                if (ws.role === 'host' && !room.guest) broadcastRoomUpsert(code);
                 break;
             }
 
             // ── 방 목록 조회 ─────────────────────────────────────────────
             case 'get_room_list': {
-                const guestRttMs = socketRttMs(ws);
-                const list = Object.keys(rooms)
-                    .map(code => {
-                        const room = rooms[code];
-                        if (room.host?.readyState !== WebSocket.OPEN ||
-                            (room.guest && room.guest.readyState === WebSocket.OPEN)) {
-                            return null;
-                        }
-                        return {
-                            code,
-                            ...roomQuality(room.hostRttMs, guestRttMs),
-                            hostCharacterId: room.hostCharacterId,
-                            arenaId: room.arenaId,
-                            battleType: room.battleType,
-                            networkMode: room.networkMode || 'relay',
-                        };
-                    })
-                    .filter(Boolean);
-                send(ws, { type: 'room_list', rooms: list });
+                ws.roomListSubscribed = true;
+                send(ws, { type: 'room_list', rooms: roomListSnapshot(ws) });
                 break;
             }
 
@@ -2348,6 +2411,7 @@ wss.on('connection', (ws, req) => {
 
         // 방 삭제
         delete rooms[code];
+        broadcastRoomRemoved(code);
         console.log(`[-] Room removed: ${code}`);
     });
 });

@@ -21,6 +21,8 @@ Set these environment variables in production to block outdated multiplayer clie
 | `MULTIPLAYER_MAX_BALANCE_VERSION` | unset | Optional maximum balance version for this pool |
 | `HEARTBEAT_INTERVAL_MS` | `15000` | Server WebSocket ping interval |
 | `HEARTBEAT_TIMEOUT_MS` | `45000` | Time since last message/pong before a socket is terminated |
+| `WS_BACKPRESSURE_SOFT_BYTES` | `262144` | Drop superseded `game_state` packets above this pending-send buffer |
+| `WS_BACKPRESSURE_HARD_BYTES` | `1048576` | Terminate a slow socket above this pending-send buffer to protect server memory |
 | `MAX_CONNECTIONS` | unset | Optional hard cap for simultaneous WebSocket clients |
 | `MAX_ACTIVE_ROOMS` | unset | Optional cap for total in-memory rooms |
 | `MAX_ACTIVE_MATCHES` | unset | Optional cap for active two-player matches |
@@ -62,6 +64,7 @@ Clients must route before capacity/WebSocket connection. The selected game serve
 | `ping_check_ack` | Server -> Client | `{ clientTime, serverTime }` |
 | `get_room_list` | Client -> Server | Open rooms |
 | `room_list` | Server -> Client | `{ rooms: [{ code, pingMs, quality, hostCharacterId?, arenaId?, battleType, networkMode }] }` |
+| `room_updated` / `room_removed` | Server -> Client | Push room-list deltas after the initial snapshot; clients periodically request a new snapshot for recovery |
 
 `create_room` and `join_room` also enforce the same capacity gates as `/capacity`, so clients cannot bypass overload protection by skipping the HTTP preflight.
 

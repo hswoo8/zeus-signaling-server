@@ -103,6 +103,8 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
             MULTIPLAYER_MAX_APP_VERSION_CODE: '1',
             MULTIPLAYER_MAX_PROTOCOL_VERSION: '1',
             MULTIPLAYER_MAX_BALANCE_VERSION: '1',
+            WS_BACKPRESSURE_SOFT_BYTES: '0',
+            WS_BACKPRESSURE_HARD_BYTES: '1048576',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -200,6 +202,11 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         assert.equal(response.status, 202);
     }
 
+    const roomListObserver = await connect(`ws://127.0.0.1:${port}`);
+    const observerInbox = createInbox(roomListObserver);
+    roomListObserver.send(JSON.stringify({ type: 'get_room_list', ...versionFields }));
+    await observerInbox.type('room_list');
+
     const soloHost = await connect(`ws://127.0.0.1:${port}`);
     const soloInbox = createInbox(soloHost);
     soloHost.send(JSON.stringify({
@@ -210,13 +217,18 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         arenaId: 'CLASSIC_OLYMPUS',
     }));
     const soloCreated = await soloInbox.type('room_created');
+    const roomAdded = await observerInbox.type('room_updated');
+    assert.equal(roomAdded.room.code, soloCreated.code);
     soloHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
     const soloLeft = await soloInbox.type('room_left');
     assert.equal(soloLeft.code, soloCreated.code);
+    const roomRemoved = await observerInbox.type('room_removed');
+    assert.equal(roomRemoved.code, soloCreated.code);
     soloHost.send(JSON.stringify({ type: 'get_room_list', ...versionFields }));
     const soloRooms = await soloInbox.type('room_list');
     assert.equal(soloRooms.rooms.some((room) => room.code === soloCreated.code), false);
     soloHost.close();
+    roomListObserver.close();
 
     const departingHost = await connect(`ws://127.0.0.1:${port}`);
     const promotedGuest = await connect(`ws://127.0.0.1:${port}`);
@@ -323,6 +335,12 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     ]);
     assert.ok(assigned.matchId);
     assert.equal(started.matchId, assigned.matchId);
+
+    host.send(JSON.stringify({ type: 'game_state', x: 10, y: 20 }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const backpressureCapacity = await fetch(`${baseUrl}/capacity`).then((response) => response.json());
+    assert.equal(backpressureCapacity.backpressure.droppedStatePackets, 1);
+    assert.equal(backpressureCapacity.backpressure.closedConnections, 0);
 
     host.send(JSON.stringify({
         type: 'game_over',
