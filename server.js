@@ -422,10 +422,15 @@ function roomCounts() {
         room.guest?.readyState === WebSocket.OPEN &&
         room.matchStarted
     ).length;
+    const matchSlots = roomValues.filter((room) =>
+        room.host?.readyState === WebSocket.OPEN &&
+        room.guest?.readyState === WebSocket.OPEN
+    ).length;
     return {
         rooms: roomValues.length,
         waitingRooms,
         activeMatches,
+        matchSlots,
     };
 }
 
@@ -458,6 +463,7 @@ function capacitySnapshot(options = {}) {
         rooms: roomStats.rooms,
         waitingRooms: roomStats.waitingRooms,
         activeMatches: roomStats.activeMatches,
+        matchSlots: roomStats.matchSlots,
     };
     const limits = {
         connections: limitValue(MAX_CONNECTIONS),
@@ -468,7 +474,7 @@ function capacitySnapshot(options = {}) {
 
     const connectReason = blockedReason(counts.connections, MAX_CONNECTIONS, connectionExtra);
     const createReason = blockedReason(counts.rooms, MAX_ACTIVE_ROOMS, 1);
-    const joinReason = blockedReason(counts.activeMatches, MAX_ACTIVE_MATCHES, 1);
+    const joinReason = blockedReason(counts.matchSlots, MAX_ACTIVE_MATCHES, 1);
     const canConnect = !MAINTENANCE_MODE && !connectReason;
     const canCreateRoom = !MAINTENANCE_MODE && !createReason;
     const canJoinRoom = !MAINTENANCE_MODE && !joinReason;
