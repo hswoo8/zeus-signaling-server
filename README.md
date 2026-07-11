@@ -37,6 +37,11 @@ Set these environment variables in production to block outdated multiplayer clie
 | `ANALYTICS_RATE_LIMIT_PER_MINUTE` | `120` | Per-source in-memory rate limit for analytics ingestion |
 | `ADMIN_DASHBOARD_USERNAME` | `admin` | Basic-auth username for `/admin` |
 | `ADMIN_DASHBOARD_PASSWORD` | unset | Required password; `/admin` stays disabled when unset |
+| `AUTH_TOKEN_SECRET` | unset | At least 32 characters enables guest/access/WebSocket ticket authentication |
+| `AUTH_ACCESS_TTL_SEC` | `3600` | Access-token lifetime used by the shared API auth client |
+| `AUTH_GUEST_TTL_SEC` | `15552000` | Long-lived guest credential lifetime |
+| `AUTH_WS_TICKET_TTL_SEC` | `60` | One-time WebSocket connection ticket lifetime |
+| `AUTH_RATE_LIMIT_PER_MINUTE` | `30` | Per-source authentication endpoint rate limit |
 | `PGSSL` / `PGSSLMODE` | unset | Set `PGSSL=true` or `PGSSLMODE=require` if the Postgres provider requires SSL |
 
 If a client is missing or below the version values, the server returns `{ type: "error", code: "update_required", message }`.
@@ -82,6 +87,9 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 | --- | --- | --- |
 | `GET` | `/health` | Process health, version, channel, pool, ruleset, storage mode, room/player counts |
 | `GET` | `/capacity` | Multiplayer entry status, current counts, optional caps, retry delay, and minimum version requirements |
+| `POST` | `/auth/guest/register` | Issue a long-lived signed guest credential for one player ID |
+| `POST` | `/auth/token` | Exchange a valid guest credential for a short-lived API access token |
+| `POST` | `/auth/ws-ticket` | Issue a one-time WebSocket connection ticket from an access token |
 | `POST` | `/matches/result` | Store a single-player result for one player; requires an allowed `X-App-Channel` |
 | `POST` | `/matches/pvp-result` | Store a server-confirmed PvP result for both players; requires an allowed `X-App-Channel` |
 | `GET` | `/rankings?mode=single|multi` | Return ranking rows from the active stats storage |

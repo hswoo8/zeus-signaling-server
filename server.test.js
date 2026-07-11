@@ -48,11 +48,14 @@ function createInbox(ws) {
     };
 }
 
-function connect(url) {
+function connect(url, options = {}) {
     return new Promise((resolve, reject) => {
-        const ws = new WebSocket(url);
+        const ws = new WebSocket(url, options);
         ws.once('open', () => resolve(ws));
         ws.once('error', reject);
+        ws.once('unexpected-response', (_request, response) => {
+            reject(new Error(`Unexpected WebSocket response: ${response.statusCode}`));
+        });
     });
 }
 
@@ -504,4 +507,70 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.match(adminHtml, /베타/);
     assert.match(adminHtml, /운영/);
     assert.match(adminHtml, /개발/);
+});
+
+test('guest access tokens issue one-time WebSocket tickets', async (t) => {
+    const port = 22000 + Math.floor(Math.random() * 1000);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const child = spawn(process.execPath, ['server.js'], {
+        cwd: __dirname,
+        env: {
+            ...process.env,
+            PORT: String(port),
+            DATABASE_URL: '',
+            SERVER_CHANNEL: 'dev',
+            SERVER_ALLOWED_CHANNELS: 'dev',
+            MULTIPLAYER_RULESET_VERSION: '1',
+            AUTH_TOKEN_SECRET: 'test-secret-that-is-longer-than-thirty-two-characters',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    t.after(() => {
+        if (child.exitCode === null) child.kill('SIGTERM');
+    });
+    await waitForServer(baseUrl, child);
+
+    await assert.rejects(connect(`ws://127.0.0.1:${port}`), /401/);
+
+    const registration = await fetch(`${baseUrl}/auth/guest/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ playerId: 'auth-test-player', analyticsChannel: 'dev' }),
+    });
+    assert.equal(registration.status, 201);
+    const guest = await registration.json();
+    assert.ok(guest.guestToken);
+
+    const tokenResponse = await fetch(`${baseUrl}/auth/token`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ guestToken: guest.guestToken }),
+    });
+    assert.equal(tokenResponse.status, 200);
+    const access = await tokenResponse.json();
+    assert.ok(access.accessToken);
+
+    const ticketResponse = await fetch(`${baseUrl}/auth/ws-ticket`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${access.accessToken}`,
+        },
+        body: '{}',
+    });
+    assert.equal(ticketResponse.status, 201);
+    const ticket = await ticketResponse.json();
+    assert.ok(ticket.ticket);
+
+    const authenticated = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { authorization: `Bearer ${ticket.ticket}` },
+    });
+    const inbox = createInbox(authenticated);
+    authenticated.send(JSON.stringify({ type: 'get_room_list', ...versionFields }));
+    assert.equal((await inbox.type('room_list')).type, 'room_list');
+    authenticated.close();
+
+    await assert.rejects(connect(`ws://127.0.0.1:${port}`, {
+        headers: { authorization: `Bearer ${ticket.ticket}` },
+    }), /401/);
 });

@@ -48,6 +48,12 @@ const ANALYTICS_INGEST_ENABLED = envBool(['ANALYTICS_INGEST_ENABLED'], true);
 const ANALYTICS_RATE_LIMIT_PER_MINUTE = Number(process.env.ANALYTICS_RATE_LIMIT_PER_MINUTE || 120);
 const ADMIN_DASHBOARD_USERNAME = (process.env.ADMIN_DASHBOARD_USERNAME || 'admin').trim();
 const ADMIN_DASHBOARD_PASSWORD = (process.env.ADMIN_DASHBOARD_PASSWORD || '').trim();
+const AUTH_TOKEN_SECRET = String(process.env.AUTH_TOKEN_SECRET || '').trim();
+const AUTH_ACCESS_TTL_SEC = Number(process.env.AUTH_ACCESS_TTL_SEC || 60 * 60);
+const AUTH_GUEST_TTL_SEC = Number(process.env.AUTH_GUEST_TTL_SEC || 180 * 24 * 60 * 60);
+const AUTH_WS_TICKET_TTL_SEC = Number(process.env.AUTH_WS_TICKET_TTL_SEC || 60);
+const AUTH_RATE_LIMIT_PER_MINUTE = Number(process.env.AUTH_RATE_LIMIT_PER_MINUTE || 30);
+const AUTH_ENABLED = AUTH_TOKEN_SECRET.length >= 32;
 const MIN_CLIENT_VERSION_CODE = envInt(
     ['MULTIPLAYER_MIN_APP_VERSION_CODE', 'MIN_CLIENT_VERSION_CODE'],
     1
@@ -91,7 +97,12 @@ const server = http.createServer((req, res) => {
         });
     });
 });
-const wss = new WebSocket.Server({ server });
+const authRequestBuckets = new Map();
+const usedWsTicketIds = new Map();
+const wss = new WebSocket.Server({
+    server,
+    verifyClient: ({ req }) => authenticateWebSocketUpgrade(req),
+});
 
 // rooms[roomCode] = { host, guest, networkMode, hostCharacterId, hostPassiveId, arenaId, matchId, hostNickname, guestNickname }
 const rooms = {};
@@ -327,6 +338,83 @@ function sendHtml(res, statusCode, body) {
 
 function sendHttpError(res, statusCode, code, message) {
     sendJson(res, statusCode, { error: { code, message } });
+}
+
+function bearerToken(req) {
+    const authorization = String(req.headers.authorization || '');
+    return authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+}
+
+function issueSignedToken(type, subject, channel, ttlSec, extra = {}) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const payload = {
+        typ: type,
+        sub: subject,
+        channel,
+        iat: nowSec,
+        exp: nowSec + Math.max(1, ttlSec),
+        jti: crypto.randomBytes(12).toString('base64url'),
+        ...extra,
+    };
+    const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const signature = crypto.createHmac('sha256', AUTH_TOKEN_SECRET).update(encoded).digest('base64url');
+    return { token: `${encoded}.${signature}`, payload };
+}
+
+function verifySignedToken(token, expectedType) {
+    if (!AUTH_ENABLED || typeof token !== 'string') return null;
+    const [encoded, signature, extra] = token.split('.');
+    if (!encoded || !signature || extra) return null;
+    const expected = crypto.createHmac('sha256', AUTH_TOKEN_SECRET).update(encoded).digest('base64url');
+    if (!secureEqual(signature, expected)) return null;
+    let payload;
+    try {
+        payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    } catch {
+        return null;
+    }
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (payload?.typ !== expectedType || !normalizePlayerId(payload.sub) ||
+        !Number.isInteger(payload.exp) || payload.exp <= nowSec || !appChannelAllowed(payload.channel)) {
+        return null;
+    }
+    return payload;
+}
+
+function cleanupUsedWsTickets(nowSec = Math.floor(Date.now() / 1000)) {
+    for (const [ticketId, expiresAtSec] of usedWsTicketIds) {
+        if (expiresAtSec <= nowSec) usedWsTicketIds.delete(ticketId);
+    }
+}
+
+function authenticateWebSocketUpgrade(req) {
+    if (!AUTH_ENABLED) return true;
+    const payload = verifySignedToken(bearerToken(req), 'ws_ticket');
+    if (!payload?.jti) return false;
+    cleanupUsedWsTickets();
+    if (usedWsTicketIds.has(payload.jti)) return false;
+    usedWsTicketIds.set(payload.jti, payload.exp);
+    req.authPrincipal = payload;
+    return true;
+}
+
+function authRequestAllowed(req) {
+    const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const key = hashIdentifier(forwarded || req.socket?.remoteAddress || 'unknown') || 'unknown';
+    const now = Date.now();
+    const bucket = authRequestBuckets.get(key) || { windowStart: now, count: 0 };
+    if (now - bucket.windowStart >= 60000) {
+        bucket.windowStart = now;
+        bucket.count = 0;
+    }
+    bucket.count += 1;
+    authRequestBuckets.set(key, bucket);
+    if (authRequestBuckets.size > 5000) {
+        for (const [entryKey, value] of authRequestBuckets) {
+            if (now - value.windowStart >= 120000) authRequestBuckets.delete(entryKey);
+        }
+    }
+    return bucket.count <= AUTH_RATE_LIMIT_PER_MINUTE;
 }
 
 function secureEqual(left, right) {
@@ -570,6 +658,78 @@ async function handleHttpRequest(req, res) {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = url.pathname;
 
+    if (req.method === 'POST' && pathname === '/auth/guest/register') {
+        if (!AUTH_ENABLED) {
+            sendHttpError(res, 503, 'auth_disabled', 'Guest authentication is not configured');
+            return;
+        }
+        if (!authRequestAllowed(req)) {
+            sendHttpError(res, 429, 'rate_limited', 'Too many authentication requests');
+            return;
+        }
+        const body = await readJsonRequest(req, res);
+        if (!body) return;
+        const playerId = normalizePlayerId(body.playerId);
+        const channel = normalizeAnalyticsChannel(body.analyticsChannel, body.buildType);
+        if (!playerId || !appChannelAllowed(channel)) {
+            sendHttpError(res, 400, 'invalid_guest_registration', 'Player or app channel is invalid');
+            return;
+        }
+        const guest = issueSignedToken('guest', playerId, channel, AUTH_GUEST_TTL_SEC);
+        sendJson(res, 201, {
+            playerId,
+            guestToken: guest.token,
+            expiresAtMs: guest.payload.exp * 1000,
+        });
+        return;
+    }
+
+    if (req.method === 'POST' && pathname === '/auth/token') {
+        if (!AUTH_ENABLED) {
+            sendHttpError(res, 503, 'auth_disabled', 'Guest authentication is not configured');
+            return;
+        }
+        if (!authRequestAllowed(req)) {
+            sendHttpError(res, 429, 'rate_limited', 'Too many authentication requests');
+            return;
+        }
+        const body = await readJsonRequest(req, res);
+        if (!body) return;
+        const guest = verifySignedToken(body.guestToken, 'guest');
+        if (!guest) {
+            sendHttpError(res, 401, 'invalid_guest_token', 'Guest token is invalid or expired');
+            return;
+        }
+        const access = issueSignedToken('access', guest.sub, guest.channel, AUTH_ACCESS_TTL_SEC);
+        sendJson(res, 200, {
+            accessToken: access.token,
+            expiresAtMs: access.payload.exp * 1000,
+        });
+        return;
+    }
+
+    if (req.method === 'POST' && pathname === '/auth/ws-ticket') {
+        if (!AUTH_ENABLED) {
+            sendHttpError(res, 503, 'auth_disabled', 'Guest authentication is not configured');
+            return;
+        }
+        if (!authRequestAllowed(req)) {
+            sendHttpError(res, 429, 'rate_limited', 'Too many authentication requests');
+            return;
+        }
+        const access = verifySignedToken(bearerToken(req), 'access');
+        if (!access) {
+            sendHttpError(res, 401, 'invalid_access_token', 'Access token is invalid or expired');
+            return;
+        }
+        const ticket = issueSignedToken('ws_ticket', access.sub, access.channel, AUTH_WS_TICKET_TTL_SEC);
+        sendJson(res, 201, {
+            ticket: ticket.token,
+            expiresAtMs: ticket.payload.exp * 1000,
+        });
+        return;
+    }
+
     if (req.method === 'GET' && (pathname === '/admin' || pathname === '/admin/')) {
         if (!requireAdmin(req, res)) return;
         const snapshot = await analyticsStore.snapshot(
@@ -625,6 +785,7 @@ async function handleHttpRequest(req, res) {
             rulesetVersion: RULESET_VERSION || null,
             uptimeSec: Math.floor(process.uptime()),
             storage: storageMode(),
+            authEnabled: AUTH_ENABLED,
             rooms: Object.keys(rooms).length,
             players,
             backpressure: {
@@ -733,6 +894,9 @@ async function handleHttpRequest(req, res) {
         pathname === '/health' ||
         pathname === '/capacity' ||
         pathname === '/rankings' ||
+        pathname === '/auth/guest/register' ||
+        pathname === '/auth/token' ||
+        pathname === '/auth/ws-ticket' ||
         pathname === '/admin' ||
         pathname === '/admin/' ||
         pathname === '/admin/api/stats' ||
