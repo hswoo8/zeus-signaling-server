@@ -6,6 +6,7 @@ const clientsRequested = positiveInt(args.clients, 100);
 const durationSec = positiveInt(args.duration, 15);
 const mode = ['lobby', 'matched', 'relay'].includes(args.mode) ? args.mode : 'lobby';
 const allowProduction = args['allow-production'] === true;
+const analyticsChannel = String(args.channel || 'dev').trim().toLowerCase();
 
 if (!allowProduction && /(^|\.)api\.minizeusgame\.com/i.test(new URL(url).hostname)) {
     throw new Error('Production load tests require --allow-production');
@@ -17,7 +18,7 @@ if (mode !== 'lobby' && clientsRequested % 2 !== 0) {
 const versionFields = {
     clientVersionCode: 1,
     clientVersionName: 'load-test',
-    analyticsChannel: 'dev',
+    analyticsChannel,
     protocolVersion: 1,
     rulesetVersion: 1,
     balanceVersion: 1,
@@ -31,16 +32,19 @@ class VirtualClient {
         this.waiters = [];
         this.errors = [];
         this.receivedGameStates = 0;
+        this.relayLatenciesMs = [];
         this.unexpectedClose = false;
     }
 
-    connect() {
+    async connect(accessToken) {
         const startedAt = performance.now();
+        const ticket = accessToken ? await issueWsTicket(accessToken) : null;
         return new Promise((resolve, reject) => {
             const ws = new WebSocket(url, {
                 headers: {
                     'user-agent': `MiniZeusLoadTest/${this.index}`,
                     'x-country-code': 'KR',
+                    ...(ticket ? { authorization: `Bearer ${ticket}` } : {}),
                 },
             });
             this.ws = ws;
@@ -54,7 +58,12 @@ class VirtualClient {
     }
 
     onMessage(message) {
-        if (message.type === 'game_state') this.receivedGameStates += 1;
+        if (message.type === 'game_state') {
+            this.receivedGameStates += 1;
+            if (Number.isFinite(message.sentAtMs)) {
+                this.relayLatenciesMs.push(Math.max(0, Date.now() - message.sentAtMs));
+            }
+        }
         if (message.type === 'error') this.errors.push(message);
         const index = this.waiters.findIndex((waiter) => waiter.type === message.type);
         if (index >= 0) {
@@ -90,11 +99,11 @@ class VirtualClient {
     }
 }
 
-async function connectClients(clients) {
+async function connectClients(clients, accessToken) {
     const latencies = [];
     for (let offset = 0; offset < clients.length; offset += 25) {
         const batch = clients.slice(offset, offset + 25);
-        latencies.push(...await Promise.all(batch.map((client) => client.connect())));
+        latencies.push(...await Promise.all(batch.map((client) => client.connect(accessToken))));
         await sleep(50);
     }
     return latencies;
@@ -155,7 +164,14 @@ async function runTraffic(clients, pairs) {
             });
         } else if (mode === 'relay') {
             clients.forEach((client) => {
-                client.send({ type: 'game_state', seq: tick, x: tick % 100, y: client.index, hp: 100 });
+                client.send({
+                    type: 'game_state',
+                    seq: tick,
+                    sentAtMs: Date.now(),
+                    x: tick % 100,
+                    y: client.index,
+                    hp: 100,
+                });
                 sentPackets += 1;
             });
         }
@@ -180,8 +196,67 @@ async function capacity() {
     const parsed = new URL(url);
     parsed.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:';
     parsed.pathname = '/capacity';
-    parsed.search = 'clientVersionCode=1&channel=dev&protocolVersion=1&rulesetVersion=1&balanceVersion=1';
+    parsed.search = `clientVersionCode=1&channel=${encodeURIComponent(analyticsChannel)}&protocolVersion=1&rulesetVersion=1&balanceVersion=1`;
     return fetch(parsed).then((response) => response.json());
+}
+
+function httpUrl(pathname) {
+    const parsed = new URL(url);
+    parsed.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:';
+    parsed.pathname = pathname;
+    parsed.search = '';
+    return parsed;
+}
+
+async function prepareAuthAccessToken() {
+    const health = await fetch(httpUrl('/health')).then((response) => response.json());
+    if (!health.authEnabled) return null;
+    const registration = await fetch(httpUrl('/auth/guest/register'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+            playerId: `load-test-${Date.now()}`,
+            analyticsChannel,
+        }),
+    });
+    if (!registration.ok) throw new Error(`Guest registration failed: HTTP ${registration.status}`);
+    const guest = await registration.json();
+    const tokenResponse = await fetch(httpUrl('/auth/token'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ guestToken: guest.guestToken }),
+    });
+    if (!tokenResponse.ok) throw new Error(`Access token failed: HTTP ${tokenResponse.status}`);
+    return (await tokenResponse.json()).accessToken;
+}
+
+async function issueWsTicket(accessToken) {
+    const response = await fetch(httpUrl('/auth/ws-ticket'), {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${accessToken}`,
+        },
+        body: '{}',
+    });
+    if (!response.ok) {
+        throw new Error(`WebSocket ticket failed: HTTP ${response.status}. Raise AUTH_RATE_LIMIT_PER_MINUTE for controlled load tests.`);
+    }
+    return (await response.json()).ticket;
+}
+
+function operationDelta(before, after) {
+    const first = before || {};
+    const second = after || {};
+    return {
+        capacityRejections: (second.capacityRejections || 0) - (first.capacityRejections || 0),
+        relayPackets: (second.relay?.packets || 0) - (first.relay?.packets || 0),
+        relayBytes: (second.relay?.bytes || 0) - (first.relay?.bytes || 0),
+        droppedStatePackets: (second.backpressure?.droppedStatePackets || 0) -
+            (first.backpressure?.droppedStatePackets || 0),
+        closedConnections: (second.backpressure?.closedConnections || 0) -
+            (first.backpressure?.closedConnections || 0),
+    };
 }
 
 function percentile(values, fraction) {
@@ -221,11 +296,13 @@ function sleep(ms) {
     const startedAt = performance.now();
     let pairs = [];
     try {
-        const connectionLatencies = await connectClients(clients);
+        const accessToken = await prepareAuthAccessToken();
+        const connectionLatencies = await connectClients(clients, accessToken);
         if (mode !== 'lobby') pairs = await setupMatches(clients);
         const before = await capacity();
         const sentPackets = await runTraffic(clients, pairs);
         const during = await capacity();
+        const relayLatencies = clients.flatMap((client) => client.relayLatenciesMs);
         const summary = {
             target: url,
             mode,
@@ -240,6 +317,11 @@ function sleep(ms) {
             },
             sentPackets,
             receivedGameStates: clients.reduce((sum, client) => sum + client.receivedGameStates, 0),
+            relayLatencyMs: {
+                p50: percentile(relayLatencies, 0.5),
+                p95: percentile(relayLatencies, 0.95),
+                max: percentile(relayLatencies, 1),
+            },
             serverErrors: clients.flatMap((client) => client.errors).reduce((counts, error) => {
                 const code = error.code || 'unknown';
                 counts[code] = (counts[code] || 0) + 1;
@@ -249,6 +331,8 @@ function sleep(ms) {
             capacityBefore: before.counts,
             capacityDuring: during.counts,
             backpressure: during.backpressure,
+            operationDelta: operationDelta(before.operations, during.operations),
+            eventLoopLagMs: during.operations?.eventLoopLagMs || null,
         };
         console.log(JSON.stringify(summary, null, 2));
         if (summary.unexpectedCloses > 0 || Object.keys(summary.serverErrors).length > 0) process.exitCode = 1;

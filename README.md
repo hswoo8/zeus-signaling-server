@@ -98,6 +98,8 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 | `GET` | `/admin` | Basic-auth operations dashboard; disabled until admin password is configured |
 | `GET` | `/admin/api/stats` | Basic-auth JSON snapshot used for operations or future admin tooling |
 
+`/health`, `/capacity`, and the admin snapshot expose process-local operational metrics: active relay/P2P matches, relay packet/byte totals, capacity rejections, WebSocket backpressure drops/closes, and rolling 60-second event-loop lag. These counters reset when the service restarts.
+
 Recommended Railway rollout:
 
 - Hobby: use for development, two-device QA, and small closed tests. Set conservative caps such as `MAX_CONNECTIONS`, `MAX_ACTIVE_ROOMS`, and `MAX_ACTIVE_MATCHES`, then verify the app shows the busy/maintenance popup instead of entering multiplayer.

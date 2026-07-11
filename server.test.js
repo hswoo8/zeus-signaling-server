@@ -122,6 +122,9 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(health.channel, 'dev');
     assert.equal(health.poolId, 'test-pool');
     assert.equal(health.rulesetVersion, 1);
+    assert.equal(health.operations.capacityRejections, 0);
+    assert.equal(health.operations.relay.packets, 0);
+    assert.equal(typeof health.operations.eventLoopLagMs.p95, 'number');
 
     const wrongEnvironmentCapacity = await fetch(
         `${baseUrl}/capacity?clientVersionCode=1&protocolVersion=1&rulesetVersion=1&balanceVersion=1&channel=production`
@@ -344,6 +347,11 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     const backpressureCapacity = await fetch(`${baseUrl}/capacity`).then((response) => response.json());
     assert.equal(backpressureCapacity.backpressure.droppedStatePackets, 1);
     assert.equal(backpressureCapacity.backpressure.closedConnections, 0);
+    assert.equal(backpressureCapacity.counts.activeRelayMatches, 1);
+    assert.equal(backpressureCapacity.counts.activeP2pMatches, 0);
+    assert.equal(backpressureCapacity.operations.relay.packets, 1);
+    assert.ok(backpressureCapacity.operations.relay.bytes > 0);
+    assert.equal(backpressureCapacity.operations.backpressure.droppedStatePackets, 1);
 
     host.send(JSON.stringify({
         type: 'game_over',
@@ -466,6 +474,8 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(snapshot.featureUsage[0].feature, 'single_open');
     assert.equal(snapshot.countries.find((row) => row.country === 'KR').launches, 2);
     assert.equal(snapshot.suspiciousPairs[0].matches, 3);
+    assert.ok(snapshot.operations.relay.packets > 0);
+    assert.equal(typeof snapshot.operations.eventLoopLagMs.p95, 'number');
 
     const betaStats = await fetch(`${baseUrl}/admin/api/stats?channel=beta`, {
         headers: { authorization: adminAuthorization },
@@ -507,6 +517,9 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.match(adminHtml, /베타/);
     assert.match(adminHtml, /운영/);
     assert.match(adminHtml, /개발/);
+    assert.match(adminHtml, /Relay 전송/);
+    assert.match(adminHtml, /이벤트 루프 p95/);
+    assert.match(adminHtml, /송신 지연 보호/);
 });
 
 test('guest access tokens issue one-time WebSocket tickets', async (t) => {

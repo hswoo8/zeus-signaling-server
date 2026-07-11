@@ -458,6 +458,7 @@ function aggregateEvents(events, runtime) {
         storage: runtime.storage || 'memory',
         uptimeSec: runtime.uptimeSec || 0,
         live: runtime.live || {},
+        operations: runtime.operations || {},
         selectedChannel: runtime.selectedChannel || 'all',
         periods,
         kpis,
@@ -573,6 +574,10 @@ function renderAdminPage(snapshot) {
     const today = snapshot.periods.today;
     const days7 = snapshot.periods.days7;
     const live = snapshot.live;
+    const operations = snapshot.operations || {};
+    const relay = operations.relay || {};
+    const backpressure = operations.backpressure || {};
+    const eventLoopLag = operations.eventLoopLagMs || {};
     const kpis = snapshot.kpis;
     const selectedChannel = normalizeAnalyticsFilter(snapshot.selectedChannel);
     const channelTabs = [
@@ -587,6 +592,7 @@ function renderAdminPage(snapshot) {
     const generated = new Date(snapshot.generatedAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
     const metric = (label, value, sub) => `
         <article class="metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(sub)}</small></article>`;
+    const megabytes = (bytes) => `${(Number(bytes || 0) / 1048576).toFixed(1)} MB`;
     return `<!doctype html>
 <html lang="ko">
 <head>
@@ -615,6 +621,11 @@ ${metric('사용자당 매치', kpis.matchesPerMau, '최근 30일')}
 ${metric('멀티 비중', `${kpis.multiSharePercent}%`, '최근 30일 매치')}
 ${metric('현재 연결', live.connections || 0, `전체 채널 · 방 ${live.rooms || 0}`)}
 ${metric('진행 중 대전', live.activeMatches || 0, `전체 채널 · 대기 방 ${live.waitingRooms || 0}`)}
+${metric('Relay / P2P', `${live.activeRelayMatches || 0} / ${live.activeP2pMatches || 0}`, '현재 진행 중 대전')}
+${metric('Relay 전송', relay.packets || 0, `재시작 후 ${megabytes(relay.bytes)}`)}
+${metric('혼잡 거부', operations.capacityRejections || 0, '재시작 후 누적')}
+${metric('이벤트 루프 p95', `${eventLoopLag.p95 || 0} ms`, `최근 60초 · 최대 ${eventLoopLag.max || 0} ms`)}
+${metric('송신 지연 보호', backpressure.droppedStatePackets || 0, `연결 종료 ${backpressure.closedConnections || 0}`)}
 </div>
 <section><h2>최근 30일 활동 추이</h2>${lineChart(snapshot.daily)}</section>
 <div class="grid">

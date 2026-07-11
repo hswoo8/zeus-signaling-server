@@ -113,6 +113,11 @@ const analyticsRequestBuckets = new Map();
 let serverMatchCounter = 0;
 let backpressureDroppedStatePackets = 0;
 let backpressureClosedConnections = 0;
+let capacityRejections = 0;
+let relayedPackets = 0;
+let relayedBytes = 0;
+let eventLoopLagLatestMs = 0;
+const eventLoopLagSamples = [];
 
 const LOBBY_TYPES = new Set([
     'create_room', 'join_room', 'leave_room', 'get_room_list', 'ping_check', 'selection_update',
@@ -272,7 +277,7 @@ function battleType(value) {
     return BATTLE_TYPES.has(normalized) ? normalized : 'short';
 }
 
-function send(ws, data) {
+function send(ws, data, options = {}) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     const bufferedBytes = Number(ws.bufferedAmount || 0);
     if (bufferedBytes >= WS_BACKPRESSURE_HARD_BYTES) {
@@ -285,7 +290,12 @@ function send(ws, data) {
         return false;
     }
     try {
-        ws.send(JSON.stringify(data));
+        const payload = JSON.stringify(data);
+        ws.send(payload);
+        if (options.relay === true) {
+            relayedPackets += 1;
+            relayedBytes += Buffer.byteLength(payload, 'utf8');
+        }
         return true;
     } catch {
         return false;
@@ -468,11 +478,10 @@ function analyticsRuntimeSnapshot() {
             rooms: roomStats.rooms,
             waitingRooms: roomStats.waitingRooms,
             activeMatches: roomStats.activeMatches,
+            activeRelayMatches: roomStats.activeRelayMatches,
+            activeP2pMatches: roomStats.activeP2pMatches,
         },
-        backpressure: {
-            droppedStatePackets: backpressureDroppedStatePackets,
-            closedConnections: backpressureClosedConnections,
-        },
+        operations: operationsSnapshot(),
     };
 }
 
@@ -514,11 +523,54 @@ function roomCounts() {
         room.host?.readyState === WebSocket.OPEN &&
         room.guest?.readyState === WebSocket.OPEN
     ).length;
+    const activeRelayMatches = roomValues.filter((room) =>
+        room.host?.readyState === WebSocket.OPEN &&
+        room.guest?.readyState === WebSocket.OPEN &&
+        room.matchStarted &&
+        room.networkMode !== 'p2p'
+    ).length;
+    const activeP2pMatches = roomValues.filter((room) =>
+        room.host?.readyState === WebSocket.OPEN &&
+        room.guest?.readyState === WebSocket.OPEN &&
+        room.matchStarted &&
+        room.networkMode === 'p2p'
+    ).length;
     return {
         rooms: roomValues.length,
         waitingRooms,
         activeMatches,
         matchSlots,
+        activeRelayMatches,
+        activeP2pMatches,
+    };
+}
+
+function eventLoopLagSnapshot() {
+    if (eventLoopLagSamples.length === 0) {
+        return { latest: 0, p95: 0, max: 0, samples: 0 };
+    }
+    const sorted = [...eventLoopLagSamples].sort((a, b) => a - b);
+    const p95Index = Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1);
+    return {
+        latest: eventLoopLagLatestMs,
+        p95: sorted[p95Index],
+        max: sorted[sorted.length - 1],
+        samples: sorted.length,
+    };
+}
+
+function operationsSnapshot() {
+    return {
+        capacityRejections,
+        relay: {
+            packets: relayedPackets,
+            bytes: relayedBytes,
+        },
+        backpressure: {
+            droppedStatePackets: backpressureDroppedStatePackets,
+            closedConnections: backpressureClosedConnections,
+        },
+        eventLoopLagMs: eventLoopLagSnapshot(),
     };
 }
 
@@ -552,6 +604,8 @@ function capacitySnapshot(options = {}) {
         waitingRooms: roomStats.waitingRooms,
         activeMatches: roomStats.activeMatches,
         matchSlots: roomStats.matchSlots,
+        activeRelayMatches: roomStats.activeRelayMatches,
+        activeP2pMatches: roomStats.activeP2pMatches,
     };
     const limits = {
         connections: limitValue(MAX_CONNECTIONS),
@@ -604,6 +658,7 @@ function capacitySnapshot(options = {}) {
             droppedStatePackets: backpressureDroppedStatePackets,
             closedConnections: backpressureClosedConnections,
         },
+        operations: operationsSnapshot(),
         requiredVersionCode: MIN_CLIENT_VERSION_CODE,
         requiredProtocolVersion: MIN_PROTOCOL_VERSION,
         requiredBalanceVersion: MIN_BALANCE_VERSION,
@@ -617,6 +672,7 @@ function capacitySnapshot(options = {}) {
 }
 
 function sendCapacityWsError(ws, snapshot) {
+    capacityRejections += 1;
     send(ws, {
         type: 'error',
         code: snapshot.code || 'server_busy',
@@ -792,6 +848,7 @@ async function handleHttpRequest(req, res) {
                 droppedStatePackets: backpressureDroppedStatePackets,
                 closedConnections: backpressureClosedConnections,
             },
+            operations: operationsSnapshot(),
         });
         return;
     }
@@ -2473,7 +2530,7 @@ wss.on('connection', (ws, req) => {
                 if (!room) return;
 
                 const peer = ws.role === 'host' ? room.guest : room.host;
-                send(peer, { ...msg, matchId: room.matchId || null });
+                send(peer, { ...msg, matchId: room.matchId || null }, { relay: true });
                 finalizeRoomMatch(room, ws.role, msg);
                 break;
             }
@@ -2519,7 +2576,7 @@ wss.on('connection', (ws, req) => {
                     room.arenaId = enumToken(msg.arenaId) || room.arenaId;
                     const gameStartPacket = { ...msg, matchId: room.matchId };
                     const peer = ws.role === 'host' ? room.guest : room.host;
-                    send(peer, gameStartPacket);
+                    send(peer, gameStartPacket, { relay: true });
                     send(ws, {
                         type: 'match_assigned',
                         matchId: room.matchId,
@@ -2547,7 +2604,7 @@ wss.on('connection', (ws, req) => {
                     );
                 }
                 const peer = ws.role === 'host' ? room.guest : room.host;
-                send(peer, msg);
+                send(peer, msg, { relay: true });
                 if (msg.type === 'game_ready') {
                     sendCountdownSync(room);
                 }
@@ -2604,8 +2661,18 @@ const heartbeatInterval = setInterval(() => {
     });
 }, HEARTBEAT_INTERVAL_MS);
 
+let eventLoopExpectedAt = Date.now() + 1000;
+const eventLoopLagInterval = setInterval(() => {
+    const now = Date.now();
+    eventLoopLagLatestMs = Math.max(0, now - eventLoopExpectedAt);
+    eventLoopLagSamples.push(eventLoopLagLatestMs);
+    if (eventLoopLagSamples.length > 60) eventLoopLagSamples.shift();
+    eventLoopExpectedAt = now + 1000;
+}, 1000);
+
 wss.on('close', () => {
     clearInterval(heartbeatInterval);
+    clearInterval(eventLoopLagInterval);
 });
 
 initializeStatsStorage()
