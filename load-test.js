@@ -61,8 +61,9 @@ class VirtualClient {
         if (message.type === 'game_state') {
             this.receivedGameStates += 1;
             if (Number.isFinite(message.sentAtMs)) {
-                this.relayLatenciesMs.push(Math.max(0, Date.now() - message.sentAtMs));
+                this.recordRelayLatency(Math.max(0, Date.now() - message.sentAtMs));
             }
+            return;
         }
         if (message.type === 'error') this.errors.push(message);
         const index = this.waiters.findIndex((waiter) => waiter.type === message.type);
@@ -73,6 +74,16 @@ class VirtualClient {
         } else {
             this.messages.push(message);
         }
+    }
+
+    recordRelayLatency(value) {
+        const sampleLimit = 1000;
+        if (this.relayLatenciesMs.length < sampleLimit) {
+            this.relayLatenciesMs.push(value);
+            return;
+        }
+        const replacement = Math.floor(Math.random() * this.receivedGameStates);
+        if (replacement < sampleLimit) this.relayLatenciesMs[replacement] = value;
     }
 
     send(message) {
