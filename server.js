@@ -57,6 +57,9 @@ const SUPPORT_ADDRESS_RATE_LIMIT_PER_HOUR = Math.min(
     100,
     envInt(['SUPPORT_ADDRESS_RATE_LIMIT_PER_HOUR'], Math.max(10, SUPPORT_RATE_LIMIT_PER_HOUR * 2))
 );
+const ANNOUNCEMENT_CATEGORIES = new Set(['update', 'maintenance', 'privacy', 'balance']);
+const ANNOUNCEMENT_STATUSES = new Set(['draft', 'published', 'archived']);
+const ANNOUNCEMENT_CHANNELS = new Set(['all', 'dev', 'beta', 'production']);
 const ADMIN_DASHBOARD_USERNAME = (process.env.ADMIN_DASHBOARD_USERNAME || 'admin').trim();
 const ADMIN_DASHBOARD_PASSWORD = (process.env.ADMIN_DASHBOARD_PASSWORD || '').trim();
 const AUTH_TOKEN_SECRET = String(process.env.AUTH_TOKEN_SECRET || '').trim();
@@ -124,6 +127,7 @@ const analyticsRequestBuckets = new Map();
 const supportRequestBuckets = new Map();
 const supportAddressBuckets = new Map();
 const supportInquiries = new Map();
+const announcements = new Map();
 let serverMatchCounter = 0;
 let backpressureDroppedStatePackets = 0;
 let backpressureClosedConnections = 0;
@@ -317,6 +321,25 @@ async function initializeStatsStorage() {
           WHERE created_at < NOW() - ($1::text || ' days')::interval`,
         [String(SUPPORT_RETENTION_DAYS)]
     );
+    await statsPool.query(`
+        CREATE TABLE IF NOT EXISTS br_announcements (
+            id BIGSERIAL PRIMARY KEY,
+            public_id TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            category TEXT NOT NULL,
+            analytics_channel TEXT NOT NULL DEFAULT 'all',
+            status TEXT NOT NULL DEFAULT 'draft',
+            effective_at TIMESTAMPTZ NOT NULL,
+            published_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+    await statsPool.query(`
+        CREATE INDEX IF NOT EXISTS br_announcements_public_idx
+            ON br_announcements (analytics_channel, status, effective_at DESC, published_at DESC)
+    `);
 }
 
 function generateCode() {
@@ -470,8 +493,221 @@ function renderAdminSupportPage(inquiries, options = {}) {
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow,noarchive"><title>MiniZeus Support Admin</title>
 <style>:root{--bg:#f4f5f2;--surface:#fff;--line:#d8ddd5;--text:#20231f;--muted:#697067;--green:#19764c;--orange:#c65d1b;--red:#b83b32;--ink:#38424b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Noto Sans KR",sans-serif}header.page{background:#20231f;color:#fff;padding:18px 24px;border-bottom:4px solid var(--green)}header.page h1{font-size:20px;margin:0 0 4px}header.page p{margin:0;color:#cbd2c8;font-size:12px}main{max-width:1240px;margin:0 auto;padding:20px 24px 48px}.toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}.toolbar a{color:#fff;background:var(--green);padding:8px 12px;border-radius:4px;text-decoration:none;font-weight:700}.filters{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}.filter{display:inline-grid;grid-auto-flow:column;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--surface)}.filter a{padding:8px 12px;color:var(--text);text-decoration:none;font-weight:700;border-right:1px solid var(--line)}.filter a:last-child{border-right:0}.filter a.current{background:var(--ink);color:#fff}.ticket{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:16px;margin:12px 0}.ticket>header{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.ticket time{margin-left:auto;color:var(--muted);font-size:12px}.status{font-size:12px;font-weight:700;padding:2px 7px;border-radius:999px;background:#e9ece7}.status.review{background:#ffe1bb}.status.closed{background:#d8ecdf}.message{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8faf7;border:1px solid #e7eae5;padding:10px;margin:12px 0;font:inherit}dl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:0}dl div{border-top:1px solid #e7eae5;padding-top:8px}dt{font-size:12px;color:var(--muted)}dd{margin:2px 0 0;overflow-wrap:anywhere}dd small{display:block;color:var(--muted)}dd pre{margin:0;white-space:pre-wrap;font:inherit}.actions{display:flex;gap:8px;margin-top:14px}.actions form{margin:0}.actions button{border:1px solid var(--green);background:#fff;color:var(--green);border-radius:4px;padding:6px 10px;font-weight:700;cursor:pointer}.actions button:disabled{opacity:.45;cursor:default}.empty{color:var(--muted);padding:24px;text-align:center;background:var(--surface);border:1px solid var(--line);border-radius:6px}@media(max-width:760px){main{padding:14px}dl{grid-template-columns:1fr}.ticket time{margin-left:0;width:100%}.filter{overflow:auto;max-width:100%}}</style></head>
 <body><header class="page"><h1>MiniZeus 문의 관리</h1><p>관리자 전용 · 문의 본문과 선택 회신 이메일은 지원 처리 목적으로만 보관</p></header><main>
-<div class="toolbar"><span>보관 ${SUPPORT_RETENTION_DAYS}일 · ${escapeHtml(storageMode())}</span><a href="/admin?channel=${encodeURIComponent(selectedChannel)}">운영 통계</a></div>
+<div class="toolbar"><span>보관 ${SUPPORT_RETENTION_DAYS}일 · ${escapeHtml(storageMode())}</span><span><a href="/admin/announcements?channel=${encodeURIComponent(selectedChannel)}">공지 관리</a> <a href="/admin?channel=${encodeURIComponent(selectedChannel)}">운영 통계</a></span></div>
 <div class="filters"><nav class="filter">${filters}</nav><nav class="filter">${statuses}</nav></div>${rows}</main></body></html>`;
+}
+
+function announcementCategory(value, fallback = null) {
+    const category = cleanSupportText(value, 24).toLowerCase();
+    return ANNOUNCEMENT_CATEGORIES.has(category) ? category : fallback;
+}
+
+function announcementStatus(value, fallback = null) {
+    const status = cleanSupportText(value, 24).toLowerCase();
+    return ANNOUNCEMENT_STATUSES.has(status) ? status : fallback;
+}
+
+function announcementChannel(value, fallback = null) {
+    const channel = cleanSupportText(value, 24).toLowerCase();
+    return ANNOUNCEMENT_CHANNELS.has(channel) ? channel : fallback;
+}
+
+function announcementId() {
+    return `ann_${crypto.randomBytes(12).toString('base64url')}`;
+}
+
+function announcementFromInput(body) {
+    const title = cleanSupportText(body?.title, 120);
+    const message = cleanSupportText(body?.body, 5000);
+    const category = announcementCategory(body?.category);
+    const analyticsChannel = announcementChannel(body?.channel, 'all');
+    const status = announcementStatus(body?.status, 'draft');
+    const requestedEffectiveAt = cleanSupportText(body?.effectiveAt, 64);
+    const effectiveAt = requestedEffectiveAt ? new Date(requestedEffectiveAt) : new Date();
+    if (title.length < 2 || message.length < 4 || !category || Number.isNaN(effectiveAt.getTime())) {
+        return null;
+    }
+    return {
+        title,
+        body: message,
+        category,
+        analyticsChannel,
+        status,
+        effectiveAt: effectiveAt.toISOString(),
+    };
+}
+
+function announcementFromRow(row) {
+    return {
+        id: row.public_id,
+        title: row.title,
+        body: row.body,
+        category: announcementCategory(row.category, 'update'),
+        channel: announcementChannel(row.analytics_channel, 'all'),
+        status: announcementStatus(row.status, 'draft'),
+        effectiveAt: new Date(row.effective_at).toISOString(),
+        publishedAt: row.published_at ? new Date(row.published_at).toISOString() : null,
+        createdAt: new Date(row.created_at).toISOString(),
+        updatedAt: new Date(row.updated_at).toISOString(),
+    };
+}
+
+function announcementVisibleToChannel(announcement, channel) {
+    return announcement.status === 'published' &&
+        (announcement.channel === 'all' || announcement.channel === channel);
+}
+
+async function createAnnouncement(input) {
+    const id = announcementId();
+    const now = new Date().toISOString();
+    const publishedAt = input.status === 'published' ? now : null;
+    if (!statsPool) {
+        const announcement = {
+            id,
+            ...input,
+            publishedAt,
+            createdAt: now,
+            updatedAt: now,
+        };
+        announcements.set(id, announcement);
+        return announcement;
+    }
+    const result = await statsPool.query(
+        `INSERT INTO br_announcements (
+            public_id, title, body, category, analytics_channel, status, effective_at, published_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING *`,
+        [
+            id,
+            input.title,
+            input.body,
+            input.category,
+            input.analyticsChannel,
+            input.status,
+            input.effectiveAt,
+            publishedAt,
+        ]
+    );
+    return announcementFromRow(result.rows[0]);
+}
+
+async function listAnnouncements(channel = 'all', status = 'all', limit = 100) {
+    const selectedChannel = announcementChannel(channel, 'all');
+    const selectedStatus = status === 'all' ? 'all' : announcementStatus(status, 'all');
+    const safeLimit = Math.min(200, Math.max(1, Number(limit) || 100));
+    if (!statsPool) {
+        return Array.from(announcements.values())
+            .filter((announcement) => selectedChannel === 'all' || announcement.channel === selectedChannel)
+            .filter((announcement) => selectedStatus === 'all' || announcement.status === selectedStatus)
+            .sort((left, right) => right.effectiveAt.localeCompare(left.effectiveAt))
+            .slice(0, safeLimit);
+    }
+    const clauses = [];
+    const params = [];
+    if (selectedChannel !== 'all') {
+        params.push(selectedChannel);
+        clauses.push(`analytics_channel = $${params.length}`);
+    }
+    if (selectedStatus !== 'all') {
+        params.push(selectedStatus);
+        clauses.push(`status = $${params.length}`);
+    }
+    params.push(safeLimit);
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = await statsPool.query(
+        `SELECT * FROM br_announcements ${where}
+          ORDER BY effective_at DESC, published_at DESC NULLS LAST, created_at DESC
+          LIMIT $${params.length}`,
+        params
+    );
+    return rows.rows.map(announcementFromRow);
+}
+
+async function publicAnnouncements(channel, limit = 30) {
+    const safeChannel = announcementChannel(channel, 'all');
+    if (!statsPool) {
+        return Array.from(announcements.values())
+            .filter((announcement) => announcementVisibleToChannel(announcement, safeChannel))
+            .sort((left, right) => right.effectiveAt.localeCompare(left.effectiveAt))
+            .slice(0, Math.min(100, Math.max(1, Number(limit) || 30)));
+    }
+    const rows = await statsPool.query(
+        `SELECT * FROM br_announcements
+          WHERE status = 'published' AND (analytics_channel = 'all' OR analytics_channel = $1)
+          ORDER BY effective_at DESC, published_at DESC NULLS LAST, created_at DESC
+          LIMIT $2`,
+        [safeChannel, Math.min(100, Math.max(1, Number(limit) || 30))]
+    );
+    return rows.rows.map(announcementFromRow);
+}
+
+async function findPublicAnnouncement(id, channel) {
+    const safeId = cleanSupportText(id, 64);
+    const safeChannel = announcementChannel(channel, 'all');
+    if (!safeId) return null;
+    if (!statsPool) {
+        const announcement = announcements.get(safeId);
+        return announcement && announcementVisibleToChannel(announcement, safeChannel) ? announcement : null;
+    }
+    const result = await statsPool.query(
+        `SELECT * FROM br_announcements
+          WHERE public_id = $1 AND status = 'published'
+            AND (analytics_channel = 'all' OR analytics_channel = $2)`,
+        [safeId, safeChannel]
+    );
+    return result.rows[0] ? announcementFromRow(result.rows[0]) : null;
+}
+
+async function updateAnnouncementStatus(id, status) {
+    const safeId = cleanSupportText(id, 64);
+    const safeStatus = announcementStatus(status);
+    if (!safeId || !safeStatus) return null;
+    if (!statsPool) {
+        const announcement = announcements.get(safeId);
+        if (!announcement) return null;
+        announcement.status = safeStatus;
+        announcement.publishedAt = safeStatus === 'published' ? announcement.publishedAt || new Date().toISOString() : null;
+        announcement.updatedAt = new Date().toISOString();
+        return announcement;
+    }
+    const result = await statsPool.query(
+        `UPDATE br_announcements
+            SET status = $2,
+                published_at = CASE
+                    WHEN $2 = 'published' THEN COALESCE(published_at, NOW())
+                    ELSE NULL
+                END,
+                updated_at = NOW()
+          WHERE public_id = $1
+          RETURNING *`,
+        [safeId, safeStatus]
+    );
+    return result.rows[0] ? announcementFromRow(result.rows[0]) : null;
+}
+
+function renderAdminAnnouncementsPage(items, options = {}) {
+    const selectedChannel = announcementChannel(options.channel, 'all');
+    const selectedStatus = options.status === 'all' ? 'all' : announcementStatus(options.status, 'all');
+    const channelFilters = [['all', '전체'], ['production', '운영'], ['beta', '베타'], ['dev', '개발']]
+        .map(([channel, label]) => `<a href="/admin/announcements?${new URLSearchParams({ channel, status: selectedStatus })}" class="${channel === selectedChannel ? 'current' : ''}">${label}</a>`)
+        .join('');
+    const statusFilters = [['all', '전체'], ['draft', '초안'], ['published', '공개'], ['archived', '보관']]
+        .map(([status, label]) => `<a href="/admin/announcements?${new URLSearchParams({ channel: selectedChannel, status })}" class="${status === selectedStatus ? 'current' : ''}">${label}</a>`)
+        .join('');
+    const categoryLabels = { update: '업데이트', maintenance: '점검', privacy: '개인정보', balance: '밸런스' };
+    const rows = items.length > 0 ? items.map((item) => `<article class="notice">
+        <header><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(categoryLabels[item.category] || item.category)}</span><span>${escapeHtml(item.channel)}</span><span class="status ${escapeHtml(item.status)}">${escapeHtml(item.status)}</span></header>
+        <time>시행 ${escapeHtml(new Date(item.effectiveAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' }))}</time>
+        <pre>${escapeHtml(item.body)}</pre>
+        <div class="actions">${['draft', 'published', 'archived'].map((status) => `<button type="button" onclick='setStatus(${JSON.stringify(item.id)}, ${JSON.stringify(status)})'${item.status === status ? ' disabled' : ''}>${escapeHtml({ draft: '초안', published: '공개', archived: '보관' }[status])}</button>`).join('')}</div>
+    </article>`).join('') : '<p class="empty">등록된 공지가 없습니다.</p>';
+    return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow,noarchive"><title>MiniZeus 공지 관리</title>
+<style>:root{--bg:#f4f5f2;--surface:#fff;--line:#d8ddd5;--text:#20231f;--muted:#697067;--green:#19764c;--ink:#38424b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Noto Sans KR",sans-serif}header.page{background:#20231f;color:#fff;padding:18px 24px;border-bottom:4px solid var(--green)}header.page h1{font-size:20px;margin:0 0 4px}header.page p{margin:0;color:#cbd2c8;font-size:12px}main{max-width:1000px;margin:0 auto;padding:20px 24px 48px}.toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}.toolbar a{color:#fff;background:var(--green);padding:8px 12px;border-radius:4px;text-decoration:none;font-weight:700}.filters{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}.filter{display:inline-grid;grid-auto-flow:column;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--surface)}.filter a{padding:8px 12px;color:var(--text);text-decoration:none;font-weight:700;border-right:1px solid var(--line)}.filter a:last-child{border-right:0}.filter a.current{background:var(--ink);color:#fff}.composer,.notice{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:16px;margin:12px 0}.composer h2{font-size:16px;margin:0 0 12px}.composer label{display:block;font-weight:700;margin:9px 0 4px}.composer input,.composer textarea,.composer select{width:100%;font:inherit;padding:8px;border:1px solid var(--line);border-radius:4px}.composer textarea{min-height:150px;resize:vertical}.fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.composer button,.actions button{border:1px solid var(--green);background:#fff;color:var(--green);border-radius:4px;padding:7px 11px;font-weight:700;cursor:pointer}.composer button{background:var(--green);color:#fff;margin-top:14px}.notice header{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.notice header strong{font-size:16px}.notice header span{font-size:12px;border-radius:999px;background:#e9ece7;padding:2px 7px}.notice header .published{background:#d8ecdf}.notice header .archived{background:#eee}.notice time{display:block;color:var(--muted);font-size:12px;margin-top:7px}.notice pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8faf7;border:1px solid #e7eae5;padding:10px;margin:12px 0;font:inherit}.actions{display:flex;gap:8px}.actions button:disabled{opacity:.45;cursor:default}.empty{color:var(--muted);padding:24px;text-align:center;background:var(--surface);border:1px solid var(--line);border-radius:6px}@media(max-width:700px){main{padding:14px}.fields{grid-template-columns:1fr}}</style></head>
+<body><header class="page"><h1>MiniZeus 공지 관리</h1><p>관리자 전용 · 공개 공지는 앱의 배포 채널에 맞춰 표시됩니다.</p></header><main>
+<div class="toolbar"><a href="/admin?channel=${encodeURIComponent(selectedChannel === 'all' ? 'all' : selectedChannel)}">운영 통계</a><a href="/admin/support?channel=${encodeURIComponent(selectedChannel === 'all' ? 'all' : selectedChannel)}">문의 관리</a></div>
+<section class="composer"><h2>공지 등록</h2><form id="announcement-form"><label>제목<input name="title" maxlength="120" required></label><label>본문<textarea name="body" maxlength="5000" required></textarea></label><div class="fields"><label>유형<select name="category"><option value="update">업데이트</option><option value="maintenance">점검</option><option value="privacy">개인정보</option><option value="balance">밸런스</option></select></label><label>배포 채널<select name="channel"><option value="all">전체</option><option value="production">운영</option><option value="beta">베타</option><option value="dev">개발</option></select></label><label>공개 상태<select name="status"><option value="draft">초안</option><option value="published">공개</option></select></label></div><label>시행일<input name="effectiveAt" type="datetime-local"></label><button type="submit">공지 저장</button></form></section>
+<div class="filters"><nav class="filter">${channelFilters}</nav><nav class="filter">${statusFilters}</nav></div>${rows}</main>
+<script>const api='/admin/api/announcements';document.getElementById('announcement-form').addEventListener('submit',async event=>{event.preventDefault();const form=new FormData(event.currentTarget);const effective=form.get('effectiveAt');const payload=Object.fromEntries(form.entries());if(effective)payload.effectiveAt=new Date(effective).toISOString();const response=await fetch(api,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!response.ok){alert('공지 저장에 실패했습니다.');return}location.reload()});async function setStatus(id,status){const response=await fetch(api+'/'+encodeURIComponent(id)+'/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})});if(!response.ok){alert('상태 변경에 실패했습니다.');return}location.reload()}</script></body></html>`;
 }
 
 function bearerToken(req) {
@@ -989,6 +1225,8 @@ async function handleHttpRequest(req, res) {
     const pathname = url.pathname;
     const adminSupportStatusMatch = pathname.match(/^\/admin\/support\/([^/]+)\/status$/);
     const adminSupportApiStatusMatch = pathname.match(/^\/admin\/api\/support\/([^/]+)\/status$/);
+    const announcementMatch = pathname.match(/^\/announcements\/([^/]+)$/);
+    const adminAnnouncementStatusMatch = pathname.match(/^\/admin\/api\/announcements\/([^/]+)\/status$/);
 
     if (req.method === 'POST' && pathname === '/auth/guest/register') {
         if (!AUTH_ENABLED) {
@@ -1192,6 +1430,89 @@ async function handleHttpRequest(req, res) {
         return;
     }
 
+    if (req.method === 'GET' && (pathname === '/admin/announcements' || pathname === '/admin/announcements/')) {
+        if (!requireAdmin(req, res)) return;
+        const channel = url.searchParams.get('channel') || 'all';
+        const status = url.searchParams.get('status') || 'all';
+        const validChannel = channel === 'all' || ANNOUNCEMENT_CHANNELS.has(channel);
+        const validStatus = status === 'all' || ANNOUNCEMENT_STATUSES.has(status);
+        const announcements = await listAnnouncements(
+            validChannel ? channel : 'all',
+            validStatus ? status : 'all'
+        );
+        sendHtml(res, 200, renderAdminAnnouncementsPage(announcements, {
+            channel: validChannel ? channel : 'all',
+            status: validStatus ? status : 'all',
+        }));
+        return;
+    }
+
+    if (req.method === 'GET' && pathname === '/admin/api/announcements') {
+        if (!requireAdmin(req, res)) return;
+        const channel = url.searchParams.get('channel') || 'all';
+        const status = url.searchParams.get('status') || 'all';
+        sendJson(res, 200, {
+            storage: storageMode(),
+            announcements: await listAnnouncements(
+                channel === 'all' || ANNOUNCEMENT_CHANNELS.has(channel) ? channel : 'all',
+                status === 'all' || ANNOUNCEMENT_STATUSES.has(status) ? status : 'all'
+            ),
+        });
+        return;
+    }
+
+    if (req.method === 'POST' && pathname === '/admin/api/announcements') {
+        if (!requireAdmin(req, res)) return;
+        const body = await readJsonRequest(req, res);
+        if (!body) return;
+        const announcement = announcementFromInput(body);
+        if (!announcement) {
+            sendHttpError(res, 400, 'invalid_announcement', 'Announcement title or body is invalid');
+            return;
+        }
+        sendJson(res, 201, await createAnnouncement(announcement));
+        return;
+    }
+
+    if (req.method === 'POST' && adminAnnouncementStatusMatch) {
+        if (!requireAdmin(req, res)) return;
+        const body = await readJsonRequest(req, res);
+        if (!body) return;
+        const updated = await updateAnnouncementStatus(
+            decodeURIComponent(adminAnnouncementStatusMatch[1]),
+            body.status
+        );
+        if (!updated) {
+            sendHttpError(res, 404, 'announcement_not_found', 'Announcement was not found');
+            return;
+        }
+        sendJson(res, 200, updated);
+        return;
+    }
+
+    if (req.method === 'GET' && pathname === '/announcements') {
+        if (!requireHttpAppChannel(req, res)) return;
+        const limit = parseBoundedInt(url.searchParams.get('limit'), 30, 1, 100);
+        sendJson(res, 200, {
+            announcements: await publicAnnouncements(requestAppChannel(req), limit),
+        });
+        return;
+    }
+
+    if (req.method === 'GET' && announcementMatch) {
+        if (!requireHttpAppChannel(req, res)) return;
+        const announcement = await findPublicAnnouncement(
+            decodeURIComponent(announcementMatch[1]),
+            requestAppChannel(req)
+        );
+        if (!announcement) {
+            sendHttpError(res, 404, 'announcement_not_found', 'Announcement was not found');
+            return;
+        }
+        sendJson(res, 200, announcement);
+        return;
+    }
+
     if (req.method === 'GET' && pathname === '/health') {
         const players = statsPool ? await postgresPlayerCount() : statsPlayers.size;
         sendJson(res, 200, {
@@ -1309,7 +1630,7 @@ async function handleHttpRequest(req, res) {
         return;
     }
 
-    if (['/matches/result', '/matches/pvp-result', '/analytics/events', '/support/inquiries'].includes(pathname) ||
+    if (['/matches/result', '/matches/pvp-result', '/analytics/events', '/support/inquiries', '/announcements'].includes(pathname) ||
         pathname === '/health' ||
         pathname === '/capacity' ||
         pathname === '/rankings' ||
@@ -1322,8 +1643,13 @@ async function handleHttpRequest(req, res) {
         pathname === '/admin/support' ||
         pathname === '/admin/support/' ||
         pathname === '/admin/api/support' ||
+        pathname === '/admin/announcements' ||
+        pathname === '/admin/announcements/' ||
+        pathname === '/admin/api/announcements' ||
         adminSupportStatusMatch ||
         adminSupportApiStatusMatch ||
+        adminAnnouncementStatusMatch ||
+        announcementMatch ||
         playerStatsMatch) {
         sendHttpError(res, 405, 'method_not_allowed', 'Method not allowed');
         return;
