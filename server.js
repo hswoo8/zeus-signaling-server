@@ -136,6 +136,10 @@ let websocketAbnormalDisconnects = 0;
 let websocketHeartbeatTimeouts = 0;
 let websocketPingFailures = 0;
 const websocketDisconnectSources = new Map();
+let integrityAuditsReceived = 0;
+let integrityAuditsInvalid = 0;
+let integrityAuditMismatches = 0;
+let integrityMatchesFlagged = 0;
 let capacityRejections = 0;
 let relayedPackets = 0;
 let relayedBytes = 0;
@@ -157,7 +161,7 @@ const GAME_TYPES = new Set([
     'game_start', 'game_ready', 'game_state', 'game_skill', 'game_damage',
     'game_state_hp', 'game_emote', 'game_over', 'game_start_failed', 'rematch_accept', 'rematch_decline',
     'rematch_request', 'rematch_cancel', 'rematch_reselect', 'rematch_ready',
-    'game_pause', 'game_resume', 'game_countdown_sync',
+    'game_pause', 'game_resume', 'game_countdown_sync', 'game_audit',
 ]);
 
 const ALL_TYPES = new Set([...LOBBY_TYPES, ...GAME_TYPES]);
@@ -1110,6 +1114,12 @@ function operationsSnapshot() {
             heartbeatTimeouts: websocketHeartbeatTimeouts,
             pingFailures: websocketPingFailures,
             sources: Object.fromEntries(websocketDisconnectSources),
+        },
+        integrityAudits: {
+            received: integrityAuditsReceived,
+            invalid: integrityAuditsInvalid,
+            hpMismatches: integrityAuditMismatches,
+            flaggedMatches: integrityMatchesFlagged,
         },
         eventLoopLagMs: eventLoopLagSnapshot(),
     };
@@ -2710,6 +2720,7 @@ function confirmationRecord(room, result) {
         matchMode: room.matchMode || 'friendly',
         rulesetVersion: room.rulesetVersion || null,
         durationSec: result.durationSec,
+        integrity: roomIntegritySummary(room),
         completedAt: result.completedAt,
         expiresAt: new Date(result.expiresAt).toISOString(),
     };
@@ -2769,6 +2780,7 @@ function recordMultiMatchAnalytics(room, result) {
             battleType: room.battleType || 'short',
             arenaId: room.arenaId || null,
             rulesetVersion: room.rulesetVersion || null,
+            integrity: roomIntegritySummary(room),
         },
     }).catch((err) => {
         console.error('[analytics] failed to record multi match:', err?.message || err);
@@ -2782,6 +2794,102 @@ function roomAnalyticsChannel(room) {
     if (hostChannel === 'unknown') return guestChannel;
     if (guestChannel === 'unknown') return hostChannel;
     return 'mixed';
+}
+
+function roomIntegritySummary(room) {
+    const state = room?.integrityState;
+    return {
+        audits: state?.audits || 0,
+        invalid: state?.invalid || 0,
+        hpMismatches: state?.hpMismatches || 0,
+        flagged: state?.flagged === true,
+    };
+}
+
+function resetRoomIntegrity(room) {
+    room.integrityReports = {};
+    room.integrityState = {
+        audits: 0,
+        invalid: 0,
+        hpMismatches: 0,
+        consecutiveHpMismatches: 0,
+        flagged: false,
+        comparedHostAuditSeq: 0,
+        comparedGuestAuditSeq: 0,
+    };
+}
+
+function finitePacketNumber(msg, field) {
+    const value = msg[field];
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function flagRoomIntegrity(room, reason) {
+    if (room.integrityState.flagged) return;
+    room.integrityState.flagged = true;
+    integrityMatchesFlagged += 1;
+    console.warn(`[integrity] observe-only flag match=${room.matchId || '-'} reason=${reason}`);
+}
+
+function recordGameAudit(room, ws, msg) {
+    integrityAuditsReceived += 1;
+    if (!room?.matchStarted || room.matchMode !== 'ranked' || !['host', 'guest'].includes(ws.role)) return;
+    if (!room.integrityState) resetRoomIntegrity(room);
+    const state = room.integrityState;
+    state.audits += 1;
+
+    const matchId = typeof msg.matchId === 'string' ? msg.matchId : '';
+    const auditSeq = packetInt(msg, 'auditSeq');
+    const stateSeq = packetInt(msg, 'stateSeq');
+    const elapsedSec = packetInt(msg, 'elapsedSec');
+    const localHp = packetInt(msg, 'localHp');
+    const remoteHp = packetInt(msg, 'remoteHp');
+    const x = finitePacketNumber(msg, 'x');
+    const y = finitePacketNumber(msg, 'y');
+    const previous = room.integrityReports[ws.role];
+    const invalid = matchId !== room.matchId ||
+        !Number.isInteger(auditSeq) || auditSeq <= 0 ||
+        !Number.isInteger(stateSeq) || stateSeq < 0 ||
+        !Number.isInteger(elapsedSec) || elapsedSec < 0 || elapsedSec > 900 ||
+        !Number.isInteger(localHp) || localHp < 0 || localHp > 1000000 ||
+        !Number.isInteger(remoteHp) || remoteHp < 0 || remoteHp > 1000000 ||
+        x === null || x < -64 || x > 1344 ||
+        y === null || y < -64 || y > 784 ||
+        (previous && auditSeq <= previous.auditSeq) ||
+        (previous && stateSeq < previous.stateSeq);
+    if (invalid) {
+        integrityAuditsInvalid += 1;
+        state.invalid += 1;
+        if (state.invalid >= 3) flagRoomIntegrity(room, 'repeated_invalid_audit');
+        return;
+    }
+
+    room.integrityReports[ws.role] = {
+        auditSeq,
+        stateSeq,
+        elapsedSec,
+        localHp,
+        remoteHp,
+        receivedAtMs: Date.now(),
+    };
+    const host = room.integrityReports.host;
+    const guest = room.integrityReports.guest;
+    if (!host || !guest ||
+        host.auditSeq === state.comparedHostAuditSeq ||
+        guest.auditSeq === state.comparedGuestAuditSeq) return;
+    state.comparedHostAuditSeq = host.auditSeq;
+    state.comparedGuestAuditSeq = guest.auditSeq;
+    if (Math.abs(host.receivedAtMs - guest.receivedAtMs) > 5000) return;
+
+    const hpMismatch = host.localHp !== guest.remoteHp || guest.localHp !== host.remoteHp;
+    if (hpMismatch) {
+        integrityAuditMismatches += 1;
+        state.hpMismatches += 1;
+        state.consecutiveHpMismatches += 1;
+        if (state.consecutiveHpMismatches >= 3) flagRoomIntegrity(room, 'repeated_hp_mismatch');
+    } else {
+        state.consecutiveHpMismatches = 0;
+    }
 }
 
 function finalizeRoomMatch(room, reporterRole, msg) {
@@ -3551,7 +3659,8 @@ wss.on('connection', (ws, req) => {
             case 'game_state_hp':
             case 'game_emote':
             case 'game_pause':
-            case 'game_resume': {
+            case 'game_resume':
+            case 'game_audit': {
                 const code = ws.roomCode;
                 const room = rooms[code];
                 if (!room) return;
@@ -3576,6 +3685,7 @@ wss.on('connection', (ws, req) => {
                         room.finalResult = null;
                         room.battleStartAtMs = null;
                         room.matchStartedAtMs = Date.now();
+                        resetRoomIntegrity(room);
                     }
                     room.hostCharacterId = enumToken(msg.hostCharacterId) || room.hostCharacterId;
                     room.hostPassiveId = enumToken(msg.hostPassiveId) || room.hostPassiveId;
@@ -3615,6 +3725,10 @@ wss.on('connection', (ws, req) => {
                     room.guestVersionCode = packetInt(msg, 'clientVersionCode') || room.guestVersionCode;
                     room.guestVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : room.guestVersionName;
                     room.guestAnalyticsChannel = normalizeAnalyticsChannel(msg.analyticsChannel || room.guestAnalyticsChannel);
+                }
+                if (msg.type === 'game_audit') {
+                    recordGameAudit(room, ws, msg);
+                    break;
                 }
                 if (msg.type === 'rematch_ready') {
                     const prefix = ws.role === 'host' ? 'host' : 'guest';

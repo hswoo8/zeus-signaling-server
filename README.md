@@ -112,7 +112,9 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 | `GET` | `/admin/api/support` | Basic-auth JSON support inbox; filter with `channel` and `status` |
 | `POST` | `/admin/api/support/:inquiryId/status` | Basic-auth support status update: `open`, `review`, or `closed` |
 
-`/health`, `/capacity`, and the admin snapshot expose process-local operational metrics: active Relay/P2P matches, Relay packet/byte totals, rolling 60-minute Relay bytes, Relay/capacity rejections, WebSocket backpressure drops/closes, and rolling 60-second event-loop lag. Counters reset when the service restarts. The rolling egress value measures WebSocket payload bytes and is an application-level estimate; Railway Network Egress remains the billing source of truth.
+`/health`, `/capacity`, and the admin snapshot expose process-local operational metrics: active Relay/P2P matches, Relay packet/byte totals, rolling 60-minute Relay bytes, Relay/capacity rejections, WebSocket backpressure drops/closes, disconnect sources, ranked integrity-audit counts, and rolling 60-second event-loop lag. Counters reset when the service restarts. The rolling egress value measures WebSocket payload bytes and is an application-level estimate; Railway Network Egress remains the billing source of truth.
+
+Ranked P2P clients send a compact `game_audit` directly over the signaling WebSocket every two seconds. The server compares each side's local/remote HP view and basic sequence/position bounds. Three repeated mismatches or invalid reports mark the in-memory match observation and the existing confirmed-match analytics record. This is observe-only: it does not reject a result or alter MMR until real beta data establishes safe thresholds.
 
 Recommended Railway rollout:
 

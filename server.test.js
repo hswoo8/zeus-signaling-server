@@ -130,6 +130,8 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(health.operations.websocketDisconnects.total, 0);
     assert.equal(health.operations.websocketDisconnects.abnormal, 0);
     assert.equal(health.operations.websocketDisconnects.heartbeatTimeouts, 0);
+    assert.equal(health.operations.integrityAudits.received, 0);
+    assert.equal(health.operations.integrityAudits.flaggedMatches, 0);
 
     const wrongEnvironmentCapacity = await fetch(
         `${baseUrl}/capacity?clientVersionCode=1&protocolVersion=1&rulesetVersion=1&balanceVersion=1&channel=production`
@@ -376,6 +378,67 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     ]);
     assert.ok(assigned.matchId);
     assert.equal(started.matchId, assigned.matchId);
+
+    host.send(JSON.stringify({
+        type: 'game_audit',
+        matchId: assigned.matchId,
+        roundId: 1,
+        auditSeq: 1,
+        stateSeq: 20,
+        elapsedSec: 2,
+        localHp: 125,
+        remoteHp: 100,
+        x: 320,
+        y: 360,
+    }));
+    guest.send(JSON.stringify({
+        type: 'game_audit',
+        matchId: assigned.matchId,
+        roundId: 1,
+        auditSeq: 1,
+        stateSeq: 20,
+        elapsedSec: 2,
+        localHp: 100,
+        remoteHp: 125,
+        x: 960,
+        y: 360,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const integrityHealth = await fetch(`${baseUrl}/health`).then((response) => response.json());
+    assert.equal(integrityHealth.operations.integrityAudits.received, 2);
+    assert.equal(integrityHealth.operations.integrityAudits.invalid, 0);
+    assert.equal(integrityHealth.operations.integrityAudits.hpMismatches, 0);
+
+    for (let auditSeq = 2; auditSeq <= 4; auditSeq += 1) {
+        host.send(JSON.stringify({
+            type: 'game_audit',
+            matchId: assigned.matchId,
+            roundId: 1,
+            auditSeq,
+            stateSeq: auditSeq * 20,
+            elapsedSec: auditSeq * 2,
+            localHp: 125,
+            remoteHp: 90,
+            x: 320,
+            y: 360,
+        }));
+        guest.send(JSON.stringify({
+            type: 'game_audit',
+            matchId: assigned.matchId,
+            roundId: 1,
+            auditSeq,
+            stateSeq: auditSeq * 20,
+            elapsedSec: auditSeq * 2,
+            localHp: 100,
+            remoteHp: 120,
+            x: 960,
+            y: 360,
+        }));
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const flaggedIntegrityHealth = await fetch(`${baseUrl}/health`).then((response) => response.json());
+    assert.equal(flaggedIntegrityHealth.operations.integrityAudits.hpMismatches, 3);
+    assert.equal(flaggedIntegrityHealth.operations.integrityAudits.flaggedMatches, 1);
 
     host.send(JSON.stringify({ type: 'game_state', x: 10, y: 20 }));
     await new Promise((resolve) => setTimeout(resolve, 25));
