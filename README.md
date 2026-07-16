@@ -36,7 +36,7 @@ Set these environment variables in production to block outdated multiplayer clie
 | `MAINTENANCE_MESSAGE` | Korean default | Message shown to clients during maintenance |
 | `DATABASE_URL` | unset | PostgreSQL connection string. When set, match results/rankings use Postgres instead of memory |
 | `CONFIRMED_MATCH_TTL_MS` | `86400000` | Time a server-confirmed PvP result remains eligible for stats submission |
-| `ANALYTICS_INGEST_ENABLED` | `true` | Accept debug/beta analytics events at `/analytics/events` |
+| `ANALYTICS_INGEST_ENABLED` | `true` | Accept legacy-client analytics events at `/analytics/events`; current Android builds use Firebase Analytics |
 | `ANALYTICS_RETENTION_DAYS` | `90` | Analytics event retention and dashboard aggregation window |
 | `ANALYTICS_RATE_LIMIT_PER_MINUTE` | `120` | Per-source in-memory rate limit for analytics ingestion |
 | `SUPPORT_INGEST_ENABLED` | `true` | Accept in-app support inquiries at `/support/inquiries` |
@@ -104,7 +104,7 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 | `POST` | `/matches/pvp-result` | Store a server-confirmed PvP result for both players; requires an allowed `X-App-Channel` |
 | `GET` | `/rankings?mode=single|multi` | Return ranking rows from the active stats storage |
 | `GET` | `/players/:playerIdOrNickname/stats?mode=single|multi` | Return one player's aggregate stats |
-| `POST` | `/analytics/events` | Accept allowlisted launch, screen, feature, and single-match analytics events |
+| `POST` | `/analytics/events` | Legacy compatibility for older Android launch, screen, feature, and single-match analytics events |
 | `POST` | `/support/inquiries` | Store one in-app support inquiry; requires `X-Player-Id`, allowed `X-App-Channel`, app metadata headers, category, message, and optional reply email |
 | `GET` | `/admin` | Basic-auth operations dashboard; disabled until admin password is configured |
 | `GET` | `/admin/api/stats` | Basic-auth JSON snapshot used for operations or future admin tooling |
@@ -137,4 +137,4 @@ Set `ADMIN_DASHBOARD_PASSWORD` in Railway, optionally change `ADMIN_DASHBOARD_US
 
 The same administrator credentials protect `/admin/support`. Each inquiry links the submitted anonymous `playerId` to the current `br_player_stats` single/multi MMR and record snapshot for support handling. Support messages and optional reply emails are not analytics events. They are retained for `SUPPORT_RETENTION_DAYS` and should only be accessed for support operations.
 
-Analytics stores a one-way short hash of the anonymous player ID. It does not persist raw IP addresses. Country prefers a trusted proxy country header and falls back to the Android locale country code, so it is operational grouping rather than precise location. Persistent history requires `DATABASE_URL`; memory mode resets dashboard history whenever the server restarts.
+Current Android builds send app-usage analytics to Firebase Analytics and do not call `/analytics/events`. The legacy endpoint stores a one-way short hash of the anonymous player ID and does not persist raw IP addresses. Country prefers a trusted proxy country header and falls back to the Android locale country code, so it is operational grouping rather than precise location. Persistent legacy history requires `DATABASE_URL`; memory mode resets dashboard history whenever the server restarts. Set `ANALYTICS_INGEST_ENABLED=false` after versions that still use the endpoint are no longer supported.

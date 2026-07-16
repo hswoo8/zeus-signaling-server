@@ -127,6 +127,9 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(health.operations.relay.canStartNewMatch, true);
     assert.equal(health.operations.relay.maxActiveMatches, null);
     assert.equal(typeof health.operations.eventLoopLagMs.p95, 'number');
+    assert.equal(health.operations.websocketDisconnects.total, 0);
+    assert.equal(health.operations.websocketDisconnects.abnormal, 0);
+    assert.equal(health.operations.websocketDisconnects.heartbeatTimeouts, 0);
 
     const wrongEnvironmentCapacity = await fetch(
         `${baseUrl}/capacity?clientVersionCode=1&protocolVersion=1&rulesetVersion=1&balanceVersion=1&channel=production`
@@ -237,6 +240,35 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(soloRooms.rooms.some((room) => room.code === soloCreated.code), false);
     soloHost.close();
     roomListObserver.close();
+
+    const rankedObserver = await connect(`ws://127.0.0.1:${port}`);
+    const rankedObserverInbox = createInbox(rankedObserver);
+    rankedObserver.send(JSON.stringify({
+        type: 'get_room_list',
+        ...versionFields,
+        matchMode: 'ranked',
+        playerId: 'ranked-observer',
+    }));
+    await rankedObserverInbox.type('room_list');
+    const rankedHost = await connect(`ws://127.0.0.1:${port}`);
+    const rankedHostInbox = createInbox(rankedHost);
+    rankedHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'ranked',
+        hostPlayerId: 'ranked-host',
+        hostCharacterId: 'ZEUS',
+        hostPassiveId: 'IRON_WILL',
+        arenaId: 'CLASSIC_OLYMPUS',
+    }));
+    const rankedCreated = await rankedHostInbox.type('room_created');
+    const rankedAdded = await rankedObserverInbox.type('room_updated');
+    assert.equal(rankedAdded.room.code, rankedCreated.code);
+    assert.equal(rankedAdded.room.ratingDifference, 0);
+    assert.equal(typeof rankedAdded.room.waitingMs, 'number');
+    rankedHost.close();
+    await rankedObserverInbox.type('room_removed');
+    rankedObserver.close();
 
     const departingHost = await connect(`ws://127.0.0.1:${port}`);
     const promotedGuest = await connect(`ws://127.0.0.1:${port}`);

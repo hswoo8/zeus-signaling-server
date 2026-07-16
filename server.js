@@ -131,6 +131,11 @@ const announcements = new Map();
 let serverMatchCounter = 0;
 let backpressureDroppedStatePackets = 0;
 let backpressureClosedConnections = 0;
+let websocketDisconnects = 0;
+let websocketAbnormalDisconnects = 0;
+let websocketHeartbeatTimeouts = 0;
+let websocketPingFailures = 0;
+const websocketDisconnectSources = new Map();
 let capacityRejections = 0;
 let relayedPackets = 0;
 let relayedBytes = 0;
@@ -364,6 +369,7 @@ function send(ws, data, options = {}) {
     const bufferedBytes = Number(ws.bufferedAmount || 0);
     if (bufferedBytes >= WS_BACKPRESSURE_HARD_BYTES) {
         backpressureClosedConnections += 1;
+        ws.serverTerminationSource = 'backpressure';
         ws.terminate();
         return false;
     }
@@ -406,6 +412,17 @@ function sendCountdownSync(room) {
 function markSocketAlive(ws) {
     ws.isAlive = true;
     ws.lastSeenAt = Date.now();
+}
+
+function recordWebSocketDisconnect(ws, code, reason) {
+    websocketDisconnects += 1;
+    if (code !== 1000) websocketAbnormalDisconnects += 1;
+    const source = ws.serverTerminationSource || (code === 1000 ? 'normal' : 'transport');
+    websocketDisconnectSources.set(source, (websocketDisconnectSources.get(source) || 0) + 1);
+    const reasonText = Buffer.isBuffer(reason) ? reason.toString('utf8') : String(reason || '');
+    console.log(
+        `[ws] closed code=${code} source=${source} room=${ws.roomCode || '-'} reason=${reasonText || '-'}`
+    );
 }
 
 function sendJson(res, statusCode, data) {
@@ -1086,6 +1103,13 @@ function operationsSnapshot() {
         backpressure: {
             droppedStatePackets: backpressureDroppedStatePackets,
             closedConnections: backpressureClosedConnections,
+        },
+        websocketDisconnects: {
+            total: websocketDisconnects,
+            abnormal: websocketAbnormalDisconnects,
+            heartbeatTimeouts: websocketHeartbeatTimeouts,
+            pingFailures: websocketPingFailures,
+            sources: Object.fromEntries(websocketDisconnectSources),
         },
         eventLoopLagMs: eventLoopLagSnapshot(),
     };
@@ -2910,7 +2934,27 @@ function roomQuality(hostRttMs, guestRttMs) {
     };
 }
 
-function roomListEntry(code, room, viewer) {
+async function matchmakingRatingForSocket(ws, claimedPlayerId, refresh = false) {
+    const now = Date.now();
+    if (!refresh && Number.isFinite(ws.matchmakingRating) &&
+        now - (ws.matchmakingRatingLoadedAt || 0) < 30000) {
+        return ws.matchmakingRating;
+    }
+    const playerId = normalizePlayerId(ws.authPlayerId) || normalizePlayerId(claimedPlayerId);
+    let player = null;
+    try {
+        player = statsPool
+            ? await postgresFindPlayerByRef('multi', playerId)
+            : findPlayerByRef('multi', playerId);
+    } catch (error) {
+        console.warn(`[matchmaking] MMR lookup failed: ${error?.message || 'unknown error'}`);
+    }
+    ws.matchmakingRating = Number.isFinite(player?.rating) ? player.rating : 1000;
+    ws.matchmakingRatingLoadedAt = now;
+    return ws.matchmakingRating;
+}
+
+function roomListEntry(code, room, viewer, viewerRating = 1000) {
     if (!room || room.host?.readyState !== WebSocket.OPEN ||
         (room.guest && room.guest.readyState === WebSocket.OPEN)) {
         return null;
@@ -2918,6 +2962,7 @@ function roomListEntry(code, room, viewer) {
     if (room.networkMode === 'relay' && !relayAvailabilitySnapshot().canStartNewMatch) {
         return null;
     }
+    const ranked = room.matchMode === 'ranked';
     return {
         code,
         ...roomQuality(room.hostRttMs, socketRttMs(viewer)),
@@ -2928,12 +2973,16 @@ function roomListEntry(code, room, viewer) {
         networkMode: room.networkMode || 'relay',
         region: room.hostRegion || null,
         relayRegion: SERVER_POOL_ID,
+        ...(ranked ? {
+            ratingDifference: Math.abs((Number(room.hostRating) || 1000) - viewerRating),
+            waitingMs: Math.max(0, Date.now() - room.createdAt),
+        } : {}),
     };
 }
 
-function roomListSnapshot(viewer, requestedMatchMode = 'friendly') {
+function roomListSnapshot(viewer, requestedMatchMode = 'friendly', viewerRating = 1000) {
     return Object.keys(rooms)
-        .map((code) => roomListEntry(code, rooms[code], viewer))
+        .map((code) => roomListEntry(code, rooms[code], viewer, viewerRating))
         .filter((entry) => entry && entry.matchMode === requestedMatchMode);
 }
 
@@ -2942,7 +2991,7 @@ function broadcastRoomUpsert(code) {
     wss.clients.forEach((client) => {
         if (!client.roomListSubscribed || client.readyState !== WebSocket.OPEN) return;
         if ((client.roomListMatchMode || 'friendly') !== (room.matchMode || 'friendly')) return;
-        const entry = roomListEntry(code, room, client);
+        const entry = roomListEntry(code, room, client, client.matchmakingRating || 1000);
         if (entry) {
             send(client, { type: 'room_updated', room: entry });
         } else {
@@ -3173,6 +3222,7 @@ wss.on('connection', (ws, req) => {
     ws.roomListSubscribed = false;
     ws.analyticsCountryCode = requestCountry(req, null);
     ws.analyticsUserAgent = safeUserAgent(req);
+    ws.authPlayerId = normalizePlayerId(req.authPrincipal?.sub);
     markSocketAlive(ws);
 
     const connectionCapacity = capacitySnapshot({ connectionExtra: 0 });
@@ -3186,7 +3236,7 @@ wss.on('connection', (ws, req) => {
         markSocketAlive(ws);
     });
 
-    ws.on('message', (raw) => {
+    ws.on('message', async (raw) => {
         markSocketAlive(ws);
         if (typeof raw !== 'string' && !Buffer.isBuffer(raw)) return;
         const text = raw.toString();
@@ -3273,6 +3323,9 @@ wss.on('connection', (ws, req) => {
                     rulesetVersion: packetInt(msg, 'rulesetVersion'),
                     hostNickname: typeof msg.hostNickname === 'string' ? msg.hostNickname : undefined,
                     hostPlayerId: typeof msg.hostPlayerId === 'string' ? msg.hostPlayerId : undefined,
+                    hostRating: requestedMatchMode === 'ranked'
+                        ? await matchmakingRatingForSocket(ws, msg.hostPlayerId)
+                        : null,
                     hostVersionCode: packetInt(msg, 'clientVersionCode'),
                     hostVersionName: typeof msg.clientVersionName === 'string' ? msg.clientVersionName : undefined,
                     hostAnalyticsChannel: normalizeAnalyticsChannel(msg.analyticsChannel),
@@ -3459,10 +3512,13 @@ wss.on('connection', (ws, req) => {
             case 'get_room_list': {
                 ws.roomListSubscribed = true;
                 ws.roomListMatchMode = matchMode(msg.matchMode);
+                const viewerRating = ws.roomListMatchMode === 'ranked'
+                    ? await matchmakingRatingForSocket(ws, msg.playerId, true)
+                    : 1000;
                 send(ws, {
                     type: 'room_list',
                     matchMode: ws.roomListMatchMode,
-                    rooms: roomListSnapshot(ws, ws.roomListMatchMode),
+                    rooms: roomListSnapshot(ws, ws.roomListMatchMode, viewerRating),
                 });
                 break;
             }
@@ -3587,7 +3643,8 @@ wss.on('connection', (ws, req) => {
         }
     });
 
-    ws.on('close', () => {
+    ws.on('close', (closeCode, closeReason) => {
+        recordWebSocketDisconnect(ws, closeCode, closeReason);
         const code = ws.roomCode;
         if (!code || !rooms[code]) return;
 
@@ -3620,6 +3677,8 @@ const heartbeatInterval = setInterval(() => {
         if (ws.readyState !== WebSocket.OPEN) return;
         const lastSeenAt = Number.isFinite(ws.lastSeenAt) ? ws.lastSeenAt : now;
         if (now - lastSeenAt > HEARTBEAT_TIMEOUT_MS) {
+            websocketHeartbeatTimeouts += 1;
+            ws.serverTerminationSource = 'heartbeat_timeout';
             ws.terminate();
             return;
         }
@@ -3627,6 +3686,8 @@ const heartbeatInterval = setInterval(() => {
         try {
             ws.ping();
         } catch {
+            websocketPingFailures += 1;
+            ws.serverTerminationSource = 'ping_failure';
             ws.terminate();
         }
     });
