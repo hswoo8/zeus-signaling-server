@@ -128,6 +128,24 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(health.operations.capacityRejections, 0);
     assert.equal(health.operations.relay.packets, 0);
     assert.equal(health.operations.relay.canStartNewMatch, true);
+
+    const invalidRoomClient = await connect(`ws://127.0.0.1:${port}`);
+    const invalidRoomInbox = createInbox(invalidRoomClient);
+    invalidRoomClient.send(JSON.stringify({
+        type: 'join_room',
+        ...versionFields,
+        code: 'bad',
+    }));
+    const invalidRoom = await invalidRoomInbox.type('error');
+    assert.equal(invalidRoom.code, 'invalid_room_code');
+    invalidRoomClient.send(JSON.stringify({
+        type: 'join_room',
+        ...versionFields,
+        code: '9999',
+    }));
+    const missingRoom = await invalidRoomInbox.type('error');
+    assert.equal(missingRoom.code, 'room_not_found');
+    invalidRoomClient.close();
     assert.equal(health.operations.relay.maxActiveMatches, null);
     assert.equal(typeof health.operations.eventLoopLagMs.p95, 'number');
     assert.equal(health.operations.websocketDisconnects.total, 0);

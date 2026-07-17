@@ -3576,7 +3576,7 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
                 if (ws.roomCode) {
-                    send(ws, { type: 'error', message: 'Already in a room' });
+                    send(ws, { type: 'error', code: 'already_in_room', message: 'Already in a room' });
                     return;
                 }
                 // 기존 방 코드와 겹치지 않도록 재생성
@@ -3653,13 +3653,13 @@ wss.on('connection', (ws, req) => {
                 }
                 const code = msg.code;
                 if (!validateJoinCode(code)) {
-                    send(ws, { type: 'error', message: 'Invalid room code' });
+                    send(ws, { type: 'error', code: 'invalid_room_code', message: 'Invalid room code' });
                     return;
                 }
                 const room = rooms[code];
 
                 if (!room) {
-                    send(ws, { type: 'error', message: 'Room not found' });
+                    send(ws, { type: 'error', code: 'room_not_found', message: 'Room not found' });
                     return;
                 }
                 if (room.matchMode === 'ranked' && msg.type !== 'join_ranked_room') {
@@ -3671,11 +3671,15 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
                 if (room.matchMode !== 'ranked' && msg.type === 'join_ranked_room') {
-                    send(ws, { type: 'error', message: 'Ranked room is no longer available' });
+                    send(ws, {
+                        type: 'error',
+                        code: 'ranked_room_unavailable',
+                        message: 'Ranked room is no longer available',
+                    });
                     return;
                 }
                 if (room.guest && room.guest.readyState === WebSocket.OPEN) {
-                    send(ws, { type: 'error', message: 'Room is full' });
+                    send(ws, { type: 'error', code: 'room_full', message: 'Room is full' });
                     return;
                 }
                 if (room.networkMode === 'relay') {
