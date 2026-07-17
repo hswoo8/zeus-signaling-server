@@ -34,8 +34,16 @@ Set these environment variables in production to block outdated multiplayer clie
 | `CAPACITY_RETRY_AFTER_SEC` | `30` | Suggested retry delay returned by `/capacity` and server-busy WebSocket errors |
 | `MAINTENANCE_MODE` | `false` | When true, block new multiplayer entry with a maintenance message |
 | `MAINTENANCE_MESSAGE` | Korean default | Message shown to clients during maintenance |
+| `DEPLOYMENT_DRAIN_MESSAGE` | Korean default | Message shown while the runtime deployment drain blocks new entry |
 | `DATABASE_URL` | unset | PostgreSQL connection string. When set, match results/rankings use Postgres instead of memory |
 | `CONFIRMED_MATCH_TTL_MS` | `86400000` | Time a server-confirmed PvP result remains eligible for stats submission |
+| `RANK_PLACEMENT_MATCHES` | `10` | Ranked matches that use the placement K-factor |
+| `RANK_PLACEMENT_K` | `48` | Elo K-factor while either player is in placement |
+| `RANK_ESTABLISHED_K` | `24` | Elo K-factor after placement |
+| `RANK_ELO_SPREAD` | `400` | Rating spread used by the Elo expected-score curve |
+| `INTEGRITY_INVALID_FLAG_THRESHOLD` | `3` | Invalid ranked audit reports before an observe-only flag |
+| `INTEGRITY_HP_MISMATCH_FLAG_THRESHOLD` | `3` | Consecutive paired HP mismatches before an observe-only flag |
+| `INTEGRITY_REPORT_MAX_SKEW_MS` | `5000` | Maximum receive-time skew for comparing two audit reports |
 | `ANALYTICS_INGEST_ENABLED` | `true` | Accept legacy-client analytics events at `/analytics/events`; current Android builds use Firebase Analytics |
 | `ANALYTICS_RETENTION_DAYS` | `90` | Analytics event retention and dashboard aggregation window |
 | `ANALYTICS_RATE_LIMIT_PER_MINUTE` | `120` | Per-source in-memory rate limit for analytics ingestion |
@@ -95,8 +103,9 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/health` | Process health, version, channel, pool, ruleset, storage mode, room/player counts |
+| `GET` | `/health` | Lightweight process readiness plus channel, pool, ruleset, room counts, and deployment-drain state |
 | `GET` | `/capacity` | Multiplayer entry status, current counts, optional caps, retry delay, and minimum version requirements |
+| `POST` | `/admin/api/deployment/drain` | Basic-auth runtime switch that blocks new entry while existing matches finish |
 | `POST` | `/auth/guest/register` | Issue a long-lived signed guest credential for one player ID |
 | `POST` | `/auth/token` | Exchange a valid guest credential for a short-lived API access token |
 | `POST` | `/auth/ws-ticket` | Issue a one-time WebSocket connection ticket from an access token |
@@ -114,14 +123,18 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 
 `/health`, `/capacity`, and the admin snapshot expose process-local operational metrics: active Relay/P2P matches, Relay packet/byte totals, rolling 60-minute Relay bytes, Relay/capacity rejections, WebSocket backpressure drops/closes, disconnect sources, ranked integrity-audit counts, and rolling 60-second event-loop lag. Counters reset when the service restarts. The rolling egress value measures WebSocket payload bytes and is an application-level estimate; Railway Network Egress remains the billing source of truth.
 
-Ranked P2P clients send a compact `game_audit` directly over the signaling WebSocket every two seconds. The server compares each side's local/remote HP view and basic sequence/position bounds. Three repeated mismatches or invalid reports mark the in-memory match observation and the existing confirmed-match analytics record. This is observe-only: it does not reject a result or alter MMR until real beta data establishes safe thresholds.
+`/health` deliberately does not query PostgreSQL. Railway calls it while a new deployment starts, so it must reflect process readiness without making deployment activation depend on a dashboard query. It remains HTTP 200 while runtime drain is active and reports `acceptingConnections=false`; `/capacity` and WebSocket admission enforce the actual entry block.
+
+For a single-replica deployment, open `/admin`, select `배포 드레인 시작`, and wait until the dashboard reports zero active matches. The router remains online and continues returning the one stable game-service domain, while `/capacity` prevents new clients from entering. Deploy the game service only after active matches reach zero. A successful restart clears the in-memory drain automatically; if deployment is cancelled, select `신규 입장 재개`.
+
+Ranked P2P clients send a compact `game_audit` directly over the signaling WebSocket every two seconds. The server compares each side's local/remote HP view and basic sequence/position bounds. Configurable repeated mismatch and invalid-report thresholds mark the in-memory match observation and the existing confirmed-match analytics record. This is observe-only: it does not reject a result or alter MMR until real beta data establishes safe thresholds.
 
 Recommended Railway rollout:
 
 - Hobby: use for development, two-device QA, and small closed tests. Set conservative caps such as `MAX_CONNECTIONS`, `MAX_ACTIVE_ROOMS`, and `MAX_ACTIVE_MATCHES`, then verify the app shows the busy/maintenance popup instead of entering multiplayer.
 - Pro: switch before public SLT/release multiplayer, then raise caps based on load-test results and Railway CPU/RAM/egress metrics.
 
-PvP results prefer `playerId` as the identity key and use nickname only as a fallback/display value. `/matches/pvp-result` rejects unknown match IDs, participant mismatches, and outcomes that differ from the WebSocket-confirmed result. Normal PvP wins return the full coin reward; disconnect/forfeit wins return reduced reward so abuse-prone outcomes can still count for MMR without becoming a farming path. Duplicate `serverMatchId` submissions are idempotent, so both devices can submit the same match without double-counting.
+PvP results prefer `playerId` as the identity key and use nickname only as a fallback/display value. `/matches/pvp-result` rejects unknown match IDs, participant mismatches, and outcomes that differ from the WebSocket-confirmed result. Ranked MMR uses opponent-relative Elo: placement matches use K=48 by default, established players use K=24, and the response includes each player's rating before, delta, and rating after the match. Normal PvP wins return the full coin reward; disconnect/forfeit wins return reduced reward so abuse-prone outcomes can still count for MMR without becoming a farming path. Duplicate `serverMatchId` submissions are idempotent, so both devices can submit the same match without double-counting.
 
 PostgreSQL tables are created automatically at startup:
 

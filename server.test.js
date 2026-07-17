@@ -108,6 +108,9 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
             MULTIPLAYER_MAX_BALANCE_VERSION: '1',
             WS_BACKPRESSURE_SOFT_BYTES: '0',
             WS_BACKPRESSURE_HARD_BYTES: '1048576',
+            RANK_PLACEMENT_MATCHES: '2',
+            RANK_PLACEMENT_K: '48',
+            RANK_ESTABLISHED_K: '24',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -132,6 +135,12 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(health.operations.websocketDisconnects.heartbeatTimeouts, 0);
     assert.equal(health.operations.integrityAudits.received, 0);
     assert.equal(health.operations.integrityAudits.flaggedMatches, 0);
+    assert.equal(health.operations.integrityAudits.thresholds.invalidReports, 3);
+    assert.equal(health.operations.integrityAudits.thresholds.consecutiveHpMismatches, 3);
+    assert.equal(health.ready, true);
+    assert.equal(health.acceptingConnections, true);
+    assert.equal(health.deployment.draining, false);
+    assert.equal(health.deployment.activeMatchesDrained, true);
 
     const wrongEnvironmentCapacity = await fetch(
         `${baseUrl}/capacity?clientVersionCode=1&protocolVersion=1&rulesetVersion=1&balanceVersion=1&channel=production`
@@ -143,6 +152,63 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
 
     const unauthorizedAdmin = await fetch(`${baseUrl}/admin`);
     assert.equal(unauthorizedAdmin.status, 401);
+
+    const deploymentAdminAuthorization = `Basic ${Buffer.from('admin:test-password').toString('base64')}`;
+    const unauthorizedDrain = await fetch(`${baseUrl}/admin/api/deployment/drain`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+    });
+    assert.equal(unauthorizedDrain.status, 401);
+
+    const existingDuringDrain = await connect(`ws://127.0.0.1:${port}`);
+    const existingDuringDrainInbox = createInbox(existingDuringDrain);
+    const drainEnabledResponse = await fetch(`${baseUrl}/admin/api/deployment/drain`, {
+        method: 'POST',
+        headers: {
+            authorization: deploymentAdminAuthorization,
+            'content-type': 'application/json',
+        },
+        body: JSON.stringify({ enabled: true }),
+    });
+    assert.equal(drainEnabledResponse.status, 200);
+    const drainEnabled = await drainEnabledResponse.json();
+    assert.equal(drainEnabled.draining, true);
+    assert.equal(drainEnabled.acceptingConnections, false);
+    assert.equal(drainEnabled.activeMatchesDrained, true);
+
+    const drainedCapacity = await fetch(
+        `${baseUrl}/capacity?clientVersionCode=1&protocolVersion=1&rulesetVersion=1&balanceVersion=1&channel=dev`
+    ).then((response) => response.json());
+    assert.equal(drainedCapacity.code, 'server_maintenance');
+    assert.equal(drainedCapacity.canConnect, false);
+    assert.equal(drainedCapacity.canAcceptMatchmaking, false);
+
+    existingDuringDrain.send(JSON.stringify({ type: 'get_room_list', ...versionFields }));
+    assert.equal((await existingDuringDrainInbox.type('room_list')).type, 'room_list');
+
+    const rejectedDuringDrain = await connect(`ws://127.0.0.1:${port}`);
+    const rejectedCloseCode = await new Promise((resolve) => {
+        rejectedDuringDrain.once('close', resolve);
+    });
+    assert.equal(rejectedCloseCode, 1013);
+
+    const drainedHealth = await fetch(`${baseUrl}/health`).then((response) => response.json());
+    assert.equal(drainedHealth.ready, true);
+    assert.equal(drainedHealth.acceptingConnections, false);
+    assert.equal(drainedHealth.deployment.draining, true);
+
+    const drainDisabledResponse = await fetch(`${baseUrl}/admin/api/deployment/drain`, {
+        method: 'POST',
+        headers: {
+            authorization: deploymentAdminAuthorization,
+            'content-type': 'application/json',
+        },
+        body: JSON.stringify({ enabled: false }),
+    });
+    assert.equal(drainDisabledResponse.status, 200);
+    assert.equal((await drainDisabledResponse.json()).acceptingConnections, true);
+    existingDuringDrain.close();
 
     const launchEvent = {
         eventId: 'launch:test-1',
@@ -483,6 +549,12 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         body: JSON.stringify(resultBody(assigned.matchId, hostPlayer, guestPlayer, 'win')),
     });
     assert.equal(accepted.status, 201, serverErrors);
+    const acceptedBody = await accepted.json();
+    assert.equal(acceptedBody.players.local.ratingBefore, 1000);
+    assert.equal(acceptedBody.players.local.ratingDelta, 24);
+    assert.equal(acceptedBody.players.local.rating, 1024);
+    assert.equal(acceptedBody.players.remote.ratingDelta, -24);
+    assert.equal(acceptedBody.players.remote.rating, 976);
 
     const duplicate = await fetch(`${baseUrl}/matches/pvp-result`, {
         method: 'POST',
@@ -490,11 +562,16 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         body: JSON.stringify(resultBody(assigned.matchId, guestPlayer, hostPlayer, 'loss')),
     });
     assert.equal(duplicate.status, 200, serverErrors);
-    assert.equal((await duplicate.json()).duplicate, true);
+    const duplicateBody = await duplicate.json();
+    assert.equal(duplicateBody.duplicate, true);
+    assert.equal(duplicateBody.players.local.rating, 976);
+    assert.equal(duplicateBody.players.remote.rating, 1024);
 
     const stats = await fetch(`${baseUrl}/players/${hostPlayer.playerId}/stats?mode=multi`, { headers: appHeaders });
     assert.equal(stats.status, 200);
-    assert.equal((await stats.json()).matches, 1);
+    const firstStats = await stats.json();
+    assert.equal(firstStats.matches, 1);
+    assert.equal(firstStats.rating, 1024);
 
     host.send(JSON.stringify({ type: 'game_start', ...versionFields }));
     const [rematchAssigned, rematchStarted] = await Promise.all([
@@ -528,6 +605,9 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(forfeitAccepted.status, 201, serverErrors);
     const forfeitResponse = await forfeitAccepted.json();
     assert.equal(forfeitResponse.players.local.rewardCoins, 20);
+    assert.equal(forfeitResponse.players.local.ratingBefore, 1024);
+    assert.equal(forfeitResponse.players.local.ratingDelta, 21);
+    assert.equal(forfeitResponse.players.local.rating, 1045);
 
     const updatedStats = await fetch(`${baseUrl}/players/${hostPlayer.playerId}/stats?mode=multi`, { headers: appHeaders });
     assert.equal(updatedStats.status, 200);
@@ -550,7 +630,11 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         body: JSON.stringify(resultBody(disconnectAssigned.matchId, hostPlayer, guestPlayer, 'win')),
     });
     assert.equal(disconnectAccepted.status, 201, serverErrors);
-    assert.equal((await disconnectAccepted.json()).players.local.rewardCoins, 20);
+    const disconnectAcceptedBody = await disconnectAccepted.json();
+    assert.equal(disconnectAcceptedBody.players.local.rewardCoins, 20);
+    assert.equal(disconnectAcceptedBody.players.local.ratingBefore, 1045);
+    assert.equal(disconnectAcceptedBody.players.local.ratingDelta, 9);
+    assert.equal(disconnectAcceptedBody.players.local.rating, 1054);
 
     const finalStats = await fetch(`${baseUrl}/players/${hostPlayer.playerId}/stats?mode=multi`, { headers: appHeaders });
     assert.equal(finalStats.status, 200);
@@ -575,6 +659,8 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(snapshot.suspiciousPairs[0].matches, 3);
     assert.ok(snapshot.operations.relay.packets > 0);
     assert.equal(typeof snapshot.operations.eventLoopLagMs.p95, 'number');
+    assert.equal(snapshot.deployment.draining, false);
+    assert.equal(snapshot.deployment.acceptingConnections, true);
 
     const betaStats = await fetch(`${baseUrl}/admin/api/stats?channel=beta`, {
         headers: { authorization: adminAuthorization },
@@ -621,6 +707,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.match(adminHtml, /Relay 진입 거부/);
     assert.match(adminHtml, /이벤트 루프 p95/);
     assert.match(adminHtml, /송신 지연 보호/);
+    assert.match(adminHtml, /배포 드레인 시작/);
 });
 
 test('relay admission limits preserve P2P matches and reject new relay starts', async (t) => {

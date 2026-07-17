@@ -35,6 +35,8 @@ const MAINTENANCE_MODE = envBool(['MAINTENANCE_MODE', 'MULTIPLAYER_MAINTENANCE']
 const MAINTENANCE_MESSAGE = process.env.MAINTENANCE_MESSAGE ||
     process.env.MULTIPLAYER_MAINTENANCE_MESSAGE ||
     '대전 서버 점검 중입니다. 잠시 후 다시 시도해주세요.';
+const DEPLOYMENT_DRAIN_MESSAGE = process.env.DEPLOYMENT_DRAIN_MESSAGE ||
+    '안전한 배포를 위해 신규 대전 입장을 잠시 중단했습니다.';
 const SERVER_BUSY_MESSAGE = process.env.SERVER_BUSY_MESSAGE ||
     process.env.MULTIPLAYER_SERVER_BUSY_MESSAGE ||
     '현재 대전 서버가 혼잡합니다. 잠시 후 다시 시도해주세요.';
@@ -47,6 +49,13 @@ const RATE_LIMITS = {
 };
 const BATTLE_COUNTDOWN_SYNC_DELAY_MS = Number(process.env.BATTLE_COUNTDOWN_SYNC_DELAY_MS || 4500);
 const CONFIRMED_MATCH_TTL_MS = Number(process.env.CONFIRMED_MATCH_TTL_MS || 24 * 60 * 60 * 1000);
+const RANK_PLACEMENT_MATCHES = envInt(['RANK_PLACEMENT_MATCHES'], 10);
+const RANK_PLACEMENT_K = envInt(['RANK_PLACEMENT_K'], 48);
+const RANK_ESTABLISHED_K = envInt(['RANK_ESTABLISHED_K'], 24);
+const RANK_ELO_SPREAD = envInt(['RANK_ELO_SPREAD'], 400);
+const INTEGRITY_INVALID_FLAG_THRESHOLD = envInt(['INTEGRITY_INVALID_FLAG_THRESHOLD'], 3);
+const INTEGRITY_HP_MISMATCH_FLAG_THRESHOLD = envInt(['INTEGRITY_HP_MISMATCH_FLAG_THRESHOLD'], 3);
+const INTEGRITY_REPORT_MAX_SKEW_MS = envInt(['INTEGRITY_REPORT_MAX_SKEW_MS'], 5000);
 const ANALYTICS_RETENTION_DAYS = Number(process.env.ANALYTICS_RETENTION_DAYS || 90);
 const ANALYTICS_INGEST_ENABLED = envBool(['ANALYTICS_INGEST_ENABLED'], true);
 const ANALYTICS_RATE_LIMIT_PER_MINUTE = Number(process.env.ANALYTICS_RATE_LIMIT_PER_MINUTE || 120);
@@ -141,6 +150,8 @@ let integrityAuditsInvalid = 0;
 let integrityAuditMismatches = 0;
 let integrityMatchesFlagged = 0;
 let capacityRejections = 0;
+let runtimeDrainEnabled = false;
+let runtimeDrainStartedAtMs = null;
 let relayedPackets = 0;
 let relayedBytes = 0;
 let relayAdmissionRejections = 0;
@@ -871,6 +882,7 @@ function analyticsRuntimeSnapshot() {
             activeP2pMatches: roomStats.activeP2pMatches,
         },
         operations: operationsSnapshot(),
+        deployment: deploymentSnapshot(),
     };
 }
 
@@ -1120,6 +1132,11 @@ function operationsSnapshot() {
             invalid: integrityAuditsInvalid,
             hpMismatches: integrityAuditMismatches,
             flaggedMatches: integrityMatchesFlagged,
+            thresholds: {
+                invalidReports: INTEGRITY_INVALID_FLAG_THRESHOLD,
+                consecutiveHpMismatches: INTEGRITY_HP_MISMATCH_FLAG_THRESHOLD,
+                reportSkewMs: INTEGRITY_REPORT_MAX_SKEW_MS,
+            },
         },
         eventLoopLagMs: eventLoopLagSnapshot(),
     };
@@ -1146,6 +1163,25 @@ function blockedReason(count, limit, extra = 0) {
     return null;
 }
 
+function deploymentSnapshot() {
+    const roomStats = roomCounts();
+    const admissionPaused = MAINTENANCE_MODE || runtimeDrainEnabled;
+    return {
+        ready: true,
+        acceptingConnections: !admissionPaused,
+        staticMaintenance: MAINTENANCE_MODE,
+        draining: runtimeDrainEnabled,
+        drainStartedAt: runtimeDrainStartedAtMs
+            ? new Date(runtimeDrainStartedAtMs).toISOString()
+            : null,
+        activeMatchesDrained: roomStats.activeMatches === 0,
+        activeMatches: roomStats.activeMatches,
+        waitingRooms: roomStats.waitingRooms,
+        rooms: roomStats.rooms,
+        connections: openConnectionCount(),
+    };
+}
+
 function capacitySnapshot(options = {}) {
     const connectionExtra = Number.isInteger(options.connectionExtra) ? options.connectionExtra : 1;
     const roomStats = roomCounts();
@@ -1168,18 +1204,19 @@ function capacitySnapshot(options = {}) {
     const connectReason = blockedReason(counts.connections, MAX_CONNECTIONS, connectionExtra);
     const createReason = blockedReason(counts.rooms, MAX_ACTIVE_ROOMS, 1);
     const joinReason = blockedReason(counts.matchSlots, MAX_ACTIVE_MATCHES, 1);
-    const canConnect = !MAINTENANCE_MODE && !connectReason;
-    const canCreateRoom = !MAINTENANCE_MODE && !createReason;
-    const canJoinRoom = !MAINTENANCE_MODE && !joinReason;
+    const admissionPaused = MAINTENANCE_MODE || runtimeDrainEnabled;
+    const canConnect = !admissionPaused && !connectReason;
+    const canCreateRoom = !admissionPaused && !createReason;
+    const canJoinRoom = !admissionPaused && !joinReason;
     const canAcceptMatchmaking = canConnect && (canCreateRoom || canJoinRoom);
 
     let status = 'available';
     let code = 'ok';
     let message = '대전 서버 이용 가능';
-    if (MAINTENANCE_MODE) {
+    if (admissionPaused) {
         status = 'maintenance';
         code = 'server_maintenance';
-        message = MAINTENANCE_MESSAGE;
+        message = runtimeDrainEnabled ? DEPLOYMENT_DRAIN_MESSAGE : MAINTENANCE_MESSAGE;
     } else if (!canAcceptMatchmaking) {
         const reason = connectReason || createReason || joinReason || 'busy';
         status = reason === 'full' ? 'full' : 'busy';
@@ -1358,6 +1395,25 @@ async function handleHttpRequest(req, res) {
             analyticsRuntimeSnapshot(),
             url.searchParams.get('channel')
         ));
+        return;
+    }
+
+    if (req.method === 'POST' && pathname === '/admin/api/deployment/drain') {
+        if (!requireAdmin(req, res)) return;
+        const body = await readJsonRequest(req, res);
+        if (!body) return;
+        if (typeof body.enabled !== 'boolean') {
+            sendHttpError(res, 400, 'invalid_drain_state', 'enabled must be a boolean');
+            return;
+        }
+        runtimeDrainEnabled = body.enabled;
+        runtimeDrainStartedAtMs = runtimeDrainEnabled ? Date.now() : null;
+        const deployment = deploymentSnapshot();
+        console.info(
+            `[deployment] drain ${runtimeDrainEnabled ? 'enabled' : 'disabled'} ` +
+            `(activeMatches=${deployment.activeMatches}, rooms=${deployment.rooms}, connections=${deployment.connections})`
+        );
+        sendJson(res, 200, deployment);
         return;
     }
 
@@ -1556,9 +1612,11 @@ async function handleHttpRequest(req, res) {
     }
 
     if (req.method === 'GET' && pathname === '/health') {
-        const players = statsPool ? await postgresPlayerCount() : statsPlayers.size;
+        const deployment = deploymentSnapshot();
         sendJson(res, 200, {
             ok: true,
+            ready: deployment.ready,
+            acceptingConnections: deployment.acceptingConnections,
             service: 'beerock-signaling-server',
             version: packageJson.version || '1.0.0',
             channel: SERVER_CHANNEL,
@@ -1568,7 +1626,8 @@ async function handleHttpRequest(req, res) {
             storage: storageMode(),
             authEnabled: AUTH_ENABLED,
             rooms: Object.keys(rooms).length,
-            players,
+            players: statsPool ? null : statsPlayers.size,
+            deployment,
             backpressure: {
                 droppedStatePackets: backpressureDroppedStatePackets,
                 closedConnections: backpressureClosedConnections,
@@ -1682,6 +1741,7 @@ async function handleHttpRequest(req, res) {
         pathname === '/admin' ||
         pathname === '/admin/' ||
         pathname === '/admin/api/stats' ||
+        pathname === '/admin/api/deployment/drain' ||
         pathname === '/admin/support' ||
         pathname === '/admin/support/' ||
         pathname === '/admin/api/support' ||
@@ -1798,10 +1858,24 @@ function rewardForResult(outcome, finishReason) {
     return 100;
 }
 
-function ratingDelta(outcome, mode) {
-    if (outcome === 'win') return mode === 'multi' ? 16 : 16;
-    if (outcome === 'loss') return mode === 'multi' ? -16 : -12;
-    return mode === 'multi' ? 1 : 2;
+function outcomeScore(outcome) {
+    if (outcome === 'win') return 1;
+    if (outcome === 'loss') return 0;
+    return 0.5;
+}
+
+function rankKFactor(matches) {
+    return matches < RANK_PLACEMENT_MATCHES ? RANK_PLACEMENT_K : RANK_ESTABLISHED_K;
+}
+
+function ratingDelta(outcome, mode, rating = 1000, opponentRating = 1000, matches = RANK_PLACEMENT_MATCHES) {
+    if (mode !== 'multi') {
+        if (outcome === 'win') return 16;
+        if (outcome === 'loss') return -12;
+        return 2;
+    }
+    const expected = 1 / (1 + (10 ** ((opponentRating - rating) / RANK_ELO_SPREAD)));
+    return Math.round(rankKFactor(matches) * (outcomeScore(outcome) - expected));
 }
 
 function getOrCreatePlayer(mode, playerInput) {
@@ -1838,7 +1912,10 @@ function getOrCreatePlayer(mode, playerInput) {
 }
 
 function applyPlayerResult(player, outcome, metadata) {
-    player.rating = Math.max(0, player.rating + ratingDelta(outcome, player.mode));
+    const delta = Number.isInteger(metadata.ratingDelta)
+        ? metadata.ratingDelta
+        : ratingDelta(outcome, player.mode);
+    player.rating = Math.max(0, player.rating + delta);
     if (outcome === 'win') {
         player.wins += 1;
         player.currentStreak = Math.max(1, player.currentStreak + 1);
@@ -1859,6 +1936,38 @@ function applyPlayerResult(player, outcome, metadata) {
     }
     player.lastPlayedAt = metadata.completedAt;
     player.coinsEarned += metadata.rewardCoins || 0;
+}
+
+function applyPvpPlayerResults(local, remote, localOutcome, localMetadata, remoteMetadata) {
+    const remoteOutcome = reverseOutcome(localOutcome);
+    const localBefore = local.rating;
+    const remoteBefore = remote.rating;
+    const localDelta = ratingDelta(
+        localOutcome,
+        'multi',
+        localBefore,
+        remoteBefore,
+        playerMatchCount(local)
+    );
+    const remoteDelta = ratingDelta(
+        remoteOutcome,
+        'multi',
+        remoteBefore,
+        localBefore,
+        playerMatchCount(remote)
+    );
+    applyPlayerResult(local, localOutcome, { ...localMetadata, ratingDelta: localDelta });
+    applyPlayerResult(remote, remoteOutcome, { ...remoteMetadata, ratingDelta: remoteDelta });
+    return {
+        local: {
+            ratingBefore: localBefore,
+            ratingDelta: local.rating - localBefore,
+        },
+        remote: {
+            ratingBefore: remoteBefore,
+            ratingDelta: remote.rating - remoteBefore,
+        },
+    };
 }
 
 function favoriteCharacterId(player) {
@@ -1943,14 +2052,19 @@ function playerStatsResponse(player, rank) {
     };
 }
 
-function pvpPlayerSummary(player, rewardCoins) {
+function pvpPlayerSummary(player, rewardCoins, ratingChange = {}) {
     return {
         nickname: player.nickname,
         playerId: player.playerId || null,
+        ratingBefore: Number.isInteger(ratingChange.ratingBefore)
+            ? ratingChange.ratingBefore
+            : player.rating,
+        ratingDelta: Number.isInteger(ratingChange.ratingDelta) ? ratingChange.ratingDelta : 0,
         rating: player.rating,
         wins: player.wins,
         losses: player.losses,
         draws: player.draws,
+        matches: playerMatchCount(player),
         rewardCoins,
     };
 }
@@ -2016,11 +2130,6 @@ function dbPlayerFromRow(row) {
         lastPlayedAt: row.last_played_at ? new Date(row.last_played_at).toISOString() : null,
         coinsEarned: Number(row.coins_earned) || 0,
     };
-}
-
-async function postgresPlayerCount() {
-    const result = await statsPool.query('SELECT COUNT(*)::int AS count FROM br_player_stats');
-    return result.rows[0]?.count || 0;
 }
 
 async function postgresPlayersByMode(mode) {
@@ -2218,7 +2327,7 @@ async function updateSupportInquiryStatus(publicId, status) {
     return result.rows[0] ? supportInquiryFromRow(result.rows[0]) : null;
 }
 
-async function upsertPostgresPlayerResult(client, mode, playerInput, outcome, metadata) {
+async function ensurePostgresPlayer(client, mode, playerInput) {
     const nickname = normalizeNicknameInput(playerInput.nickname, 'Player');
     const identityKey = playerIdentityKey({ ...playerInput, nickname });
     if (!identityKey) throw new Error('player identity is invalid');
@@ -2233,12 +2342,11 @@ async function upsertPostgresPlayerResult(client, mode, playerInput, outcome, me
                 updated_at = NOW()`,
         [mode, identityKey, playerId, nickname, nicknameKey(nickname)]
     );
-    const locked = await client.query(
-        'SELECT * FROM br_player_stats WHERE mode = $1 AND identity_key = $2 FOR UPDATE',
-        [mode, identityKey]
-    );
-    const player = dbPlayerFromRow(locked.rows[0]);
-    applyPlayerResult(player, outcome, metadata);
+    return identityKey;
+}
+
+async function persistPostgresPlayer(client, player) {
+    const identityKey = player.key.slice(`${player.mode}:`.length);
     await client.query(
         `UPDATE br_player_stats
             SET player_id = $3,
@@ -2257,7 +2365,7 @@ async function upsertPostgresPlayerResult(client, mode, playerInput, outcome, me
                 updated_at = NOW()
           WHERE mode = $1 AND identity_key = $2`,
         [
-            mode,
+            player.mode,
             identityKey,
             player.playerId,
             player.nickname,
@@ -2274,7 +2382,54 @@ async function upsertPostgresPlayerResult(client, mode, playerInput, outcome, me
             player.coinsEarned,
         ]
     );
+}
+
+async function upsertPostgresPlayerResult(client, mode, playerInput, outcome, metadata) {
+    const identityKey = await ensurePostgresPlayer(client, mode, playerInput);
+    const locked = await client.query(
+        'SELECT * FROM br_player_stats WHERE mode = $1 AND identity_key = $2 FOR UPDATE',
+        [mode, identityKey]
+    );
+    const player = dbPlayerFromRow(locked.rows[0]);
+    applyPlayerResult(player, outcome, metadata);
+    await persistPostgresPlayer(client, player);
     return player;
+}
+
+async function upsertPostgresPvpResults(
+    client,
+    localInput,
+    remoteInput,
+    localOutcome,
+    localMetadata,
+    remoteMetadata
+) {
+    const localIdentity = await ensurePostgresPlayer(client, 'multi', localInput);
+    const remoteIdentity = await ensurePostgresPlayer(client, 'multi', remoteInput);
+    const identities = [localIdentity, remoteIdentity].sort();
+    const locked = await client.query(
+        `SELECT * FROM br_player_stats
+          WHERE mode = 'multi' AND identity_key = ANY($1::text[])
+          ORDER BY identity_key
+          FOR UPDATE`,
+        [identities]
+    );
+    const playersByIdentity = new Map(
+        locked.rows.map((row) => [row.identity_key, dbPlayerFromRow(row)])
+    );
+    const local = playersByIdentity.get(localIdentity);
+    const remote = playersByIdentity.get(remoteIdentity);
+    if (!local || !remote) throw new Error('failed to lock PvP player records');
+    const ratingChanges = applyPvpPlayerResults(
+        local,
+        remote,
+        localOutcome,
+        localMetadata,
+        remoteMetadata
+    );
+    await persistPostgresPlayer(client, local);
+    await persistPostgresPlayer(client, remote);
+    return { local, remote, ratingChanges };
 }
 
 function validateCommonResult(body, mode) {
@@ -2397,18 +2552,23 @@ function handlePvpMatchResult(res, body) {
     const local = getOrCreatePlayer('multi', body.localPlayer);
     const remote = getOrCreatePlayer('multi', body.remotePlayer);
 
-    applyPlayerResult(local, outcome, {
-        durationSec: body.durationSec,
-        characterId: body.localPlayer.characterId,
-        completedAt,
-        rewardCoins: localReward,
-    });
-    applyPlayerResult(remote, remoteOutcome, {
-        durationSec: body.durationSec,
-        characterId: body.remotePlayer.characterId,
-        completedAt,
-        rewardCoins: remoteReward,
-    });
+    const ratingChanges = applyPvpPlayerResults(
+        local,
+        remote,
+        outcome,
+        {
+            durationSec: body.durationSec,
+            characterId: body.localPlayer.characterId,
+            completedAt,
+            rewardCoins: localReward,
+        },
+        {
+            durationSec: body.durationSec,
+            characterId: body.remotePlayer.characterId,
+            completedAt,
+            rewardCoins: remoteReward,
+        }
+    );
 
     const matchId = matchRef || makeServerMatchId();
     const record = {
@@ -2416,10 +2576,10 @@ function handlePvpMatchResult(res, body) {
         matchId,
         finishReason,
         players: {
-            [localIdentity]: pvpPlayerSummary(local, localReward),
-            [remoteIdentity]: pvpPlayerSummary(remote, remoteReward),
-            local: pvpPlayerSummary(local, localReward),
-            remote: pvpPlayerSummary(remote, remoteReward),
+            [localIdentity]: pvpPlayerSummary(local, localReward, ratingChanges.local),
+            [remoteIdentity]: pvpPlayerSummary(remote, remoteReward, ratingChanges.remote),
+            local: pvpPlayerSummary(local, localReward, ratingChanges.local),
+            remote: pvpPlayerSummary(remote, remoteReward, ratingChanges.remote),
         },
     };
     const response = {
@@ -2586,27 +2746,33 @@ async function handlePostgresPvpMatchResult(res, body) {
             }
         }
 
-        const local = await upsertPostgresPlayerResult(client, 'multi', body.localPlayer, outcome, {
-            durationSec: body.durationSec,
-            characterId: body.localPlayer.characterId,
-            completedAt,
-            rewardCoins: localReward,
-        });
-        const remote = await upsertPostgresPlayerResult(client, 'multi', body.remotePlayer, remoteOutcome, {
-            durationSec: body.durationSec,
-            characterId: body.remotePlayer.characterId,
-            completedAt,
-            rewardCoins: remoteReward,
-        });
+        const { local, remote, ratingChanges } = await upsertPostgresPvpResults(
+            client,
+            body.localPlayer,
+            body.remotePlayer,
+            outcome,
+            {
+                durationSec: body.durationSec,
+                characterId: body.localPlayer.characterId,
+                completedAt,
+                rewardCoins: localReward,
+            },
+            {
+                durationSec: body.durationSec,
+                characterId: body.remotePlayer.characterId,
+                completedAt,
+                rewardCoins: remoteReward,
+            }
+        );
         const record = {
             type: 'pvp',
             matchId,
             finishReason,
             players: {
-                [localIdentity]: pvpPlayerSummary(local, localReward),
-                [remoteIdentity]: pvpPlayerSummary(remote, remoteReward),
-                local: pvpPlayerSummary(local, localReward),
-                remote: pvpPlayerSummary(remote, remoteReward),
+                [localIdentity]: pvpPlayerSummary(local, localReward, ratingChanges.local),
+                [remoteIdentity]: pvpPlayerSummary(remote, remoteReward, ratingChanges.remote),
+                local: pvpPlayerSummary(local, localReward, ratingChanges.local),
+                remote: pvpPlayerSummary(remote, remoteReward, ratingChanges.remote),
             },
         };
         const response = {
@@ -2860,7 +3026,9 @@ function recordGameAudit(room, ws, msg) {
     if (invalid) {
         integrityAuditsInvalid += 1;
         state.invalid += 1;
-        if (state.invalid >= 3) flagRoomIntegrity(room, 'repeated_invalid_audit');
+        if (state.invalid >= INTEGRITY_INVALID_FLAG_THRESHOLD) {
+            flagRoomIntegrity(room, 'repeated_invalid_audit');
+        }
         return;
     }
 
@@ -2879,14 +3047,16 @@ function recordGameAudit(room, ws, msg) {
         guest.auditSeq === state.comparedGuestAuditSeq) return;
     state.comparedHostAuditSeq = host.auditSeq;
     state.comparedGuestAuditSeq = guest.auditSeq;
-    if (Math.abs(host.receivedAtMs - guest.receivedAtMs) > 5000) return;
+    if (Math.abs(host.receivedAtMs - guest.receivedAtMs) > INTEGRITY_REPORT_MAX_SKEW_MS) return;
 
     const hpMismatch = host.localHp !== guest.remoteHp || guest.localHp !== host.remoteHp;
     if (hpMismatch) {
         integrityAuditMismatches += 1;
         state.hpMismatches += 1;
         state.consecutiveHpMismatches += 1;
-        if (state.consecutiveHpMismatches >= 3) flagRoomIntegrity(room, 'repeated_hp_mismatch');
+        if (state.consecutiveHpMismatches >= INTEGRITY_HP_MISMATCH_FLAG_THRESHOLD) {
+            flagRoomIntegrity(room, 'repeated_hp_mismatch');
+        }
     } else {
         state.consecutiveHpMismatches = 0;
     }
