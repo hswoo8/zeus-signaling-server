@@ -3232,9 +3232,24 @@ async function matchmakingRatingForSocket(ws, claimedPlayerId, refresh = false) 
     return ws.matchmakingRating;
 }
 
+function playerIdForSocket(ws, claimedPlayerId) {
+    return normalizePlayerId(ws?.authPlayerId) || normalizePlayerId(claimedPlayerId);
+}
+
+function roomOwnedByViewer(room, viewer) {
+    if (!room || !viewer) return false;
+    if (room.host === viewer) return true;
+    const viewerPlayerId = playerIdForSocket(viewer, viewer.matchmakingPlayerId);
+    const hostPlayerId = normalizePlayerId(room.hostPlayerId);
+    return Boolean(viewerPlayerId && hostPlayerId && viewerPlayerId === hostPlayerId);
+}
+
 function roomListEntry(code, room, viewer, viewerRating = 1000) {
     if (!room || room.host?.readyState !== WebSocket.OPEN ||
         (room.guest && room.guest.readyState === WebSocket.OPEN)) {
+        return null;
+    }
+    if (roomOwnedByViewer(room, viewer)) {
         return null;
     }
     if (room.networkMode === 'relay' && !relayAvailabilitySnapshot().canStartNewMatch) {
@@ -3583,6 +3598,7 @@ wss.on('connection', (ws, req) => {
                 let code;
                 do { code = generateCode(); } while (rooms[code]);
 
+                const hostPlayerId = playerIdForSocket(ws, msg.hostPlayerId);
                 rooms[code] = {
                     host: ws,
                     guest: null,
@@ -3600,7 +3616,7 @@ wss.on('connection', (ws, req) => {
                     matchMode: requestedMatchMode,
                     rulesetVersion: packetInt(msg, 'rulesetVersion'),
                     hostNickname: typeof msg.hostNickname === 'string' ? msg.hostNickname : undefined,
-                    hostPlayerId: typeof msg.hostPlayerId === 'string' ? msg.hostPlayerId : undefined,
+                    hostPlayerId: hostPlayerId || undefined,
                     hostRating: requestedMatchMode === 'ranked'
                         ? await matchmakingRatingForSocket(ws, msg.hostPlayerId)
                         : null,
@@ -3630,6 +3646,7 @@ wss.on('connection', (ws, req) => {
                 };
                 ws.roomCode = code;
                 ws.role = 'host';
+                ws.matchmakingPlayerId = hostPlayerId;
 
                 send(ws, {
                     type: 'room_created',
@@ -3656,6 +3673,10 @@ wss.on('connection', (ws, req) => {
                     send(ws, { type: 'error', code: 'invalid_room_code', message: 'Invalid room code' });
                     return;
                 }
+                if (ws.roomCode) {
+                    send(ws, { type: 'error', code: 'already_in_room', message: 'Already in a room' });
+                    return;
+                }
                 const room = rooms[code];
 
                 if (!room) {
@@ -3678,6 +3699,16 @@ wss.on('connection', (ws, req) => {
                     });
                     return;
                 }
+                const guestPlayerId = playerIdForSocket(ws, msg.guestPlayerId);
+                const hostPlayerId = normalizePlayerId(room.hostPlayerId);
+                if (room.host === ws || (guestPlayerId && hostPlayerId && guestPlayerId === hostPlayerId)) {
+                    send(ws, {
+                        type: 'error',
+                        code: 'self_join_not_allowed',
+                        message: 'Cannot join a room owned by the same player',
+                    });
+                    return;
+                }
                 if (room.guest && room.guest.readyState === WebSocket.OPEN) {
                     send(ws, { type: 'error', code: 'room_full', message: 'Room is full' });
                     return;
@@ -3695,7 +3726,7 @@ wss.on('connection', (ws, req) => {
                 room.guestPassiveId = enumToken(msg.guestPassiveId);
                 room.guestArenaId = enumToken(msg.arenaId);
                 room.guestNickname = typeof msg.guestNickname === 'string' ? msg.guestNickname : undefined;
-                room.guestPlayerId = typeof msg.guestPlayerId === 'string' ? msg.guestPlayerId : undefined;
+                room.guestPlayerId = guestPlayerId || undefined;
                 room.guestVersionCode = packetInt(msg, 'clientVersionCode');
                 room.guestVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : undefined;
                 room.guestAnalyticsChannel = normalizeAnalyticsChannel(msg.analyticsChannel);
@@ -3703,6 +3734,7 @@ wss.on('connection', (ws, req) => {
                 room.guestUserAgent = ws.analyticsUserAgent;
                 ws.roomCode = code;
                 ws.role = 'guest';
+                ws.matchmakingPlayerId = guestPlayerId;
 
                 // 양쪽에게 준비 알림
                 send(ws, {
@@ -3794,6 +3826,7 @@ wss.on('connection', (ws, req) => {
             case 'get_room_list': {
                 ws.roomListSubscribed = true;
                 ws.roomListMatchMode = matchMode(msg.matchMode);
+                ws.matchmakingPlayerId = playerIdForSocket(ws, msg.playerId);
                 const viewerRating = ws.roomListMatchMode === 'ranked'
                     ? await matchmakingRatingForSocket(ws, msg.playerId, true)
                     : 1000;

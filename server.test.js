@@ -352,6 +352,36 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(rankedAdded.room.code, rankedCreated.code);
     assert.equal(rankedAdded.room.ratingDifference, 0);
     assert.equal(typeof rankedAdded.room.waitingMs, 'number');
+
+    rankedHost.send(JSON.stringify({
+        type: 'get_room_list',
+        ...versionFields,
+        matchMode: 'ranked',
+        playerId: 'ranked-host',
+    }));
+    const ownRankedRooms = await rankedHostInbox.type('room_list');
+    assert.equal(ownRankedRooms.rooms.some((room) => room.code === rankedCreated.code), false);
+
+    const duplicateRankedHost = await connect(`ws://127.0.0.1:${port}`);
+    const duplicateRankedHostInbox = createInbox(duplicateRankedHost);
+    duplicateRankedHost.send(JSON.stringify({
+        type: 'get_room_list',
+        ...versionFields,
+        matchMode: 'ranked',
+        playerId: 'ranked-host',
+    }));
+    const duplicateOwnRooms = await duplicateRankedHostInbox.type('room_list');
+    assert.equal(duplicateOwnRooms.rooms.some((room) => room.code === rankedCreated.code), false);
+    duplicateRankedHost.send(JSON.stringify({
+        type: 'join_ranked_room',
+        ...versionFields,
+        code: rankedCreated.code,
+        guestPlayerId: 'ranked-host',
+    }));
+    const selfJoinError = await duplicateRankedHostInbox.type('error');
+    assert.equal(selfJoinError.code, 'self_join_not_allowed');
+    duplicateRankedHost.close();
+
     rankedHost.close();
     await rankedObserverInbox.type('room_removed');
     rankedObserver.close();
