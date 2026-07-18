@@ -541,6 +541,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.ok(assigned.matchId);
     assert.equal(started.matchId, assigned.matchId);
     assert.equal(started.matchSequence, assigned.matchSequence);
+    assert.equal(assigned.arenaId, created.arenaId);
     assert.equal(started.battleType, 'short');
     assert.equal(started.arenaId, created.arenaId);
     assert.equal(started.debugNoKo, true);
@@ -682,6 +683,8 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.ok(rematchAssigned.matchId);
     assert.equal(rematchStarted.matchId, rematchAssigned.matchId);
     assert.notEqual(rematchAssigned.matchId, assigned.matchId);
+    assert.equal(rematchAssigned.arenaId, rematchStarted.arenaId);
+    assert.notEqual(rematchStarted.arenaId, started.arenaId);
 
     guest.send(JSON.stringify({
         type: 'game_over',
@@ -715,10 +718,12 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal((await updatedStats.json()).matches, 2);
 
     host.send(JSON.stringify({ type: 'game_start', ...versionFields }));
-    const [disconnectAssigned] = await Promise.all([
+    const [disconnectAssigned, disconnectStarted] = await Promise.all([
         hostInbox.type('match_assigned'),
         guestInbox.type('game_start'),
     ]);
+    assert.equal(disconnectAssigned.arenaId, disconnectStarted.arenaId);
+    assert.notEqual(disconnectStarted.arenaId, rematchStarted.arenaId);
     guest.close();
     const disconnectResult = await hostInbox.type('match_result');
     assert.equal(disconnectResult.matchId, disconnectAssigned.matchId);

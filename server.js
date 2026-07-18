@@ -168,8 +168,10 @@ const MATCH_MODES = new Set(['ranked', 'casual', 'friendly']);
 const RANKED_BATTLE_TYPE = 'short';
 const RANKED_ARENA_IDS = Object.freeze(['CLASSIC_OLYMPUS', 'SKY_OLYMPUS']);
 
-function randomRankedArenaId() {
-    return RANKED_ARENA_IDS[Math.floor(Math.random() * RANKED_ARENA_IDS.length)];
+function randomRankedArenaId(previousArenaId = null) {
+    const candidates = RANKED_ARENA_IDS.filter((arenaId) => arenaId !== previousArenaId);
+    const pool = candidates.length > 0 ? candidates : RANKED_ARENA_IDS;
+    return pool[Math.floor(Math.random() * pool.length)];
 }
 
 const GAME_TYPES = new Set([
@@ -421,6 +423,7 @@ function sendCountdownSync(room) {
         type: 'game_countdown_sync',
         matchId: room.matchId || null,
         matchSequence: room.matchSequence || 0,
+        arenaId: room.arenaId || null,
         serverTimeMs,
         battleStartAtMs: room.battleStartAtMs,
         countdownDelayMs: Math.max(0, room.battleStartAtMs - serverTimeMs),
@@ -3548,6 +3551,7 @@ function compatibilityError(msg) {
 wss.on('connection', (ws, req) => {
     ws.roomCode = null;
     ws.role = null; // 'host' | 'guest'
+    ws.lastRankedArenaId = null;
     ws.roomListSubscribed = false;
     ws.analyticsCountryCode = requestCountry(req, null);
     ws.analyticsUserAgent = safeUserAgent(req);
@@ -3645,7 +3649,7 @@ wss.on('connection', (ws, req) => {
                     hostCharacterId: enumToken(msg.hostCharacterId),
                     hostPassiveId: enumToken(msg.hostPassiveId),
                     arenaId: requestedMatchMode === 'ranked'
-                        ? randomRankedArenaId()
+                        ? randomRankedArenaId(ws.lastRankedArenaId)
                         : enumToken(msg.arenaId),
                     battleType: requestedMatchMode === 'ranked'
                         ? RANKED_BATTLE_TYPE
@@ -3686,6 +3690,9 @@ wss.on('connection', (ws, req) => {
                 ws.roomCode = code;
                 ws.role = 'host';
                 ws.matchmakingPlayerId = hostPlayerId;
+                if (requestedMatchMode === 'ranked') {
+                    ws.lastRankedArenaId = rooms[code].arenaId;
+                }
 
                 send(ws, {
                     type: 'room_created',
@@ -3777,6 +3784,9 @@ wss.on('connection', (ws, req) => {
                 ws.roomCode = code;
                 ws.role = 'guest';
                 ws.matchmakingPlayerId = guestPlayerId;
+                if (room.matchMode === 'ranked') {
+                    ws.lastRankedArenaId = room.arenaId;
+                }
 
                 // 양쪽에게 준비 알림
                 send(ws, {
@@ -3933,6 +3943,11 @@ wss.on('connection', (ws, req) => {
                     if (!room.matchStarted) {
                         room.matchStarted = true;
                         room.activeTransport = requestedTransport;
+                        if (room.matchMode === 'ranked' && (room.matchSequence || 0) > 0) {
+                            room.arenaId = randomRankedArenaId(room.arenaId);
+                            if (room.host) room.host.lastRankedArenaId = room.arenaId;
+                            if (room.guest) room.guest.lastRankedArenaId = room.arenaId;
+                        }
                         room.matchSequence = (room.matchSequence || 0) + 1;
                         room.matchId = makeMatchId();
                         room.finalResult = null;
@@ -3970,6 +3985,7 @@ wss.on('connection', (ws, req) => {
                         type: 'match_assigned',
                         matchId: room.matchId,
                         matchSequence: room.matchSequence,
+                        arenaId: room.arenaId,
                     });
                     break;
                 }
