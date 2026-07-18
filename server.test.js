@@ -327,6 +327,35 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     soloHost.close();
     roomListObserver.close();
 
+    const staleHost = await connect(`ws://127.0.0.1:${port}`);
+    const replacementHost = await connect(`ws://127.0.0.1:${port}`);
+    const staleHostInbox = createInbox(staleHost);
+    const replacementHostInbox = createInbox(replacementHost);
+    staleHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        hostPlayerId: 'duplicate-waiting-host',
+        matchMode: 'ranked',
+    }));
+    const staleRoom = await staleHostInbox.type('room_created');
+    replacementHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        hostPlayerId: 'duplicate-waiting-host',
+        matchMode: 'ranked',
+    }));
+    const [staleRoomLeft, replacementRoom] = await Promise.all([
+        staleHostInbox.type('room_left'),
+        replacementHostInbox.type('room_created'),
+    ]);
+    assert.equal(staleRoomLeft.code, staleRoom.code);
+    assert.equal(staleRoomLeft.reason, 'replaced_by_new_connection');
+    assert.notEqual(replacementRoom.code, staleRoom.code);
+    replacementHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await replacementHostInbox.type('room_left');
+    staleHost.close();
+    replacementHost.close();
+
     const rankedObserver = await connect(`ws://127.0.0.1:${port}`);
     const rankedObserverInbox = createInbox(rankedObserver);
     rankedObserver.send(JSON.stringify({
@@ -350,6 +379,10 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     const rankedCreated = await rankedHostInbox.type('room_created');
     const rankedAdded = await rankedObserverInbox.type('room_updated');
     assert.equal(rankedAdded.room.code, rankedCreated.code);
+    assert.equal(rankedCreated.battleType, 'short');
+    assert.equal(rankedAdded.room.battleType, 'short');
+    assert.ok(['CLASSIC_OLYMPUS', 'SKY_OLYMPUS'].includes(rankedCreated.arenaId));
+    assert.equal(rankedAdded.room.arenaId, rankedCreated.arenaId);
     assert.equal(rankedAdded.room.ratingDifference, 0);
     assert.equal(typeof rankedAdded.room.waitingMs, 'number');
 
@@ -471,8 +504,14 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         arenaId: 'CLASSIC_OLYMPUS',
         battleType: 'standard',
         matchMode: 'ranked',
+        debugNoKo: true,
+        debugNoTime: false,
     }));
     const created = await hostInbox.type('room_created');
+    assert.equal(created.battleType, 'short');
+    assert.ok(['CLASSIC_OLYMPUS', 'SKY_OLYMPUS'].includes(created.arenaId));
+    assert.equal(created.debugNoKo, true);
+    assert.equal(created.debugNoTime, false);
     guest.send(JSON.stringify({
         type: 'join_ranked_room',
         ...versionFields,
@@ -483,7 +522,16 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         guestPlayerId: guestPlayer.playerId,
         arenaId: 'CLASSIC_OLYMPUS',
     }));
-    await Promise.all([hostInbox.type('guest_joined'), guestInbox.type('room_joined')]);
+    const [guestJoined, roomJoined] = await Promise.all([
+        hostInbox.type('guest_joined'),
+        guestInbox.type('room_joined'),
+    ]);
+    assert.equal(guestJoined.debugNoKo, true);
+    assert.equal(guestJoined.debugNoTime, false);
+    assert.equal(roomJoined.debugNoKo, true);
+    assert.equal(roomJoined.debugNoTime, false);
+    assert.equal(roomJoined.battleType, 'short');
+    assert.equal(roomJoined.arenaId, created.arenaId);
 
     host.send(JSON.stringify({ type: 'game_start', ...versionFields }));
     const [assigned, started] = await Promise.all([
@@ -492,6 +540,11 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     ]);
     assert.ok(assigned.matchId);
     assert.equal(started.matchId, assigned.matchId);
+    assert.equal(started.matchSequence, assigned.matchSequence);
+    assert.equal(started.battleType, 'short');
+    assert.equal(started.arenaId, created.arenaId);
+    assert.equal(started.debugNoKo, true);
+    assert.equal(started.debugNoTime, false);
 
     host.send(JSON.stringify({
         type: 'game_audit',

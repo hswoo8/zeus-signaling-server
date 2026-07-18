@@ -75,11 +75,11 @@ Clients must route before capacity/WebSocket connection. The selected game serve
 
 | type | Direction | Description |
 | --- | --- | --- |
-| `create_room` | Client -> Server | Create room with compatibility metadata and `{ hostCharacterId, hostPassiveId, arenaId, battleType, hostNickname, hostPlayerId, networkMode }`; missing/invalid `networkMode` becomes `relay`, missing/invalid `battleType` becomes `short` |
-| `room_created` | Server -> Host | `{ code, networkMode, battleType }` |
+| `create_room` | Client -> Server | Create room with compatibility metadata and `{ hostCharacterId, hostPassiveId, arenaId, battleType, debugNoKo, debugNoTime, hostNickname, hostPlayerId, networkMode }`; missing/invalid `networkMode` becomes `relay`, missing/invalid `battleType` becomes `short` |
+| `room_created` | Server -> Host | `{ code, networkMode, arenaId, battleType, debugNoKo, debugNoTime }` |
 | `join_room` | Client -> Server | Compatibility metadata and `{ code, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
-| `room_joined` | Server -> Guest | `{ code, networkMode, battleType, hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId }` |
-| `guest_joined` | Server -> Host | `{ networkMode, battleType, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
+| `room_joined` | Server -> Guest | `{ code, networkMode, battleType, debugNoKo, debugNoTime, hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId }` |
+| `guest_joined` | Server -> Host | `{ networkMode, battleType, debugNoKo, debugNoTime, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
 | `leave_room` | Client -> Server | Leave the waiting/rematch room while keeping the WebSocket connected |
 | `room_left` | Server -> Client | Confirms that room state was cleared; the client can return to room-list polling |
 | `selection_update` | Client -> Server -> Peer | Live setup selection and ready state: `{ characterId, passiveId, arenaId, battleType, nickname, playerId, ready, networkMode }`; room `battleType` is fixed at `create_room` |
@@ -92,6 +92,8 @@ Clients must route before capacity/WebSocket connection. The selected game serve
 `create_room` and `join_room` also enforce the same capacity gates as `/capacity`, so clients cannot bypass overload protection by skipping the HTTP preflight.
 
 Each accepted `game_start` assigns a new `matchId`, including rematches. The guest receives it on `game_start`, the host receives `match_assigned`, and both receive it again on `game_countdown_sync`. Relay game packets remain peer-compatible. On `game_over` or an active-match socket disconnect, the server emits perspective-correct `match_result { matchId, outcome, finishReason, serverConfirmed }` packets to both sides. After `game_ready`, the server sends `game_countdown_sync { matchId, serverTimeMs, battleStartAtMs }` so battle countdown starts from the same server-authoritative time. WebRTC `offer` / `answer` / `ice_candidate` messages are forwarded for P2P DataChannel setup.
+
+Ranked rooms use the `short` battle type. The server selects one supported arena when the room is created and keeps that arena for both players. Internal `debugNoKo` and `debugNoTime` rules are fixed from the room creator's request and relayed to the guest.
 
 Rate limits are type-specific so lobby/signaling traffic stays low while `game_state` can sustain 20 Hz relay traffic.
 

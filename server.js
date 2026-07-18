@@ -165,8 +165,12 @@ const LOBBY_TYPES = new Set([
     'offer', 'answer', 'ice_candidate',
 ]);
 const MATCH_MODES = new Set(['ranked', 'casual', 'friendly']);
-const RANKED_BATTLE_TYPE = 'standard';
-const RANKED_ARENA_ID = 'CLASSIC_OLYMPUS';
+const RANKED_BATTLE_TYPE = 'short';
+const RANKED_ARENA_IDS = Object.freeze(['CLASSIC_OLYMPUS', 'SKY_OLYMPUS']);
+
+function randomRankedArenaId() {
+    return RANKED_ARENA_IDS[Math.floor(Math.random() * RANKED_ARENA_IDS.length)];
+}
 
 const GAME_TYPES = new Set([
     'game_start', 'game_ready', 'game_state', 'game_skill', 'game_damage',
@@ -416,6 +420,7 @@ function sendCountdownSync(room) {
     const packet = {
         type: 'game_countdown_sync',
         matchId: room.matchId || null,
+        matchSequence: room.matchSequence || 0,
         serverTimeMs,
         battleStartAtMs: room.battleStartAtMs,
         countdownDelayMs: Math.max(0, room.battleStartAtMs - serverTimeMs),
@@ -3244,6 +3249,33 @@ function roomOwnedByViewer(room, viewer) {
     return Boolean(viewerPlayerId && hostPlayerId && viewerPlayerId === hostPlayerId);
 }
 
+function removeDuplicateWaitingRoomsForPlayer(playerId, currentSocket) {
+    const normalizedPlayerId = normalizePlayerId(playerId);
+    if (!normalizedPlayerId) return 0;
+    let removed = 0;
+    for (const [code, room] of Object.entries(rooms)) {
+        if (!room || room.host === currentSocket || room.matchStarted) continue;
+        if (room.guest?.readyState === WebSocket.OPEN) continue;
+        if (normalizePlayerId(room.hostPlayerId) !== normalizedPlayerId) continue;
+
+        const previousHost = room.host;
+        if (previousHost) {
+            previousHost.roomCode = null;
+            previousHost.role = null;
+            send(previousHost, {
+                type: 'room_left',
+                code,
+                reason: 'replaced_by_new_connection',
+            });
+        }
+        delete rooms[code];
+        broadcastRoomRemoved(code);
+        removed += 1;
+        console.log(`[-] Replaced duplicate waiting room: ${code}`);
+    }
+    return removed;
+}
+
 function roomListEntry(code, room, viewer, viewerRating = 1000) {
     if (!room || room.host?.readyState !== WebSocket.OPEN ||
         (room.guest && room.guest.readyState === WebSocket.OPEN)) {
@@ -3390,6 +3422,10 @@ function leaveWaitingRoom(ws, notifyLeaver = false) {
             code,
             networkMode: room.networkMode || 'relay',
             arenaId: room.arenaId,
+            battleType: room.battleType,
+            matchMode: room.matchMode,
+            debugNoKo: room.debugNoKo,
+            debugNoTime: room.debugNoTime,
         });
         broadcastRoomUpsert(code);
         console.log(`[~] Host migrated after waiting host left: ${code}`);
@@ -3585,20 +3621,21 @@ wss.on('connection', (ws, req) => {
                         return;
                     }
                 }
+                if (ws.roomCode) {
+                    send(ws, { type: 'error', code: 'already_in_room', message: 'Already in a room' });
+                    return;
+                }
+                const hostPlayerId = playerIdForSocket(ws, msg.hostPlayerId);
+                removeDuplicateWaitingRoomsForPlayer(hostPlayerId, ws);
                 const capacity = capacitySnapshot({ connectionExtra: 0 });
                 if (!capacity.canCreateRoom) {
                     sendCapacityWsError(ws, capacity);
-                    return;
-                }
-                if (ws.roomCode) {
-                    send(ws, { type: 'error', code: 'already_in_room', message: 'Already in a room' });
                     return;
                 }
                 // 기존 방 코드와 겹치지 않도록 재생성
                 let code;
                 do { code = generateCode(); } while (rooms[code]);
 
-                const hostPlayerId = playerIdForSocket(ws, msg.hostPlayerId);
                 rooms[code] = {
                     host: ws,
                     guest: null,
@@ -3608,11 +3645,13 @@ wss.on('connection', (ws, req) => {
                     hostCharacterId: enumToken(msg.hostCharacterId),
                     hostPassiveId: enumToken(msg.hostPassiveId),
                     arenaId: requestedMatchMode === 'ranked'
-                        ? RANKED_ARENA_ID
+                        ? randomRankedArenaId()
                         : enumToken(msg.arenaId),
                     battleType: requestedMatchMode === 'ranked'
                         ? RANKED_BATTLE_TYPE
                         : battleType(msg.battleType),
+                    debugNoKo: msg.debugNoKo === true,
+                    debugNoTime: msg.debugNoTime === true,
                     matchMode: requestedMatchMode,
                     rulesetVersion: packetInt(msg, 'rulesetVersion'),
                     hostNickname: typeof msg.hostNickname === 'string' ? msg.hostNickname : undefined,
@@ -3652,7 +3691,10 @@ wss.on('connection', (ws, req) => {
                     type: 'room_created',
                     code,
                     networkMode: rooms[code].networkMode,
+                    arenaId: rooms[code].arenaId,
                     battleType: rooms[code].battleType,
+                    debugNoKo: rooms[code].debugNoKo,
+                    debugNoTime: rooms[code].debugNoTime,
                     matchMode: rooms[code].matchMode,
                 });
                 broadcastRoomUpsert(code);
@@ -3745,6 +3787,8 @@ wss.on('connection', (ws, req) => {
                     hostPassiveId: room.hostPassiveId,
                     arenaId: room.arenaId,
                     battleType: room.battleType,
+                    debugNoKo: room.debugNoKo,
+                    debugNoTime: room.debugNoTime,
                     matchMode: room.matchMode,
                     hostNickname: room.hostNickname,
                     hostPlayerId: room.hostPlayerId,
@@ -3756,6 +3800,8 @@ wss.on('connection', (ws, req) => {
                     guestPassiveId: room.guestPassiveId,
                     arenaId: room.guestArenaId,
                     battleType: room.battleType,
+                    debugNoKo: room.debugNoKo,
+                    debugNoTime: room.debugNoTime,
                     matchMode: room.matchMode,
                     guestNickname: room.guestNickname,
                     guestPlayerId: room.guestPlayerId,
@@ -3902,7 +3948,7 @@ wss.on('connection', (ws, req) => {
                     room.hostVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : room.hostVersionName;
                     room.hostAnalyticsChannel = normalizeAnalyticsChannel(msg.analyticsChannel || room.hostAnalyticsChannel);
                     room.arenaId = room.matchMode === 'ranked'
-                        ? RANKED_ARENA_ID
+                        ? room.arenaId
                         : (enumToken(msg.arenaId) || room.arenaId);
                     room.battleType = room.matchMode === 'ranked'
                         ? RANKED_BATTLE_TYPE
@@ -3911,9 +3957,12 @@ wss.on('connection', (ws, req) => {
                         ...msg,
                         arenaId: room.arenaId,
                         battleType: room.battleType,
+                        debugNoKo: room.debugNoKo,
+                        debugNoTime: room.debugNoTime,
                         matchMode: room.matchMode || 'friendly',
                         activeTransport: requestedTransport,
                         matchId: room.matchId,
+                        matchSequence: room.matchSequence,
                     };
                     const peer = ws.role === 'host' ? room.guest : room.host;
                     send(peer, gameStartPacket, { relay: true });
