@@ -3773,7 +3773,9 @@ wss.on('connection', (ws, req) => {
                 room.guest = ws;
                 room.guestCharacterId = enumToken(msg.guestCharacterId);
                 room.guestPassiveId = enumToken(msg.guestPassiveId);
-                room.guestArenaId = enumToken(msg.arenaId);
+                room.guestArenaId = room.matchMode === 'ranked'
+                    ? room.arenaId
+                    : enumToken(msg.arenaId);
                 room.guestNickname = typeof msg.guestNickname === 'string' ? msg.guestNickname : undefined;
                 room.guestPlayerId = guestPlayerId || undefined;
                 room.guestVersionCode = packetInt(msg, 'clientVersionCode');
@@ -3808,7 +3810,7 @@ wss.on('connection', (ws, req) => {
                     networkMode: room.networkMode || 'relay',
                     guestCharacterId: room.guestCharacterId,
                     guestPassiveId: room.guestPassiveId,
-                    arenaId: room.guestArenaId,
+                    arenaId: room.matchMode === 'ranked' ? room.arenaId : room.guestArenaId,
                     battleType: room.battleType,
                     debugNoKo: room.debugNoKo,
                     debugNoTime: room.debugNoTime,
@@ -3868,12 +3870,17 @@ wss.on('connection', (ws, req) => {
                 } else if (ws.role === 'guest') {
                     room.guestCharacterId = enumToken(msg.characterId) || room.guestCharacterId;
                     room.guestPassiveId = enumToken(msg.passiveId) || room.guestPassiveId;
-                    room.guestArenaId = enumToken(msg.arenaId) || room.guestArenaId;
+                    room.guestArenaId = room.matchMode === 'ranked'
+                        ? room.arenaId
+                        : (enumToken(msg.arenaId) || room.guestArenaId);
                     room.guestNickname = typeof msg.nickname === 'string' ? msg.nickname : room.guestNickname;
                     room.guestPlayerId = typeof msg.playerId === 'string' ? msg.playerId : room.guestPlayerId;
                 }
                 const peer = ws.role === 'host' ? room.guest : room.host;
-                send(peer, msg);
+                const selectionPacket = room.matchMode === 'ranked'
+                    ? { ...msg, arenaId: room.arenaId, battleType: room.battleType }
+                    : msg;
+                send(peer, selectionPacket);
                 if (ws.role === 'host' && !room.guest) broadcastRoomUpsert(code);
                 break;
             }

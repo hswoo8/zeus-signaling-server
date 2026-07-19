@@ -532,6 +532,36 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(roomJoined.debugNoTime, false);
     assert.equal(roomJoined.battleType, 'short');
     assert.equal(roomJoined.arenaId, created.arenaId);
+    assert.equal(guestJoined.arenaId, created.arenaId);
+
+    const nonAuthoritativeArena = created.arenaId === 'CLASSIC_OLYMPUS'
+        ? 'SKY_OLYMPUS'
+        : 'CLASSIC_OLYMPUS';
+    guest.send(JSON.stringify({
+        type: 'selection_update',
+        ...versionFields,
+        characterId: guestPlayer.characterId,
+        passiveId: guestPlayer.passiveId,
+        arenaId: nonAuthoritativeArena,
+        battleType: 'long',
+        ready: false,
+    }));
+    const guestSelectionAtHost = await hostInbox.type('selection_update');
+    assert.equal(guestSelectionAtHost.arenaId, created.arenaId);
+    assert.equal(guestSelectionAtHost.battleType, 'short');
+
+    host.send(JSON.stringify({
+        type: 'selection_update',
+        ...versionFields,
+        characterId: hostPlayer.characterId,
+        passiveId: hostPlayer.passiveId,
+        arenaId: nonAuthoritativeArena,
+        battleType: 'long',
+        ready: false,
+    }));
+    const hostSelectionAtGuest = await guestInbox.type('selection_update');
+    assert.equal(hostSelectionAtGuest.arenaId, created.arenaId);
+    assert.equal(hostSelectionAtGuest.battleType, 'short');
 
     host.send(JSON.stringify({ type: 'game_start', ...versionFields }));
     const [assigned, started] = await Promise.all([
