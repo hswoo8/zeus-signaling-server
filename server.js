@@ -3236,6 +3236,7 @@ async function matchmakingRatingForSocket(ws, claimedPlayerId, refresh = false) 
         console.warn(`[matchmaking] MMR lookup failed: ${error?.message || 'unknown error'}`);
     }
     ws.matchmakingRating = Number.isFinite(player?.rating) ? player.rating : 1000;
+    ws.matchmakingMatches = player ? playerMatchCount(player) : 0;
     ws.matchmakingRatingLoadedAt = now;
     return ws.matchmakingRating;
 }
@@ -3348,6 +3349,8 @@ function resetGuestSlot(room) {
     room.guestArenaId = undefined;
     room.guestNickname = undefined;
     room.guestPlayerId = undefined;
+    room.guestRating = undefined;
+    room.guestMatches = undefined;
     room.guestVersionCode = undefined;
     room.guestVersionName = undefined;
     room.guestCountryCode = undefined;
@@ -3412,6 +3415,8 @@ function leaveWaitingRoom(ws, notifyLeaver = false) {
         room.arenaId = room.guestArenaId || room.arenaId;
         room.hostNickname = room.guestNickname;
         room.hostPlayerId = room.guestPlayerId;
+        room.hostRating = room.guestRating;
+        room.hostMatches = room.guestMatches;
         room.hostVersionCode = room.guestVersionCode;
         room.hostVersionName = room.guestVersionName;
         room.hostAnalyticsChannel = room.guestAnalyticsChannel;
@@ -3427,6 +3432,8 @@ function leaveWaitingRoom(ws, notifyLeaver = false) {
             arenaId: room.arenaId,
             battleType: room.battleType,
             matchMode: room.matchMode,
+            hostRating: room.hostRating,
+            hostMatches: room.hostMatches,
             debugNoKo: room.debugNoKo,
             debugNoTime: room.debugNoTime,
         });
@@ -3630,6 +3637,9 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
                 const hostPlayerId = playerIdForSocket(ws, msg.hostPlayerId);
+                const hostRating = requestedMatchMode === 'ranked'
+                    ? await matchmakingRatingForSocket(ws, msg.hostPlayerId)
+                    : null;
                 removeDuplicateWaitingRoomsForPlayer(hostPlayerId, ws);
                 const capacity = capacitySnapshot({ connectionExtra: 0 });
                 if (!capacity.canCreateRoom) {
@@ -3660,9 +3670,8 @@ wss.on('connection', (ws, req) => {
                     rulesetVersion: packetInt(msg, 'rulesetVersion'),
                     hostNickname: typeof msg.hostNickname === 'string' ? msg.hostNickname : undefined,
                     hostPlayerId: hostPlayerId || undefined,
-                    hostRating: requestedMatchMode === 'ranked'
-                        ? await matchmakingRatingForSocket(ws, msg.hostPlayerId)
-                        : null,
+                    hostRating,
+                    hostMatches: requestedMatchMode === 'ranked' ? (ws.matchmakingMatches || 0) : null,
                     hostVersionCode: packetInt(msg, 'clientVersionCode'),
                     hostVersionName: typeof msg.clientVersionName === 'string' ? msg.clientVersionName : undefined,
                     hostAnalyticsChannel: normalizeAnalyticsChannel(msg.analyticsChannel),
@@ -3673,6 +3682,8 @@ wss.on('connection', (ws, req) => {
                     guestArenaId: undefined,
                     guestNickname: undefined,
                     guestPlayerId: undefined,
+                    guestRating: undefined,
+                    guestMatches: undefined,
                     guestVersionCode: undefined,
                     guestVersionName: undefined,
                     guestAnalyticsChannel: undefined,
@@ -3703,6 +3714,8 @@ wss.on('connection', (ws, req) => {
                     debugNoKo: rooms[code].debugNoKo,
                     debugNoTime: rooms[code].debugNoTime,
                     matchMode: rooms[code].matchMode,
+                    hostRating: rooms[code].hostRating,
+                    hostMatches: rooms[code].hostMatches,
                 });
                 broadcastRoomUpsert(code);
                 console.log(`[+] Room created: ${code}`);
@@ -3771,6 +3784,9 @@ wss.on('connection', (ws, req) => {
                 }
 
                 room.guest = ws;
+                const guestRating = room.matchMode === 'ranked'
+                    ? await matchmakingRatingForSocket(ws, msg.guestPlayerId)
+                    : null;
                 room.guestCharacterId = enumToken(msg.guestCharacterId);
                 room.guestPassiveId = enumToken(msg.guestPassiveId);
                 room.guestArenaId = room.matchMode === 'ranked'
@@ -3778,6 +3794,8 @@ wss.on('connection', (ws, req) => {
                     : enumToken(msg.arenaId);
                 room.guestNickname = typeof msg.guestNickname === 'string' ? msg.guestNickname : undefined;
                 room.guestPlayerId = guestPlayerId || undefined;
+                room.guestRating = guestRating;
+                room.guestMatches = room.matchMode === 'ranked' ? (ws.matchmakingMatches || 0) : null;
                 room.guestVersionCode = packetInt(msg, 'clientVersionCode');
                 room.guestVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : undefined;
                 room.guestAnalyticsChannel = normalizeAnalyticsChannel(msg.analyticsChannel);
@@ -3804,6 +3822,10 @@ wss.on('connection', (ws, req) => {
                     matchMode: room.matchMode,
                     hostNickname: room.hostNickname,
                     hostPlayerId: room.hostPlayerId,
+                    hostRating: room.hostRating,
+                    hostMatches: room.hostMatches,
+                    guestRating: room.guestRating,
+                    guestMatches: room.guestMatches,
                 });
                 send(room.host, {
                     type: 'guest_joined',
@@ -3817,6 +3839,10 @@ wss.on('connection', (ws, req) => {
                     matchMode: room.matchMode,
                     guestNickname: room.guestNickname,
                     guestPlayerId: room.guestPlayerId,
+                    hostRating: room.hostRating,
+                    hostMatches: room.hostMatches,
+                    guestRating: room.guestRating,
+                    guestMatches: room.guestMatches,
                 });
                 broadcastRoomRemoved(code);
                 console.log(`[+] Room joined: ${code}`);

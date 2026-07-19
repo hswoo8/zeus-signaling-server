@@ -383,6 +383,8 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(rankedAdded.room.battleType, 'short');
     assert.ok(['CLASSIC_OLYMPUS', 'SKY_OLYMPUS'].includes(rankedCreated.arenaId));
     assert.equal(rankedAdded.room.arenaId, rankedCreated.arenaId);
+    assert.equal(rankedAdded.room.hostRating, undefined);
+    assert.equal(rankedAdded.room.hostMatches, undefined);
     assert.equal(rankedAdded.room.ratingDifference, 0);
     assert.equal(typeof rankedAdded.room.waitingMs, 'number');
 
@@ -510,6 +512,8 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     const created = await hostInbox.type('room_created');
     assert.equal(created.battleType, 'short');
     assert.ok(['CLASSIC_OLYMPUS', 'SKY_OLYMPUS'].includes(created.arenaId));
+    assert.equal(created.hostRating, 1000);
+    assert.equal(created.hostMatches, 0);
     assert.equal(created.debugNoKo, true);
     assert.equal(created.debugNoTime, false);
     guest.send(JSON.stringify({
@@ -533,6 +537,14 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(roomJoined.battleType, 'short');
     assert.equal(roomJoined.arenaId, created.arenaId);
     assert.equal(guestJoined.arenaId, created.arenaId);
+    assert.equal(roomJoined.hostRating, 1000);
+    assert.equal(roomJoined.hostMatches, 0);
+    assert.equal(roomJoined.guestRating, 1000);
+    assert.equal(roomJoined.guestMatches, 0);
+    assert.equal(guestJoined.hostRating, 1000);
+    assert.equal(guestJoined.hostMatches, 0);
+    assert.equal(guestJoined.guestRating, 1000);
+    assert.equal(guestJoined.guestMatches, 0);
 
     const nonAuthoritativeArena = created.arenaId === 'CLASSIC_OLYMPUS'
         ? 'SKY_OLYMPUS'
