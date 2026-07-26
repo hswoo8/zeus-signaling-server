@@ -53,6 +53,8 @@ const RANK_PLACEMENT_MATCHES = envInt(['RANK_PLACEMENT_MATCHES'], 10);
 const RANK_PLACEMENT_K = envInt(['RANK_PLACEMENT_K'], 48);
 const RANK_ESTABLISHED_K = envInt(['RANK_ESTABLISHED_K'], 24);
 const RANK_ELO_SPREAD = envInt(['RANK_ELO_SPREAD'], 400);
+const COUNTRY_MATCH_EXPANSION_MS = envInt(['COUNTRY_MATCH_EXPANSION_MS'], 15000);
+const QUALITY_REJECT_COOLDOWN_MS = envInt(['QUALITY_REJECT_COOLDOWN_MS'], 5 * 60 * 1000);
 const INTEGRITY_INVALID_FLAG_THRESHOLD = envInt(['INTEGRITY_INVALID_FLAG_THRESHOLD'], 3);
 const INTEGRITY_HP_MISMATCH_FLAG_THRESHOLD = envInt(['INTEGRITY_HP_MISMATCH_FLAG_THRESHOLD'], 3);
 const INTEGRITY_REPORT_MAX_SKEW_MS = envInt(['INTEGRITY_REPORT_MAX_SKEW_MS'], 5000);
@@ -105,6 +107,16 @@ const SERVER_ALLOWED_CHANNELS = envTokenSet(
     'SERVER_ALLOWED_CHANNELS',
     SERVER_CHANNEL === 'unrestricted' ? [] : [SERVER_CHANNEL]
 );
+const NICKNAME_EXACT_RESERVED_NAMES = new Set(['gm'].map(nicknameModerationKey));
+const NICKNAME_RESERVED_FRAGMENTS = new Set([
+    'admin', 'administrator', 'moderator', 'operator', 'minizeus', 'bakingstudio',
+    '관리자', '미니제우스', '운영자',
+].map(nicknameModerationKey));
+const NICKNAME_BLOCKED_FRAGMENTS = new Set([
+    'bitch', 'boji', 'bozi', 'cunt', 'faggot', 'fuck', 'nigger', 'shit', 'whore',
+    '개새끼', '느금마', '니애미', '병신', '보지', '시발', '씨발', '자지', '좆',
+    ...String(process.env.NICKNAME_BLOCKED_TERMS || '').split(','),
+].map(nicknameModerationKey).filter(Boolean));
 const NETWORK_MODES = new Set(['auto', 'relay', 'p2p']);
 const BATTLE_TYPES = new Set(['short', 'standard', 'long']);
 const statsPool = DATABASE_URL ? new Pool({
@@ -175,8 +187,10 @@ function randomRankedArenaId(previousArenaId = null) {
 }
 
 const GAME_TYPES = new Set([
-    'game_start', 'game_ready', 'game_state', 'game_skill', 'game_damage',
-    'game_state_hp', 'game_emote', 'game_over', 'game_start_failed', 'rematch_accept', 'rematch_decline',
+    'game_start', 'game_ready', 'game_state', 'game_skill', 'game_hit_claim',
+    'game_damage', 'game_damage_confirm',
+    'game_state_hp', 'game_emote', 'game_latency_probe', 'game_latency_ack', 'game_transport_ready',
+    'game_over', 'game_start_failed', 'rematch_accept', 'rematch_decline',
     'rematch_request', 'rematch_cancel', 'rematch_reselect', 'rematch_ready',
     'game_pause', 'game_resume', 'game_countdown_sync', 'game_audit',
 ]);
@@ -1802,9 +1816,41 @@ function makeServerMatchId() {
 
 function normalizeNicknameInput(value, fallback = null) {
     if (typeof value !== 'string') return fallback;
-    const trimmed = value.trim();
-    if (!trimmed || trimmed.length > 24 || /[\u0000-\u001F\u007F]/.test(trimmed)) return fallback;
-    return trimmed;
+    if (/[\u0000-\u001F\u007F]/.test(value)) return fallback;
+    const normalized = value.trim().replace(/\s+/g, ' ');
+    if (!normalized || normalized.length < 2 || normalized.length > 16) return fallback;
+    if (!/^[A-Za-z0-9가-힣ㄱ-ㅎㅏ-ㅣ._ -]+$/u.test(normalized)) return fallback;
+    const moderationKey = nicknameModerationKey(normalized);
+    if (NICKNAME_EXACT_RESERVED_NAMES.has(moderationKey) ||
+        [...NICKNAME_RESERVED_FRAGMENTS].some((fragment) => moderationKey.includes(fragment)) ||
+        [...NICKNAME_BLOCKED_FRAGMENTS].some((fragment) => moderationKey.includes(fragment))) {
+        return fallback;
+    }
+    return normalized;
+}
+
+function nicknameModerationKey(value) {
+    return String(value || '')
+        .trim()
+        .normalize('NFKC')
+        .toLocaleLowerCase('en-US')
+        .replaceAll('0', 'o')
+        .replaceAll('1', 'i')
+        .replaceAll('3', 'e')
+        .replaceAll('4', 'a')
+        .replaceAll('5', 's')
+        .replaceAll('7', 't')
+        .replace(/[^a-z0-9가-힣ㄱ-ㅎㅏ-ㅣ]/gu, '');
+}
+
+function normalizeMessageNicknames(msg) {
+    for (const field of ['nickname', 'hostNickname', 'guestNickname']) {
+        if (!Object.prototype.hasOwnProperty.call(msg, field)) continue;
+        const normalized = normalizeNicknameInput(msg[field]);
+        if (!normalized) return field;
+        msg[field] = normalized;
+    }
+    return null;
 }
 
 function nicknameKey(value) {
@@ -3253,6 +3299,39 @@ function roomOwnedByViewer(room, viewer) {
     return Boolean(viewerPlayerId && hostPlayerId && viewerPlayerId === hostPlayerId);
 }
 
+function normalizedCountryCode(value) {
+    const country = String(value || '').trim().toUpperCase();
+    return /^[A-Z]{2}$/.test(country) && country !== 'ZZ' ? country : null;
+}
+
+function roomMatchesViewerCountry(room, viewer) {
+    const hostCountry = normalizedCountryCode(room?.hostCountryCode);
+    const viewerCountry = normalizedCountryCode(viewer?.analyticsCountryCode);
+    return !hostCountry || !viewerCountry || hostCountry === viewerCountry;
+}
+
+function roomExpandedBeyondCountry(room) {
+    return Date.now() - (Number(room?.createdAt) || Date.now()) >= COUNTRY_MATCH_EXPANSION_MS;
+}
+
+function qualityRejectedForPlayer(room, playerId) {
+    const normalizedPlayerId = normalizePlayerId(playerId);
+    if (!room?.qualityRejectedPlayers || !normalizedPlayerId) return false;
+    const expiresAt = Number(room.qualityRejectedPlayers.get(normalizedPlayerId)) || 0;
+    if (expiresAt <= Date.now()) {
+        room.qualityRejectedPlayers.delete(normalizedPlayerId);
+        return false;
+    }
+    return true;
+}
+
+function rememberQualityRejectedPlayer(room, playerId) {
+    const normalizedPlayerId = normalizePlayerId(playerId);
+    if (!room || !normalizedPlayerId) return;
+    if (!room.qualityRejectedPlayers) room.qualityRejectedPlayers = new Map();
+    room.qualityRejectedPlayers.set(normalizedPlayerId, Date.now() + QUALITY_REJECT_COOLDOWN_MS);
+}
+
 function removeDuplicateWaitingRoomsForPlayer(playerId, currentSocket) {
     const normalizedPlayerId = normalizePlayerId(playerId);
     if (!normalizedPlayerId) return 0;
@@ -3288,6 +3367,14 @@ function roomListEntry(code, room, viewer, viewerRating = 1000) {
     if (roomOwnedByViewer(room, viewer)) {
         return null;
     }
+    const viewerPlayerId = playerIdForSocket(viewer, viewer?.matchmakingPlayerId);
+    if (qualityRejectedForPlayer(room, viewerPlayerId)) {
+        return null;
+    }
+    const sameCountry = roomMatchesViewerCountry(room, viewer);
+    if (!sameCountry && !roomExpandedBeyondCountry(room)) {
+        return null;
+    }
     if (room.networkMode === 'relay' && !relayAvailabilitySnapshot().canStartNewMatch) {
         return null;
     }
@@ -3302,6 +3389,7 @@ function roomListEntry(code, room, viewer, viewerRating = 1000) {
         networkMode: room.networkMode || 'relay',
         region: room.hostRegion || null,
         relayRegion: SERVER_POOL_ID,
+        sameCountry,
         ...(ranked ? {
             ratingDifference: Math.abs((Number(room.hostRating) || 1000) - viewerRating),
             waitingMs: Math.max(0, Date.now() - room.createdAt),
@@ -3313,6 +3401,138 @@ function roomListSnapshot(viewer, requestedMatchMode = 'friendly', viewerRating 
     return Object.keys(rooms)
         .map((code) => roomListEntry(code, rooms[code], viewer, viewerRating))
         .filter((entry) => entry && entry.matchMode === requestedMatchMode);
+}
+
+function bestRankedWaitingRoom(viewer, viewerRating = 1000) {
+    return Object.keys(rooms)
+        .map((code) => roomListEntry(code, rooms[code], viewer, viewerRating))
+        .filter((entry) => entry?.matchMode === 'ranked')
+        .sort((left, right) => {
+            if (left.sameCountry !== right.sameCountry) return left.sameCountry ? -1 : 1;
+            if (left.ratingDifference !== right.ratingDifference) {
+                return left.ratingDifference - right.ratingDifference;
+            }
+            if (left.waitingMs !== right.waitingMs) return right.waitingMs - left.waitingMs;
+            return left.code.localeCompare(right.code);
+        })[0] || null;
+}
+
+async function attachGuestToRoom(ws, msg, code, room, guestPlayerId) {
+    room.guest = ws;
+    const guestRating = room.matchMode === 'ranked'
+        ? await matchmakingRatingForSocket(ws, guestPlayerId)
+        : null;
+    room.guestCharacterId = enumToken(msg.guestCharacterId);
+    room.guestPassiveId = enumToken(msg.guestPassiveId);
+    room.guestArenaId = room.matchMode === 'ranked'
+        ? room.arenaId
+        : enumToken(msg.arenaId);
+    room.guestNickname = typeof msg.guestNickname === 'string' ? msg.guestNickname : undefined;
+    room.guestPlayerId = guestPlayerId || undefined;
+    room.guestRating = guestRating;
+    room.guestMatches = room.matchMode === 'ranked' ? (ws.matchmakingMatches || 0) : null;
+    room.guestVersionCode = packetInt(msg, 'clientVersionCode');
+    room.guestVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : undefined;
+    room.guestAnalyticsChannel = normalizeAnalyticsChannel(msg.analyticsChannel);
+    room.guestCountryCode = ws.analyticsCountryCode;
+    room.guestUserAgent = ws.analyticsUserAgent;
+    ws.roomCode = code;
+    ws.role = 'guest';
+    ws.matchmakingPlayerId = guestPlayerId;
+    if (room.matchMode === 'ranked') {
+        ws.lastRankedArenaId = room.arenaId;
+    }
+
+    send(ws, {
+        type: 'room_joined',
+        code,
+        networkMode: room.networkMode || 'relay',
+        hostCharacterId: room.hostCharacterId,
+        hostPassiveId: room.hostPassiveId,
+        arenaId: room.arenaId,
+        battleType: room.battleType,
+        debugNoKo: room.debugNoKo,
+        debugNoTime: room.debugNoTime,
+        matchMode: room.matchMode,
+        hostNickname: room.hostNickname,
+        hostPlayerId: room.hostPlayerId,
+        hostRating: room.hostRating,
+        hostMatches: room.hostMatches,
+        guestRating: room.guestRating,
+        guestMatches: room.guestMatches,
+    });
+    send(room.host, {
+        type: 'guest_joined',
+        networkMode: room.networkMode || 'relay',
+        guestCharacterId: room.guestCharacterId,
+        guestPassiveId: room.guestPassiveId,
+        arenaId: room.matchMode === 'ranked' ? room.arenaId : room.guestArenaId,
+        battleType: room.battleType,
+        debugNoKo: room.debugNoKo,
+        debugNoTime: room.debugNoTime,
+        matchMode: room.matchMode,
+        guestNickname: room.guestNickname,
+        guestPlayerId: room.guestPlayerId,
+        hostRating: room.hostRating,
+        hostMatches: room.hostMatches,
+        guestRating: room.guestRating,
+        guestMatches: room.guestMatches,
+    });
+    broadcastRoomRemoved(code);
+    console.log(`[+] Room joined: ${code}`);
+}
+
+async function reconcileRankedWaitingRooms() {
+    const waitingRooms = Object.entries(rooms)
+        .filter(([, room]) =>
+            room?.matchMode === 'ranked' &&
+            !room.matchStarted &&
+            !room.guest &&
+            room.host?.readyState === WebSocket.OPEN
+        )
+        .sort(([, left], [, right]) => left.createdAt - right.createdAt);
+
+    for (const [sourceCode, sourceRoom] of waitingRooms) {
+        const sourceSocket = sourceRoom.host;
+        if (sourceSocket.roomCode !== sourceCode || sourceSocket.role !== 'host') continue;
+        const sourceRating = Number(sourceRoom.hostRating) || 1000;
+        const candidate = bestRankedWaitingRoom(sourceSocket, sourceRating);
+        if (!candidate || candidate.code === sourceCode) continue;
+        const targetRoom = rooms[candidate.code];
+        if (!targetRoom || targetRoom.guest || targetRoom.host?.readyState !== WebSocket.OPEN) continue;
+
+        delete rooms[sourceCode];
+        sourceSocket.roomCode = null;
+        sourceSocket.role = null;
+        broadcastRoomRemoved(sourceCode);
+        await attachGuestToRoom(
+            sourceSocket,
+            {
+                guestCharacterId: sourceRoom.hostCharacterId,
+                guestPassiveId: sourceRoom.hostPassiveId,
+                guestNickname: sourceRoom.hostNickname,
+                guestPlayerId: sourceRoom.hostPlayerId,
+                clientVersionCode: sourceRoom.hostVersionCode,
+                clientVersionName: sourceRoom.hostVersionName,
+                analyticsChannel: sourceRoom.hostAnalyticsChannel,
+            },
+            candidate.code,
+            targetRoom,
+            sourceRoom.hostPlayerId
+        );
+        console.log(`[matchmaking] Expanded ranked rooms merged: ${sourceCode} -> ${candidate.code}`);
+        return true;
+    }
+    return false;
+}
+
+function scheduleRankedRoomExpansion() {
+    const timer = setTimeout(() => {
+        reconcileRankedWaitingRooms().catch((error) => {
+            console.warn(`[matchmaking] Ranked expansion failed: ${error?.message || 'unknown error'}`);
+        });
+    }, COUNTRY_MATCH_EXPANSION_MS + 50);
+    timer.unref?.();
 }
 
 function broadcastRoomUpsert(code) {
@@ -3423,6 +3643,7 @@ function leaveWaitingRoom(ws, notifyLeaver = false) {
         room.hostCountryCode = room.guestCountryCode;
         room.hostUserAgent = room.guestUserAgent;
         resetGuestSlot(room);
+        room.qualityRejectedPlayers = new Map();
         promotedHost.role = 'host';
         promotedHost.roomCode = code;
         send(promotedHost, {
@@ -3604,6 +3825,15 @@ wss.on('connection', (ws, req) => {
             });
             return;
         }
+        const invalidNicknameField = normalizeMessageNicknames(msg);
+        if (invalidNicknameField) {
+            send(ws, {
+                type: 'error',
+                code: 'nickname_invalid',
+                message: `${invalidNicknameField} is not allowed`,
+            });
+            return;
+        }
 
         switch (msg.type) {
             case 'ping_check': {
@@ -3641,6 +3871,34 @@ wss.on('connection', (ws, req) => {
                     ? await matchmakingRatingForSocket(ws, msg.hostPlayerId)
                     : null;
                 removeDuplicateWaitingRoomsForPlayer(hostPlayerId, ws);
+                const rankedCandidate = requestedMatchMode === 'ranked'
+                    ? bestRankedWaitingRoom(ws, hostRating)
+                    : null;
+                if (rankedCandidate) {
+                    const joinCapacity = capacitySnapshot({ connectionExtra: 0 });
+                    if (!joinCapacity.canJoinRoom) {
+                        sendCapacityWsError(ws, joinCapacity);
+                        return;
+                    }
+                    const room = rooms[rankedCandidate.code];
+                    if (room && !room.guest && room.host?.readyState === WebSocket.OPEN) {
+                        await attachGuestToRoom(
+                            ws,
+                            {
+                                ...msg,
+                                guestCharacterId: msg.hostCharacterId,
+                                guestPassiveId: msg.hostPassiveId,
+                                guestNickname: msg.hostNickname,
+                                guestPlayerId: msg.hostPlayerId,
+                            },
+                            rankedCandidate.code,
+                            room,
+                            hostPlayerId
+                        );
+                        console.log(`[matchmaking] Atomic ranked join: ${rankedCandidate.code}`);
+                        break;
+                    }
+                }
                 const capacity = capacitySnapshot({ connectionExtra: 0 });
                 if (!capacity.canCreateRoom) {
                     sendCapacityWsError(ws, capacity);
@@ -3695,6 +3953,7 @@ wss.on('connection', (ws, req) => {
                     matchId: null,
                     matchSequence: 0,
                     finalResult: null,
+                    qualityRejectedPlayers: new Map(),
                     battleStartAtMs: null,
                     matchStartedAtMs: null,
                 };
@@ -3718,6 +3977,9 @@ wss.on('connection', (ws, req) => {
                     hostMatches: rooms[code].hostMatches,
                 });
                 broadcastRoomUpsert(code);
+                if (requestedMatchMode === 'ranked') {
+                    scheduleRankedRoomExpansion();
+                }
                 console.log(`[+] Room created: ${code}`);
                 break;
             }
@@ -3771,6 +4033,14 @@ wss.on('connection', (ws, req) => {
                     });
                     return;
                 }
+                if (qualityRejectedForPlayer(room, guestPlayerId)) {
+                    send(ws, {
+                        type: 'error',
+                        code: 'network_quality_recently_failed',
+                        message: 'This room recently failed the network quality check',
+                    });
+                    return;
+                }
                 if (room.guest && room.guest.readyState === WebSocket.OPEN) {
                     send(ws, { type: 'error', code: 'room_full', message: 'Room is full' });
                     return;
@@ -3783,69 +4053,7 @@ wss.on('connection', (ws, req) => {
                     }
                 }
 
-                room.guest = ws;
-                const guestRating = room.matchMode === 'ranked'
-                    ? await matchmakingRatingForSocket(ws, msg.guestPlayerId)
-                    : null;
-                room.guestCharacterId = enumToken(msg.guestCharacterId);
-                room.guestPassiveId = enumToken(msg.guestPassiveId);
-                room.guestArenaId = room.matchMode === 'ranked'
-                    ? room.arenaId
-                    : enumToken(msg.arenaId);
-                room.guestNickname = typeof msg.guestNickname === 'string' ? msg.guestNickname : undefined;
-                room.guestPlayerId = guestPlayerId || undefined;
-                room.guestRating = guestRating;
-                room.guestMatches = room.matchMode === 'ranked' ? (ws.matchmakingMatches || 0) : null;
-                room.guestVersionCode = packetInt(msg, 'clientVersionCode');
-                room.guestVersionName = typeof msg.clientVersionName === 'string' ? msg.clientVersionName : undefined;
-                room.guestAnalyticsChannel = normalizeAnalyticsChannel(msg.analyticsChannel);
-                room.guestCountryCode = ws.analyticsCountryCode;
-                room.guestUserAgent = ws.analyticsUserAgent;
-                ws.roomCode = code;
-                ws.role = 'guest';
-                ws.matchmakingPlayerId = guestPlayerId;
-                if (room.matchMode === 'ranked') {
-                    ws.lastRankedArenaId = room.arenaId;
-                }
-
-                // 양쪽에게 준비 알림
-                send(ws, {
-                    type: 'room_joined',
-                    code,
-                    networkMode: room.networkMode || 'relay',
-                    hostCharacterId: room.hostCharacterId,
-                    hostPassiveId: room.hostPassiveId,
-                    arenaId: room.arenaId,
-                    battleType: room.battleType,
-                    debugNoKo: room.debugNoKo,
-                    debugNoTime: room.debugNoTime,
-                    matchMode: room.matchMode,
-                    hostNickname: room.hostNickname,
-                    hostPlayerId: room.hostPlayerId,
-                    hostRating: room.hostRating,
-                    hostMatches: room.hostMatches,
-                    guestRating: room.guestRating,
-                    guestMatches: room.guestMatches,
-                });
-                send(room.host, {
-                    type: 'guest_joined',
-                    networkMode: room.networkMode || 'relay',
-                    guestCharacterId: room.guestCharacterId,
-                    guestPassiveId: room.guestPassiveId,
-                    arenaId: room.matchMode === 'ranked' ? room.arenaId : room.guestArenaId,
-                    battleType: room.battleType,
-                    debugNoKo: room.debugNoKo,
-                    debugNoTime: room.debugNoTime,
-                    matchMode: room.matchMode,
-                    guestNickname: room.guestNickname,
-                    guestPlayerId: room.guestPlayerId,
-                    hostRating: room.hostRating,
-                    hostMatches: room.hostMatches,
-                    guestRating: room.guestRating,
-                    guestMatches: room.guestMatches,
-                });
-                broadcastRoomRemoved(code);
-                console.log(`[+] Room joined: ${code}`);
+                await attachGuestToRoom(ws, msg, code, room, guestPlayerId);
                 break;
             }
 
@@ -3951,15 +4159,54 @@ wss.on('connection', (ws, req) => {
             case 'game_ready':
             case 'game_state':
             case 'game_skill':
+            case 'game_hit_claim':
             case 'game_damage':
+            case 'game_damage_confirm':
             case 'game_state_hp':
             case 'game_emote':
+            case 'game_latency_probe':
+            case 'game_latency_ack':
+            case 'game_transport_ready':
             case 'game_pause':
             case 'game_resume':
             case 'game_audit': {
                 const code = ws.roomCode;
                 const room = rooms[code];
                 if (!room) return;
+
+                if (msg.type === 'game_start_failed') {
+                    if (Number.isFinite(room.battleStartAtMs)) return;
+                    if (room.matchMode === 'friendly' && room.host) {
+                        const host = room.host;
+                        const guest = room.guest;
+                        rememberQualityRejectedPlayer(room, room.guestPlayerId);
+                        if (host !== ws) {
+                            send(host, { ...msg, action: 'host_waiting' });
+                        }
+                        if (guest && guest !== ws) {
+                            send(guest, { ...msg, action: 'guest_removed' });
+                        }
+                        if (guest) {
+                            guest.roomCode = null;
+                            guest.role = null;
+                        }
+                        resetGuestSlot(room);
+                        broadcastRoomUpsert(code);
+                        console.log(`[-] Guest removed after friendly start failure: ${code}`);
+                        break;
+                    }
+                    const peer = ws.role === 'host' ? room.guest : room.host;
+                    send(peer, { ...msg, action: 'room_closed' });
+                    for (const participant of [room.host, room.guest]) {
+                        if (!participant) continue;
+                        participant.roomCode = null;
+                        participant.role = null;
+                    }
+                    delete rooms[code];
+                    broadcastRoomRemoved(code);
+                    console.log(`[-] Room removed after game start failure: ${code}`);
+                    break;
+                }
 
                 if (msg.type === 'game_start') {
                     if (ws.role !== 'host') return;

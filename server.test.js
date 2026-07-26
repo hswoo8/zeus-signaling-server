@@ -111,6 +111,9 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
             RANK_PLACEMENT_MATCHES: '2',
             RANK_PLACEMENT_K: '48',
             RANK_ESTABLISHED_K: '24',
+            COUNTRY_MATCH_EXPANSION_MS: '1000',
+            QUALITY_REJECT_COOLDOWN_MS: '60000',
+            NICKNAME_BLOCKED_TERMS: 'spoilername',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -145,6 +148,48 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     }));
     const missingRoom = await invalidRoomInbox.type('error');
     assert.equal(missingRoom.code, 'room_not_found');
+    invalidRoomClient.send(JSON.stringify({
+        type: 'selection_update',
+        ...versionFields,
+        nickname: '관리자',
+    }));
+    const invalidNickname = await invalidRoomInbox.type('error');
+    assert.equal(invalidNickname.code, 'nickname_invalid');
+    invalidRoomClient.send(JSON.stringify({
+        type: 'selection_update',
+        ...versionFields,
+        nickname: 'OfficialMiniZeus',
+    }));
+    const reservedNickname = await invalidRoomInbox.type('error');
+    assert.equal(reservedNickname.code, 'nickname_invalid');
+    invalidRoomClient.send(JSON.stringify({
+        type: 'selection_update',
+        ...versionFields,
+        nickname: 'boZIna',
+    }));
+    const obfuscatedInvalidNickname = await invalidRoomInbox.type('error');
+    assert.equal(obfuscatedInvalidNickname.code, 'nickname_invalid');
+    invalidRoomClient.send(JSON.stringify({
+        type: 'selection_update',
+        ...versionFields,
+        nickname: 'ㅂㅗㅈㅣ골키퍼',
+    }));
+    const jamoInvalidNickname = await invalidRoomInbox.type('error');
+    assert.equal(jamoInvalidNickname.code, 'nickname_invalid');
+    invalidRoomClient.send(JSON.stringify({
+        type: 'selection_update',
+        ...versionFields,
+        nickname: 'b o z i na',
+    }));
+    const spacedInvalidNickname = await invalidRoomInbox.type('error');
+    assert.equal(spacedInvalidNickname.code, 'nickname_invalid');
+    invalidRoomClient.send(JSON.stringify({
+        type: 'selection_update',
+        ...versionFields,
+        nickname: 'Spoiler_Name',
+    }));
+    const configuredInvalidNickname = await invalidRoomInbox.type('error');
+    assert.equal(configuredInvalidNickname.code, 'nickname_invalid');
     invalidRoomClient.close();
     assert.equal(health.operations.relay.maxActiveMatches, null);
     assert.equal(typeof health.operations.eventLoopLagMs.p95, 'number');
@@ -421,6 +466,86 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     await rankedObserverInbox.type('room_removed');
     rankedObserver.close();
 
+    const atomicRankedHost = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const atomicRankedGuest = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const atomicRankedHostInbox = createInbox(atomicRankedHost);
+    const atomicRankedGuestInbox = createInbox(atomicRankedGuest);
+    atomicRankedHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'ranked',
+        hostPlayerId: 'atomic-ranked-host',
+        hostCharacterId: 'ZEUS',
+        hostPassiveId: 'IRON_WILL',
+    }));
+    const atomicRankedRoom = await atomicRankedHostInbox.type('room_created');
+    atomicRankedGuest.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'ranked',
+        hostPlayerId: 'atomic-ranked-guest',
+        hostCharacterId: 'TRICKSTER',
+        hostPassiveId: 'LUCKY_WITCH',
+    }));
+    const [atomicGuestJoined, atomicRoomJoined] = await Promise.all([
+        atomicRankedHostInbox.type('guest_joined'),
+        atomicRankedGuestInbox.type('room_joined'),
+    ]);
+    assert.equal(atomicRoomJoined.code, atomicRankedRoom.code);
+    assert.equal(atomicRoomJoined.matchMode, 'ranked');
+    assert.equal(atomicGuestJoined.guestPlayerId, 'atomic-ranked-guest');
+    assert.equal(atomicGuestJoined.guestCharacterId, 'TRICKSTER');
+
+    atomicRankedGuest.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await atomicRankedGuestInbox.type('room_left');
+    atomicRankedHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await atomicRankedHostInbox.type('room_left');
+    atomicRankedHost.close();
+    atomicRankedGuest.close();
+
+    const expandedKrPlayer = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const expandedUsPlayer = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'US' },
+    });
+    const expandedKrInbox = createInbox(expandedKrPlayer);
+    const expandedUsInbox = createInbox(expandedUsPlayer);
+    expandedKrPlayer.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'ranked',
+        hostPlayerId: 'expanded-ranked-kr',
+    }));
+    const expandedKrRoom = await expandedKrInbox.type('room_created');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expandedUsPlayer.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'ranked',
+        hostPlayerId: 'expanded-ranked-us',
+    }));
+    const expandedUsRoom = await expandedUsInbox.type('room_created');
+    assert.notEqual(expandedUsRoom.code, expandedKrRoom.code);
+
+    const [expandedGuestJoined, expandedRoomJoined] = await Promise.all([
+        expandedKrInbox.type('guest_joined'),
+        expandedUsInbox.type('room_joined'),
+    ]);
+    assert.equal(expandedRoomJoined.code, expandedKrRoom.code);
+    assert.equal(expandedGuestJoined.guestPlayerId, 'expanded-ranked-us');
+
+    expandedUsPlayer.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await expandedUsInbox.type('room_left');
+    expandedKrPlayer.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await expandedKrInbox.type('room_left');
+    expandedKrPlayer.close();
+    expandedUsPlayer.close();
+
     const departingHost = await connect(`ws://127.0.0.1:${port}`);
     const promotedGuest = await connect(`ws://127.0.0.1:${port}`);
     const replacementGuest = await connect(`ws://127.0.0.1:${port}`);
@@ -472,6 +597,137 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     departingHost.close();
     promotedGuest.close();
     replacementGuest.close();
+
+    const countryHost = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const countryKrViewer = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const countryUsViewer = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'US' },
+    });
+    const countryHostInbox = createInbox(countryHost);
+    const countryKrInbox = createInbox(countryKrViewer);
+    const countryUsInbox = createInbox(countryUsViewer);
+    countryHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        hostPlayerId: 'country-host',
+        matchMode: 'friendly',
+    }));
+    const countryRoom = await countryHostInbox.type('room_created');
+
+    countryKrViewer.send(JSON.stringify({
+        type: 'get_room_list',
+        ...versionFields,
+        matchMode: 'friendly',
+        playerId: 'country-kr-viewer',
+    }));
+    const sameCountryRooms = await countryKrInbox.type('room_list');
+    const sameCountryEntry = sameCountryRooms.rooms.find((room) => room.code === countryRoom.code);
+    assert.equal(sameCountryEntry.sameCountry, true);
+
+    countryUsViewer.send(JSON.stringify({
+        type: 'get_room_list',
+        ...versionFields,
+        matchMode: 'friendly',
+        playerId: 'country-us-viewer',
+    }));
+    const hiddenCrossCountryRooms = await countryUsInbox.type('room_list');
+    assert.equal(
+        hiddenCrossCountryRooms.rooms.some((room) => room.code === countryRoom.code),
+        false
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1050));
+    countryUsViewer.send(JSON.stringify({
+        type: 'get_room_list',
+        ...versionFields,
+        matchMode: 'friendly',
+        playerId: 'country-us-viewer',
+    }));
+    const expandedCountryRooms = await countryUsInbox.type('room_list');
+    const expandedCountryEntry = expandedCountryRooms.rooms.find((room) => room.code === countryRoom.code);
+    assert.equal(expandedCountryEntry.sameCountry, false);
+
+    countryHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await countryHostInbox.type('room_left');
+    countryHost.close();
+    countryKrViewer.close();
+    countryUsViewer.close();
+
+    const failedStartHost = await connect(`ws://127.0.0.1:${port}`);
+    const failedStartGuest = await connect(`ws://127.0.0.1:${port}`);
+    const failedStartHostInbox = createInbox(failedStartHost);
+    const failedStartGuestInbox = createInbox(failedStartGuest);
+    failedStartHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        hostPlayerId: 'failed-start-host',
+        networkMode: 'p2p',
+    }));
+    const failedStartRoom = await failedStartHostInbox.type('room_created');
+    failedStartGuest.send(JSON.stringify({
+        type: 'join_room',
+        ...versionFields,
+        code: failedStartRoom.code,
+        guestPlayerId: 'failed-start-guest',
+    }));
+    await Promise.all([
+        failedStartHostInbox.type('guest_joined'),
+        failedStartGuestInbox.type('room_joined'),
+    ]);
+    failedStartHost.send(JSON.stringify({
+        type: 'game_start_failed',
+        ...versionFields,
+        code: 'p2p_start_failed',
+    }));
+    const relayedStartFailure = await failedStartGuestInbox.type('game_start_failed');
+    assert.equal(relayedStartFailure.code, 'p2p_start_failed');
+    assert.equal(relayedStartFailure.action, 'guest_removed');
+
+    failedStartGuest.send(JSON.stringify({
+        type: 'get_room_list',
+        ...versionFields,
+        matchMode: 'friendly',
+        playerId: 'failed-start-guest',
+    }));
+    const roomsAfterQualityFailure = await failedStartGuestInbox.type('room_list');
+    assert.equal(
+        roomsAfterQualityFailure.rooms.some((room) => room.code === failedStartRoom.code),
+        false
+    );
+    failedStartGuest.send(JSON.stringify({
+        type: 'join_room',
+        ...versionFields,
+        code: failedStartRoom.code,
+        guestPlayerId: 'failed-start-guest',
+    }));
+    const rejectedFailedPair = await failedStartGuestInbox.type('error');
+    assert.equal(rejectedFailedPair.code, 'network_quality_recently_failed');
+
+    failedStartHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        hostPlayerId: 'failed-start-host',
+    }));
+    const hostStillInRoom = await failedStartHostInbox.type('error');
+    assert.equal(hostStillInRoom.code, 'already_in_room');
+
+    failedStartGuest.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        hostPlayerId: 'failed-start-guest',
+    }));
+    await failedStartGuestInbox.type('room_created');
+    failedStartGuest.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await failedStartGuestInbox.type('room_left');
+
+    failedStartHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    const retainedHostRoomLeft = await failedStartHostInbox.type('room_left');
+    assert.equal(retainedHostRoomLeft.code, failedStartRoom.code);
+    failedStartHost.close();
+    failedStartGuest.close();
 
     const host = await connect(`ws://127.0.0.1:${port}`);
     const guest = await connect(`ws://127.0.0.1:${port}`);
@@ -575,6 +831,30 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(hostSelectionAtGuest.arenaId, created.arenaId);
     assert.equal(hostSelectionAtGuest.battleType, 'short');
 
+    host.send(JSON.stringify({
+        type: 'game_latency_probe',
+        phase: 'setup',
+        probeId: 1,
+    }));
+    const setupLatencyProbe = await guestInbox.type('game_latency_probe');
+    assert.equal(setupLatencyProbe.phase, 'setup');
+    assert.equal(setupLatencyProbe.probeId, 1);
+    guest.send(JSON.stringify({
+        type: 'game_latency_ack',
+        phase: 'setup',
+        probeId: setupLatencyProbe.probeId,
+    }));
+    const setupLatencyAck = await hostInbox.type('game_latency_ack');
+    assert.equal(setupLatencyAck.phase, 'setup');
+    assert.equal(setupLatencyAck.probeId, 1);
+
+    host.send(JSON.stringify({
+        type: 'game_transport_ready',
+        activeTransport: 'relay',
+    }));
+    const transportReady = await guestInbox.type('game_transport_ready');
+    assert.equal(transportReady.activeTransport, 'relay');
+
     host.send(JSON.stringify({ type: 'game_start', ...versionFields }));
     const [assigned, started] = await Promise.all([
         hostInbox.type('match_assigned'),
@@ -588,6 +868,47 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(started.arenaId, created.arenaId);
     assert.equal(started.debugNoKo, true);
     assert.equal(started.debugNoTime, false);
+
+    guest.send(JSON.stringify({
+        type: 'game_damage_confirm',
+        roundId: assigned.matchSequence,
+        eventId: 'damage-confirm-test',
+        sentAtMs: Date.now(),
+        amount: 30,
+        hp: 95,
+        source: 'test_projectile',
+    }));
+    const relayedDamageConfirm = await hostInbox.type('game_damage_confirm');
+    assert.equal(relayedDamageConfirm.eventId, 'damage-confirm-test');
+    assert.equal(relayedDamageConfirm.hp, 95);
+    assert.equal(relayedDamageConfirm.amount, 30);
+
+    host.send(JSON.stringify({
+        type: 'game_hit_claim',
+        roundId: assigned.matchSequence,
+        eventId: 'h-1-s1',
+        skillId: 'lightning_bolt',
+        damage: 30,
+    }));
+    const relayedHitClaim = await guestInbox.type('game_hit_claim');
+    assert.equal(relayedHitClaim.eventId, 'h-1-s1');
+    assert.equal(relayedHitClaim.skillId, 'lightning_bolt');
+    assert.equal(relayedHitClaim.damage, 30);
+
+    host.send(JSON.stringify({
+        type: 'game_latency_probe',
+        roundId: assigned.matchSequence,
+        probeId: 7,
+    }));
+    const relayedLatencyProbe = await guestInbox.type('game_latency_probe');
+    assert.equal(relayedLatencyProbe.probeId, 7);
+    guest.send(JSON.stringify({
+        type: 'game_latency_ack',
+        roundId: assigned.matchSequence,
+        probeId: relayedLatencyProbe.probeId,
+    }));
+    const relayedLatencyAck = await hostInbox.type('game_latency_ack');
+    assert.equal(relayedLatencyAck.probeId, 7);
 
     host.send(JSON.stringify({
         type: 'game_audit',
@@ -657,7 +978,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(backpressureCapacity.backpressure.closedConnections, 0);
     assert.equal(backpressureCapacity.counts.activeRelayMatches, 1);
     assert.equal(backpressureCapacity.counts.activeP2pMatches, 0);
-    assert.equal(backpressureCapacity.operations.relay.packets, 1);
+    assert.equal(backpressureCapacity.operations.relay.packets, 8);
     assert.ok(backpressureCapacity.operations.relay.bytes > 0);
     assert.equal(backpressureCapacity.operations.backpressure.droppedStatePackets, 1);
     assert.equal(backpressureCapacity.relay.canStartNewMatch, true);
