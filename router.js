@@ -15,8 +15,16 @@ const ROUTER_MAINTENANCE_MESSAGE = String(
     process.env.ROUTER_MAINTENANCE_MESSAGE || '대전 서버 점검 중입니다. 잠시 후 다시 시도해주세요.'
 ).trim();
 const ROUTER_STORE_URL = String(process.env.ROUTER_STORE_URL || '').trim();
+const APP_LATEST_VERSION_CODE = positiveInt(process.env.APP_LATEST_VERSION_CODE, 1);
+const APP_MIN_SUPPORTED_VERSION_CODE = positiveInt(process.env.APP_MIN_SUPPORTED_VERSION_CODE, 1);
+const APP_UPDATE_MODE = parseUpdateMode(process.env.APP_UPDATE_MODE);
+const APP_UPDATE_MESSAGE = String(process.env.APP_UPDATE_MESSAGE || '').trim();
 const ROUTER_ALLOW_INSECURE_LOCAL = envBool('ROUTER_ALLOW_INSECURE_LOCAL', false);
 const ROUTES = parseRoutes(process.env.ROUTER_ROUTES_JSON || '[]');
+
+if (APP_MIN_SUPPORTED_VERSION_CODE > APP_LATEST_VERSION_CODE) {
+    throw new Error('APP_MIN_SUPPORTED_VERSION_CODE must not exceed APP_LATEST_VERSION_CODE');
+}
 
 function cleanToken(value, maxLength) {
     return typeof value === 'string'
@@ -31,6 +39,21 @@ function positiveInt(value, fallback = null) {
 
 function optionalMax(value) {
     return positiveInt(value, Number.MAX_SAFE_INTEGER);
+}
+
+function parseUpdateMode(value) {
+    const mode = String(value || 'none').trim().toLowerCase();
+    if (!['none', 'soft', 'force'].includes(mode)) {
+        throw new Error('APP_UPDATE_MODE must be one of none, soft, or force');
+    }
+    return mode;
+}
+
+function parseVersionCode(value) {
+    const raw = String(value ?? '').trim();
+    if (!/^[1-9]\d*$/.test(raw)) return null;
+    const parsed = Number(raw);
+    return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
 function envBool(name, fallback) {
@@ -202,6 +225,54 @@ function routeFor(body) {
     };
 }
 
+function appPolicyFor(channelValue, versionCodeValue) {
+    const channel = cleanToken(channelValue, 24);
+    if (!ROUTER_ALLOWED_CHANNELS.has(channel)) {
+        return {
+            httpStatus: 409,
+            body: {
+                status: 'wrong_environment',
+                code: 'wrong_environment',
+                message: `${channel || 'unknown'} 앱은 ${ROUTER_CHANNEL} 라우터를 사용할 수 없습니다.`,
+            },
+        };
+    }
+
+    const currentVersionCode = parseVersionCode(versionCodeValue);
+    if (!currentVersionCode) {
+        return {
+            httpStatus: 400,
+            body: {
+                status: 'invalid_request',
+                code: 'invalid_request',
+                message: '유효한 versionCode가 필요합니다.',
+            },
+        };
+    }
+
+    let policy = 'none';
+    if (currentVersionCode < APP_MIN_SUPPORTED_VERSION_CODE) {
+        policy = 'force';
+    } else if (currentVersionCode < APP_LATEST_VERSION_CODE) {
+        policy = APP_UPDATE_MODE;
+    }
+
+    return {
+        httpStatus: 200,
+        body: {
+            status: 'ok',
+            code: 'ok',
+            policy,
+            channel: ROUTER_CHANNEL,
+            currentVersionCode,
+            latestVersionCode: APP_LATEST_VERSION_CODE,
+            minSupportedVersionCode: APP_MIN_SUPPORTED_VERSION_CODE,
+            message: policy === 'none' ? null : APP_UPDATE_MESSAGE || null,
+            storeUrl: policy === 'none' ? null : ROUTER_STORE_URL || null,
+        },
+    };
+}
+
 function createRouterServer() {
     return http.createServer(async (req, res) => {
         const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -213,7 +284,20 @@ function createRouterServer() {
                 channel: ROUTER_CHANNEL,
                 routeCount: ROUTES.length,
                 pools: ROUTES.map((route) => route.poolId),
+                appPolicy: {
+                    latestVersionCode: APP_LATEST_VERSION_CODE,
+                    minSupportedVersionCode: APP_MIN_SUPPORTED_VERSION_CODE,
+                    mode: APP_UPDATE_MODE,
+                },
             });
+            return;
+        }
+        if (req.method === 'GET' && url.pathname === '/app-policy') {
+            const result = appPolicyFor(
+                url.searchParams.get('channel'),
+                url.searchParams.get('versionCode')
+            );
+            sendJson(res, result.httpStatus, result.body);
             return;
         }
         if (req.method === 'POST' && url.pathname === '/route') {
@@ -239,4 +323,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { createRouterServer, routeFor };
+module.exports = { appPolicyFor, createRouterServer, routeFor };

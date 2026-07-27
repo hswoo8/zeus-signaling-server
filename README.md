@@ -71,6 +71,34 @@ Set `SERVICE_ROLE=router` to run the stateless `/route` service. Configure `ROUT
 
 Clients must route before capacity/WebSocket connection. The selected game server repeats the channel and version validation, so a bad or stale route cannot mix beta and production rooms. Android debug uses the beta router; production candidates use the production router.
 
+The router also exposes the app-wide update policy independently of multiplayer:
+
+| env | Default | Description |
+| --- | --- | --- |
+| `APP_LATEST_VERSION_CODE` | `1` | Latest published positive Android version code |
+| `APP_MIN_SUPPORTED_VERSION_CODE` | `1` | Oldest version code allowed to continue; must not exceed latest |
+| `APP_UPDATE_MODE` | `none` | Policy for versions below latest but still supported: `none`, `soft`, or `force` |
+| `APP_UPDATE_MESSAGE` | unset | Optional controlled message returned for `soft` or `force`; the current Android Splash keeps localized built-in copy |
+| `ROUTER_STORE_URL` | unset | Optional store URL returned for `soft` or `force` |
+
+Call `GET /app-policy?channel=production&versionCode=123`. The response includes `policy`, `currentVersionCode`, `latestVersionCode`, `minSupportedVersionCode`, and optional update message/store URL. A version below the minimum always gets `force`. A supported version below latest gets the configured policy: `none` hides the update, `soft` offers an optional update, and `force` blocks entry. A version at or above latest gets `none`.
+
+```json
+{
+  "status": "ok",
+  "code": "ok",
+  "policy": "soft",
+  "channel": "production",
+  "currentVersionCode": 123,
+  "latestVersionCode": 125,
+  "minSupportedVersionCode": 120,
+  "message": "새 버전을 설치해주세요.",
+  "storeUrl": "https://play.google.com/store/apps/details?id=example"
+}
+```
+
+An unapproved channel returns HTTP 409 with `wrong_environment`. A missing, malformed, zero, negative, or unsafe `versionCode` returns HTTP 400 with `invalid_request`. Policy responses and `/health` use `Cache-Control: no-store`; `/health.appPolicy` reports only the safe latest/minimum/mode configuration metadata.
+
 ## Lobby messages
 
 | type | Direction | Description |
