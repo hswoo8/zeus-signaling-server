@@ -65,6 +65,24 @@ If capacity or maintenance gates block entry, the server returns `{ type: "error
 Relay admission failures return `relay_disabled`, `relay_capacity`, or `relay_egress_limited`. An AUTO room may still start over P2P while Relay admission is blocked. If AUTO falls back to Relay and admission fails, the server removes the waiting room and returns both players to the lobby without interrupting existing matches.
 If a running P2P match later sends `game_state` over WebSocket, the server reclassifies it as a runtime Relay fallback for metrics and admission decisions. The existing match continues even when this temporarily moves active Relay usage above its configured cap.
 
+For a controlled pool smoke test, pass the exact compatibility tuple to the load
+client. Production targets always require the explicit safety flag, including
+provider-owned candidate URLs:
+
+```bash
+npm run load-test -- \
+  --url wss://candidate.example.com \
+  --clients 1 \
+  --duration 5 \
+  --mode lobby \
+  --channel production \
+  --app-version 2 \
+  --protocol-version 1 \
+  --ruleset-version 1 \
+  --balance-version 1 \
+  --allow-production
+```
+
 ## Match router
 
 Set `SERVICE_ROLE=router` to run the stateless `/route` service. Configure `ROUTER_CHANNEL`, `ROUTER_ALLOWED_CHANNELS`, and `ROUTER_ROUTES_JSON`. Each route defines a pool, secure WebSocket/stats URLs, app version bounds, an exact protocol/ruleset, and balance bounds. Unsupported combinations return `update_required`; cross-environment requests return `wrong_environment`.

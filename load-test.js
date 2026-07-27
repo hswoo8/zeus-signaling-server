@@ -8,7 +8,9 @@ const mode = ['lobby', 'matched', 'relay'].includes(args.mode) ? args.mode : 'lo
 const allowProduction = args['allow-production'] === true;
 const analyticsChannel = String(args.channel || 'dev').trim().toLowerCase();
 
-if (!allowProduction && /(^|\.)api\.minizeusgame\.com/i.test(new URL(url).hostname)) {
+if (!allowProduction &&
+    (analyticsChannel === 'production' ||
+        /(^|\.)api(?:-blue)?\.minizeusgame\.com/i.test(new URL(url).hostname))) {
     throw new Error('Production load tests require --allow-production');
 }
 if (mode !== 'lobby' && clientsRequested % 2 !== 0) {
@@ -16,12 +18,12 @@ if (mode !== 'lobby' && clientsRequested % 2 !== 0) {
 }
 
 const versionFields = {
-    clientVersionCode: 1,
+    clientVersionCode: positiveInt(args['app-version'], 1),
     clientVersionName: 'load-test',
     analyticsChannel,
-    protocolVersion: 1,
-    rulesetVersion: 1,
-    balanceVersion: 1,
+    protocolVersion: positiveInt(args['protocol-version'], 1),
+    rulesetVersion: positiveInt(args['ruleset-version'], 1),
+    balanceVersion: positiveInt(args['balance-version'], 1),
 };
 
 class VirtualClient {
@@ -207,7 +209,13 @@ async function capacity() {
     const parsed = new URL(url);
     parsed.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:';
     parsed.pathname = '/capacity';
-    parsed.search = `clientVersionCode=1&channel=${encodeURIComponent(analyticsChannel)}&protocolVersion=1&rulesetVersion=1&balanceVersion=1`;
+    parsed.search = new URLSearchParams({
+        clientVersionCode: String(versionFields.clientVersionCode),
+        channel: analyticsChannel,
+        protocolVersion: String(versionFields.protocolVersion),
+        rulesetVersion: String(versionFields.rulesetVersion),
+        balanceVersion: String(versionFields.balanceVersion),
+    }).toString();
     return fetch(parsed).then((response) => response.json());
 }
 
