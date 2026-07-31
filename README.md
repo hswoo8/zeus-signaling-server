@@ -141,9 +141,10 @@ Each accepted `game_start` assigns a new `matchId`, including rematches. The gue
 
 Ranked rooms use the `short` battle type. The server selects one supported arena when the room is created and keeps that arena for both players. Internal `debugNoKo` and `debugNoTime` rules are fixed from the room creator's request and relayed to the guest.
 
-Auto-queue rooms prefer same-country candidates during `COUNTRY_MATCH_EXPANSION_MS`. After the
-window, a waiting auto-queue host may be moved into the oldest compatible friendly room. Manual
-friendly hosts are never moved; they can still receive an auto-queue guest.
+Friendly and ranked matchmaking are country-locked. A room is listed or selected only when both
+players report the same country, and direct room-code joins return `country_mismatch` across
+countries. Manual friendly hosts are never moved; they can still receive a same-country auto-queue
+guest. Connections where both sides lack country metadata remain available for local development.
 
 Rate limits are type-specific so lobby/signaling traffic stays low while `game_state` can sustain 20 Hz relay traffic.
 

@@ -111,7 +111,6 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
             RANK_PLACEMENT_MATCHES: '2',
             RANK_PLACEMENT_K: '48',
             RANK_ESTABLISHED_K: '24',
-            COUNTRY_MATCH_EXPANSION_MS: '1000',
             QUALITY_REJECT_COOLDOWN_MS: '60000',
             NICKNAME_BLOCKED_TERMS: 'spoilername',
         },
@@ -532,12 +531,11 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     const expandedUsRoom = await expandedUsInbox.type('room_created');
     assert.notEqual(expandedUsRoom.code, expandedKrRoom.code);
 
-    const [expandedGuestJoined, expandedRoomJoined] = await Promise.all([
-        expandedKrInbox.type('guest_joined'),
-        expandedUsInbox.type('room_joined'),
-    ]);
-    assert.equal(expandedRoomJoined.code, expandedKrRoom.code);
-    assert.equal(expandedGuestJoined.guestPlayerId, 'expanded-ranked-us');
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    await assert.rejects(
+        expandedKrInbox.next((message) => message.type === 'guest_joined', 150),
+        /Timed out waiting for WebSocket message/
+    );
 
     expandedUsPlayer.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
     await expandedUsInbox.type('room_left');
@@ -646,9 +644,19 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         matchMode: 'friendly',
         playerId: 'country-us-viewer',
     }));
-    const expandedCountryRooms = await countryUsInbox.type('room_list');
-    const expandedCountryEntry = expandedCountryRooms.rooms.find((room) => room.code === countryRoom.code);
-    assert.equal(expandedCountryEntry.sameCountry, false);
+    const stillHiddenCrossCountryRooms = await countryUsInbox.type('room_list');
+    assert.equal(
+        stillHiddenCrossCountryRooms.rooms.some((room) => room.code === countryRoom.code),
+        false
+    );
+    countryUsViewer.send(JSON.stringify({
+        type: 'join_room',
+        ...versionFields,
+        code: countryRoom.code,
+        guestPlayerId: 'country-us-viewer',
+    }));
+    const countryMismatch = await countryUsInbox.type('error');
+    assert.equal(countryMismatch.code, 'country_mismatch');
 
     countryHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
     await countryHostInbox.type('room_left');
@@ -683,12 +691,11 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     const friendlyUsRoom = await friendlyUsInbox.type('room_created');
     assert.notEqual(friendlyUsRoom.code, friendlyKrRoom.code);
 
-    const [friendlyGuestJoined, friendlyRoomJoined] = await Promise.all([
-        friendlyKrInbox.type('guest_joined'),
-        friendlyUsInbox.type('room_joined'),
-    ]);
-    assert.equal(friendlyRoomJoined.code, friendlyKrRoom.code);
-    assert.equal(friendlyGuestJoined.guestPlayerId, 'expanded-friendly-us');
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    await assert.rejects(
+        friendlyKrInbox.next((message) => message.type === 'guest_joined', 150),
+        /Timed out waiting for WebSocket message/
+    );
 
     friendlyUsPlayer.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
     await friendlyUsInbox.type('room_left');

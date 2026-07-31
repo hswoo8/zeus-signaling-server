@@ -53,7 +53,6 @@ const RANK_PLACEMENT_MATCHES = envInt(['RANK_PLACEMENT_MATCHES'], 10);
 const RANK_PLACEMENT_K = envInt(['RANK_PLACEMENT_K'], 48);
 const RANK_ESTABLISHED_K = envInt(['RANK_ESTABLISHED_K'], 24);
 const RANK_ELO_SPREAD = envInt(['RANK_ELO_SPREAD'], 400);
-const COUNTRY_MATCH_EXPANSION_MS = envInt(['COUNTRY_MATCH_EXPANSION_MS'], 15000);
 const QUALITY_REJECT_COOLDOWN_MS = envInt(['QUALITY_REJECT_COOLDOWN_MS'], 5 * 60 * 1000);
 const INTEGRITY_INVALID_FLAG_THRESHOLD = envInt(['INTEGRITY_INVALID_FLAG_THRESHOLD'], 3);
 const INTEGRITY_HP_MISMATCH_FLAG_THRESHOLD = envInt(['INTEGRITY_HP_MISMATCH_FLAG_THRESHOLD'], 3);
@@ -3373,11 +3372,8 @@ function normalizedCountryCode(value) {
 function roomMatchesViewerCountry(room, viewer) {
     const hostCountry = normalizedCountryCode(room?.hostCountryCode);
     const viewerCountry = normalizedCountryCode(viewer?.analyticsCountryCode);
-    return !hostCountry || !viewerCountry || hostCountry === viewerCountry;
-}
-
-function roomExpandedBeyondCountry(room) {
-    return Date.now() - (Number(room?.createdAt) || Date.now()) >= COUNTRY_MATCH_EXPANSION_MS;
+    if (!hostCountry || !viewerCountry) return !hostCountry && !viewerCountry;
+    return hostCountry === viewerCountry;
 }
 
 function qualityRejectedForPlayer(room, playerId) {
@@ -3438,9 +3434,7 @@ function roomListEntry(code, room, viewer, viewerRating = 1000) {
         return null;
     }
     const sameCountry = roomMatchesViewerCountry(room, viewer);
-    if (!sameCountry && !roomExpandedBeyondCountry(room)) {
-        return null;
-    }
+    if (!sameCountry) return null;
     if (room.networkMode === 'relay' && !relayAvailabilitySnapshot().canStartNewMatch) {
         return null;
     }
@@ -3474,7 +3468,6 @@ function bestRankedWaitingRoom(viewer, viewerRating = 1000) {
         .map((code) => roomListEntry(code, rooms[code], viewer, viewerRating))
         .filter((entry) => entry?.matchMode === 'ranked')
         .sort((left, right) => {
-            if (left.sameCountry !== right.sameCountry) return left.sameCountry ? -1 : 1;
             if (left.ratingDifference !== right.ratingDifference) {
                 return left.ratingDifference - right.ratingDifference;
             }
@@ -3491,9 +3484,6 @@ function bestFriendlyWaitingRoom(viewer) {
         }))
         .filter(({ entry }) => entry?.matchMode === 'friendly')
         .sort((left, right) => {
-            if (left.entry.sameCountry !== right.entry.sameCountry) {
-                return left.entry.sameCountry ? -1 : 1;
-            }
             if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt;
             return left.entry.code.localeCompare(right.entry.code);
         })[0]?.entry || null;
@@ -3602,7 +3592,7 @@ async function reconcileRankedWaitingRooms() {
             targetRoom,
             sourceRoom.hostPlayerId
         );
-        console.log(`[matchmaking] Expanded ranked rooms merged: ${sourceCode} -> ${candidate.code}`);
+        console.log(`[matchmaking] Ranked rooms merged: ${sourceCode} -> ${candidate.code}`);
         return true;
     }
     return false;
@@ -3647,24 +3637,10 @@ async function reconcileFriendlyMatchmakingRooms() {
             targetRoom,
             sourceRoom.hostPlayerId
         );
-        console.log(`[matchmaking] Expanded friendly rooms merged: ${sourceCode} -> ${candidate.code}`);
+        console.log(`[matchmaking] Friendly rooms merged: ${sourceCode} -> ${candidate.code}`);
         return true;
     }
     return false;
-}
-
-function scheduleRoomExpansion(matchMode) {
-    const timer = setTimeout(() => {
-        const reconciliation = matchMode === 'ranked'
-            ? reconcileRankedWaitingRooms()
-            : reconcileFriendlyMatchmakingRooms();
-        reconciliation.catch((error) => {
-            console.warn(
-                `[matchmaking] ${matchMode} expansion failed: ${error?.message || 'unknown error'}`
-            );
-        });
-    }, COUNTRY_MATCH_EXPANSION_MS + 50);
-    timer.unref?.();
 }
 
 function broadcastRoomUpsert(code) {
@@ -4116,16 +4092,14 @@ wss.on('connection', (ws, req) => {
                     hostMatches: rooms[code].hostMatches,
                 });
                 broadcastRoomUpsert(code);
-                if (requestedMatchMode === 'friendly') {
-                    reconcileFriendlyMatchmakingRooms().catch((error) => {
-                        console.warn(
-                            `[matchmaking] friendly reconciliation failed: ${error?.message || 'unknown error'}`
-                        );
-                    });
-                    scheduleRoomExpansion(requestedMatchMode);
-                } else if (rooms[code].matchmaking) {
-                    scheduleRoomExpansion(requestedMatchMode);
-                }
+                const reconciliation = requestedMatchMode === 'ranked'
+                    ? reconcileRankedWaitingRooms()
+                    : reconcileFriendlyMatchmakingRooms();
+                reconciliation.catch((error) => {
+                    console.warn(
+                        `[matchmaking] ${requestedMatchMode} reconciliation failed: ${error?.message || 'unknown error'}`
+                    );
+                });
                 console.log(`[+] Room created: ${code}`);
                 break;
             }
@@ -4166,6 +4140,14 @@ wss.on('connection', (ws, req) => {
                         type: 'error',
                         code: 'ranked_room_unavailable',
                         message: 'Ranked room is no longer available',
+                    });
+                    return;
+                }
+                if (!roomMatchesViewerCountry(room, ws)) {
+                    send(ws, {
+                        type: 'error',
+                        code: 'country_mismatch',
+                        message: 'Matches are limited to players in the same country',
                     });
                     return;
                 }
