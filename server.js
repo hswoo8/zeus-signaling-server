@@ -4116,7 +4116,14 @@ wss.on('connection', (ws, req) => {
                     hostMatches: rooms[code].hostMatches,
                 });
                 broadcastRoomUpsert(code);
-                if (rooms[code].matchmaking) {
+                if (requestedMatchMode === 'friendly') {
+                    reconcileFriendlyMatchmakingRooms().catch((error) => {
+                        console.warn(
+                            `[matchmaking] friendly reconciliation failed: ${error?.message || 'unknown error'}`
+                        );
+                    });
+                    scheduleRoomExpansion(requestedMatchMode);
+                } else if (rooms[code].matchmaking) {
                     scheduleRoomExpansion(requestedMatchMode);
                 }
                 console.log(`[+] Room created: ${code}`);

@@ -697,6 +697,46 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     friendlyKrPlayer.close();
     friendlyUsPlayer.close();
 
+    const staleAutoPlayer = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const lateManualPlayer = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const staleAutoInbox = createInbox(staleAutoPlayer);
+    const lateManualInbox = createInbox(lateManualPlayer);
+    staleAutoPlayer.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'friendly',
+        matchmaking: true,
+        hostPlayerId: 'stale-auto-player',
+    }));
+    await staleAutoInbox.type('room_created');
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+
+    lateManualPlayer.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'friendly',
+        matchmaking: false,
+        hostPlayerId: 'late-manual-player',
+    }));
+    const lateManualRoom = await lateManualInbox.type('room_created');
+    const [lateManualGuestJoined, staleAutoJoined] = await Promise.all([
+        lateManualInbox.type('guest_joined'),
+        staleAutoInbox.type('room_joined'),
+    ]);
+    assert.equal(staleAutoJoined.code, lateManualRoom.code);
+    assert.equal(lateManualGuestJoined.guestPlayerId, 'stale-auto-player');
+
+    staleAutoPlayer.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await staleAutoInbox.type('room_left');
+    lateManualPlayer.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await lateManualInbox.type('room_left');
+    staleAutoPlayer.close();
+    lateManualPlayer.close();
+
     const failedStartHost = await connect(`ws://127.0.0.1:${port}`);
     const failedStartGuest = await connect(`ws://127.0.0.1:${port}`);
     const failedStartHostInbox = createInbox(failedStartHost);
