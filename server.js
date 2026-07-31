@@ -458,8 +458,74 @@ function recordWebSocketDisconnect(ws, code, reason) {
     websocketDisconnectSources.set(source, (websocketDisconnectSources.get(source) || 0) + 1);
     const reasonText = Buffer.isBuffer(reason) ? reason.toString('utf8') : String(reason || '');
     console.log(
-        `[ws] closed code=${code} source=${source} room=${ws.roomCode || '-'} reason=${reasonText || '-'}`
+        `[ws] closed code=${code} source=${source} room=${ws.roomCode || '-'} ` +
+        `role=${ws.role || '-'} reason=${diagnosticText(reasonText, 240) || '-'}`
     );
+}
+
+function diagnosticText(value, maxLength = 600) {
+    return String(value ?? '')
+        .replace(/[\r\n\t\u0000-\u001f\u007f]+/g, ' ')
+        .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[ip]')
+        .replace(/\b(?:[a-f0-9]{1,4}:){2,}[a-f0-9:]+\b/gi, '[ip]')
+        .replace(/bearer\s+\S+/gi, 'Bearer [redacted]')
+        .replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, '[jwt-redacted]')
+        .trim()
+        .slice(0, maxLength);
+}
+
+function diagnosticToken(value, fallback = 'unknown') {
+    const token = String(value ?? '').trim().toLowerCase();
+    return /^[a-z0-9_.-]{1,64}$/.test(token) ? token : fallback;
+}
+
+function diagnosticNumber(value, fallback = -1) {
+    if (value === null || value === undefined || value === '') return fallback;
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.round(number) : fallback;
+}
+
+function recordGameStartFailure(room, ws, msg, action) {
+    const role = ws?.role === 'host' || ws?.role === 'guest' ? ws.role : 'unknown';
+    const prefix = role === 'host' ? 'host' : 'guest';
+    const record = {
+        event: 'game_start_failed',
+        room: diagnosticToken(ws?.roomCode || 'unknown'),
+        reporterRole: role,
+        action: diagnosticToken(action),
+        matchMode: diagnosticToken(room?.matchMode),
+        roomNetworkMode: diagnosticToken(room?.networkMode),
+        reportedNetworkMode: diagnosticToken(msg?.networkMode),
+        activeTransport: diagnosticToken(msg?.activeTransport),
+        code: diagnosticToken(msg?.code),
+        message: diagnosticText(msg?.message),
+        serverRttMs: diagnosticNumber(msg?.serverRttMs),
+        socketRttMs: diagnosticNumber(socketRttMs(ws)),
+        roomRttMs: diagnosticNumber(room?.[`${prefix}RttMs`]),
+        clientElapsedMs: diagnosticNumber(msg?.clientElapsedMs),
+        p2pDiagnostics: diagnosticText(msg?.p2pDiagnostics),
+        clientVersionCode: diagnosticNumber(msg?.clientVersionCode),
+        protocolVersion: diagnosticNumber(msg?.protocolVersion),
+        rulesetVersion: diagnosticNumber(msg?.rulesetVersion),
+        balanceVersion: diagnosticNumber(msg?.balanceVersion),
+        analyticsChannel: diagnosticToken(msg?.analyticsChannel),
+    };
+    console.log(`[transport] ${JSON.stringify(record)}`);
+}
+
+function recordTransportReady(room, ws, msg) {
+    console.log(`[transport] ${JSON.stringify({
+        event: 'game_transport_ready',
+        room: diagnosticToken(ws?.roomCode || 'unknown'),
+        reporterRole: diagnosticToken(ws?.role),
+        matchMode: diagnosticToken(room?.matchMode),
+        networkMode: diagnosticToken(room?.networkMode),
+        activeTransport: diagnosticToken(msg?.activeTransport),
+        socketRttMs: diagnosticNumber(socketRttMs(ws)),
+        clientVersionCode: diagnosticNumber(msg?.clientVersionCode),
+        protocolVersion: diagnosticNumber(msg?.protocolVersion),
+        analyticsChannel: diagnosticToken(msg?.analyticsChannel),
+    })}`);
 }
 
 function sendJson(res, statusCode, data) {
@@ -4177,6 +4243,7 @@ wss.on('connection', (ws, req) => {
                 if (msg.type === 'game_start_failed') {
                     if (Number.isFinite(room.battleStartAtMs)) return;
                     if (room.matchMode === 'friendly' && room.host) {
+                        recordGameStartFailure(room, ws, msg, 'friendly_guest_removed');
                         const host = room.host;
                         const guest = room.guest;
                         rememberQualityRejectedPlayer(room, room.guestPlayerId);
@@ -4195,6 +4262,7 @@ wss.on('connection', (ws, req) => {
                         console.log(`[-] Guest removed after friendly start failure: ${code}`);
                         break;
                     }
+                    recordGameStartFailure(room, ws, msg, 'room_closed');
                     const peer = ws.role === 'host' ? room.guest : room.host;
                     send(peer, { ...msg, action: 'room_closed' });
                     for (const participant of [room.host, room.guest]) {
@@ -4281,6 +4349,9 @@ wss.on('connection', (ws, req) => {
                 if (msg.type === 'game_audit') {
                     recordGameAudit(room, ws, msg);
                     break;
+                }
+                if (msg.type === 'game_transport_ready') {
+                    recordTransportReady(room, ws, msg);
                 }
                 if (msg.type === 'rematch_ready') {
                     const prefix = ws.role === 'host' ? 'host' : 'guest';
