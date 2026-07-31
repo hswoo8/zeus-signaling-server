@@ -3483,6 +3483,22 @@ function bestRankedWaitingRoom(viewer, viewerRating = 1000) {
         })[0] || null;
 }
 
+function bestFriendlyWaitingRoom(viewer) {
+    return Object.keys(rooms)
+        .map((code) => ({
+            entry: roomListEntry(code, rooms[code], viewer),
+            createdAt: Number(rooms[code]?.createdAt) || Date.now(),
+        }))
+        .filter(({ entry }) => entry?.matchMode === 'friendly')
+        .sort((left, right) => {
+            if (left.entry.sameCountry !== right.entry.sameCountry) {
+                return left.entry.sameCountry ? -1 : 1;
+            }
+            if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt;
+            return left.entry.code.localeCompare(right.entry.code);
+        })[0]?.entry || null;
+}
+
 async function attachGuestToRoom(ws, msg, code, room, guestPlayerId) {
     room.guest = ws;
     const guestRating = room.matchMode === 'ranked'
@@ -3592,10 +3608,60 @@ async function reconcileRankedWaitingRooms() {
     return false;
 }
 
-function scheduleRankedRoomExpansion() {
+async function reconcileFriendlyMatchmakingRooms() {
+    const waitingRooms = Object.entries(rooms)
+        .filter(([, room]) =>
+            room?.matchMode === 'friendly' &&
+            room.matchmaking === true &&
+            !room.matchStarted &&
+            !room.guest &&
+            room.host?.readyState === WebSocket.OPEN
+        )
+        .sort(([, left], [, right]) => left.createdAt - right.createdAt);
+
+    for (const [sourceCode, sourceRoom] of waitingRooms) {
+        const sourceSocket = sourceRoom.host;
+        if (sourceSocket.roomCode !== sourceCode || sourceSocket.role !== 'host') continue;
+        const candidate = bestFriendlyWaitingRoom(sourceSocket);
+        if (!candidate || candidate.code === sourceCode) continue;
+        const targetRoom = rooms[candidate.code];
+        if (!targetRoom || targetRoom.guest || targetRoom.host?.readyState !== WebSocket.OPEN) continue;
+
+        delete rooms[sourceCode];
+        sourceSocket.roomCode = null;
+        sourceSocket.role = null;
+        broadcastRoomRemoved(sourceCode);
+        await attachGuestToRoom(
+            sourceSocket,
+            {
+                guestCharacterId: sourceRoom.hostCharacterId,
+                guestPassiveId: sourceRoom.hostPassiveId,
+                arenaId: sourceRoom.arenaId,
+                guestNickname: sourceRoom.hostNickname,
+                guestPlayerId: sourceRoom.hostPlayerId,
+                clientVersionCode: sourceRoom.hostVersionCode,
+                clientVersionName: sourceRoom.hostVersionName,
+                analyticsChannel: sourceRoom.hostAnalyticsChannel,
+            },
+            candidate.code,
+            targetRoom,
+            sourceRoom.hostPlayerId
+        );
+        console.log(`[matchmaking] Expanded friendly rooms merged: ${sourceCode} -> ${candidate.code}`);
+        return true;
+    }
+    return false;
+}
+
+function scheduleRoomExpansion(matchMode) {
     const timer = setTimeout(() => {
-        reconcileRankedWaitingRooms().catch((error) => {
-            console.warn(`[matchmaking] Ranked expansion failed: ${error?.message || 'unknown error'}`);
+        const reconciliation = matchMode === 'ranked'
+            ? reconcileRankedWaitingRooms()
+            : reconcileFriendlyMatchmakingRooms();
+        reconciliation.catch((error) => {
+            console.warn(
+                `[matchmaking] ${matchMode} expansion failed: ${error?.message || 'unknown error'}`
+            );
         });
     }, COUNTRY_MATCH_EXPANSION_MS + 50);
     timer.unref?.();
@@ -3940,13 +4006,17 @@ wss.on('connection', (ws, req) => {
                 const rankedCandidate = requestedMatchMode === 'ranked'
                     ? bestRankedWaitingRoom(ws, hostRating)
                     : null;
-                if (rankedCandidate) {
+                const friendlyCandidate = requestedMatchMode === 'friendly' && msg.matchmaking === true
+                    ? bestFriendlyWaitingRoom(ws)
+                    : null;
+                const matchmakingCandidate = rankedCandidate || friendlyCandidate;
+                if (matchmakingCandidate) {
                     const joinCapacity = capacitySnapshot({ connectionExtra: 0 });
                     if (!joinCapacity.canJoinRoom) {
                         sendCapacityWsError(ws, joinCapacity);
                         return;
                     }
-                    const room = rooms[rankedCandidate.code];
+                    const room = rooms[matchmakingCandidate.code];
                     if (room && !room.guest && room.host?.readyState === WebSocket.OPEN) {
                         await attachGuestToRoom(
                             ws,
@@ -3957,11 +4027,13 @@ wss.on('connection', (ws, req) => {
                                 guestNickname: msg.hostNickname,
                                 guestPlayerId: msg.hostPlayerId,
                             },
-                            rankedCandidate.code,
+                            matchmakingCandidate.code,
                             room,
                             hostPlayerId
                         );
-                        console.log(`[matchmaking] Atomic ranked join: ${rankedCandidate.code}`);
+                        console.log(
+                            `[matchmaking] Atomic ${requestedMatchMode} join: ${matchmakingCandidate.code}`
+                        );
                         break;
                     }
                 }
@@ -3991,6 +4063,7 @@ wss.on('connection', (ws, req) => {
                     debugNoKo: msg.debugNoKo === true,
                     debugNoTime: msg.debugNoTime === true,
                     matchMode: requestedMatchMode,
+                    matchmaking: requestedMatchMode === 'ranked' || msg.matchmaking === true,
                     rulesetVersion: packetInt(msg, 'rulesetVersion'),
                     hostNickname: typeof msg.hostNickname === 'string' ? msg.hostNickname : undefined,
                     hostPlayerId: hostPlayerId || undefined,
@@ -4043,8 +4116,8 @@ wss.on('connection', (ws, req) => {
                     hostMatches: rooms[code].hostMatches,
                 });
                 broadcastRoomUpsert(code);
-                if (requestedMatchMode === 'ranked') {
-                    scheduleRankedRoomExpansion();
+                if (rooms[code].matchmaking) {
+                    scheduleRoomExpansion(requestedMatchMode);
                 }
                 console.log(`[+] Room created: ${code}`);
                 break;

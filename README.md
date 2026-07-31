@@ -121,7 +121,7 @@ An unapproved channel returns HTTP 409 with `wrong_environment`. A missing, malf
 
 | type | Direction | Description |
 | --- | --- | --- |
-| `create_room` | Client -> Server | Create room with compatibility metadata and `{ hostCharacterId, hostPassiveId, arenaId, battleType, debugNoKo, debugNoTime, hostNickname, hostPlayerId, networkMode }`; missing/invalid `networkMode` becomes `relay`, missing/invalid `battleType` becomes `short` |
+| `create_room` | Client -> Server | Create room with compatibility metadata and `{ hostCharacterId, hostPassiveId, arenaId, battleType, debugNoKo, debugNoTime, hostNickname, hostPlayerId, networkMode, matchmaking? }`; `matchmaking=true` enables atomic auto-queue joining and country-expansion reconciliation, while missing/false keeps manual friendly-room behavior |
 | `room_created` | Server -> Host | `{ code, networkMode, arenaId, battleType, debugNoKo, debugNoTime }` |
 | `join_room` | Client -> Server | Compatibility metadata and `{ code, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
 | `room_joined` | Server -> Guest | `{ code, networkMode, battleType, debugNoKo, debugNoTime, hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId }` |
@@ -140,6 +140,10 @@ An unapproved channel returns HTTP 409 with `wrong_environment`. A missing, malf
 Each accepted `game_start` assigns a new `matchId`, including rematches. The guest receives it on `game_start`, the host receives `match_assigned`, and both receive it again on `game_countdown_sync`. Relay game packets remain peer-compatible. On `game_over` or an active-match socket disconnect, the server emits perspective-correct `match_result { matchId, outcome, finishReason, serverConfirmed }` packets to both sides. After `game_ready`, the server sends `game_countdown_sync { matchId, serverTimeMs, battleStartAtMs }` so battle countdown starts from the same server-authoritative time. WebRTC `offer` / `answer` / `ice_candidate` messages are forwarded for P2P DataChannel setup.
 
 Ranked rooms use the `short` battle type. The server selects one supported arena when the room is created and keeps that arena for both players. Internal `debugNoKo` and `debugNoTime` rules are fixed from the room creator's request and relayed to the guest.
+
+Auto-queue rooms prefer same-country candidates during `COUNTRY_MATCH_EXPANSION_MS`. After the
+window, a waiting auto-queue host may be moved into the oldest compatible friendly room. Manual
+friendly hosts are never moved; they can still receive an auto-queue guest.
 
 Rate limits are type-specific so lobby/signaling traffic stays low while `game_state` can sustain 20 Hz relay traffic.
 

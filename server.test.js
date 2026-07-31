@@ -656,6 +656,47 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     countryKrViewer.close();
     countryUsViewer.close();
 
+    const friendlyKrPlayer = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const friendlyUsPlayer = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'US' },
+    });
+    const friendlyKrInbox = createInbox(friendlyKrPlayer);
+    const friendlyUsInbox = createInbox(friendlyUsPlayer);
+    friendlyKrPlayer.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'friendly',
+        matchmaking: true,
+        hostPlayerId: 'expanded-friendly-kr',
+    }));
+    const friendlyKrRoom = await friendlyKrInbox.type('room_created');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    friendlyUsPlayer.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'friendly',
+        matchmaking: true,
+        hostPlayerId: 'expanded-friendly-us',
+    }));
+    const friendlyUsRoom = await friendlyUsInbox.type('room_created');
+    assert.notEqual(friendlyUsRoom.code, friendlyKrRoom.code);
+
+    const [friendlyGuestJoined, friendlyRoomJoined] = await Promise.all([
+        friendlyKrInbox.type('guest_joined'),
+        friendlyUsInbox.type('room_joined'),
+    ]);
+    assert.equal(friendlyRoomJoined.code, friendlyKrRoom.code);
+    assert.equal(friendlyGuestJoined.guestPlayerId, 'expanded-friendly-us');
+
+    friendlyUsPlayer.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await friendlyUsInbox.type('room_left');
+    friendlyKrPlayer.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await friendlyKrInbox.type('room_left');
+    friendlyKrPlayer.close();
+    friendlyUsPlayer.close();
+
     const failedStartHost = await connect(`ws://127.0.0.1:${port}`);
     const failedStartGuest = await connect(`ws://127.0.0.1:${port}`);
     const failedStartHostInbox = createInbox(failedStartHost);
