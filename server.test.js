@@ -42,8 +42,14 @@ function createInbox(ws) {
                 waiters.push(waiter);
             });
         },
-        type(type) {
-            return this.next((message) => message.type === type);
+        async type(type, timeoutMs = 3000) {
+            try {
+                return await this.next((message) => message.type === type, timeoutMs);
+            } catch (error) {
+                throw new Error(`Timed out waiting for WebSocket message type=${type}`, {
+                    cause: error,
+                });
+            }
         },
     };
 }
@@ -851,7 +857,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         battleType: 'standard',
         matchMode: 'ranked',
         debugNoKo: true,
-        debugNoTime: false,
+        debugNoTime: true,
     }));
     const created = await hostInbox.type('room_created');
     assert.equal(created.battleType, 'short');
@@ -859,7 +865,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(created.hostRating, 1000);
     assert.equal(created.hostMatches, 0);
     assert.equal(created.debugNoKo, true);
-    assert.equal(created.debugNoTime, false);
+    assert.equal(created.debugNoTime, true);
     guest.send(JSON.stringify({
         type: 'join_ranked_room',
         ...versionFields,
@@ -875,9 +881,9 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         guestInbox.type('room_joined'),
     ]);
     assert.equal(guestJoined.debugNoKo, true);
-    assert.equal(guestJoined.debugNoTime, false);
+    assert.equal(guestJoined.debugNoTime, true);
     assert.equal(roomJoined.debugNoKo, true);
-    assert.equal(roomJoined.debugNoTime, false);
+    assert.equal(roomJoined.debugNoTime, true);
     assert.equal(roomJoined.battleType, 'short');
     assert.equal(roomJoined.arenaId, created.arenaId);
     assert.equal(guestJoined.arenaId, created.arenaId);
@@ -955,7 +961,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(started.battleType, 'short');
     assert.equal(started.arenaId, created.arenaId);
     assert.equal(started.debugNoKo, true);
-    assert.equal(started.debugNoTime, false);
+    assert.equal(started.debugNoTime, true);
 
     guest.send(JSON.stringify({
         type: 'game_damage_confirm',
@@ -1267,7 +1273,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.match(adminHtml, /배포 드레인 시작/);
 });
 
-test('relay admission limits preserve P2P matches and reject new relay starts', async (t) => {
+test('relay admission limits preserve P2P matches and drop P2P gameplay sent over WebSocket', async (t) => {
     const port = 22000 + Math.floor(Math.random() * 1000);
     const baseUrl = `http://127.0.0.1:${port}`;
     const child = spawn(process.execPath, ['server.js'], {
@@ -1328,8 +1334,8 @@ test('relay admission limits preserve P2P matches and reject new relay starts', 
         candidateHostInbox.type('error'),
         candidateGuestInbox.type('error'),
     ]);
-    assert.equal(hostFallbackError.code, 'relay_capacity');
-    assert.equal(guestFallbackError.code, 'relay_capacity');
+    assert.equal(hostFallbackError.code, 'p2p_required');
+    assert.equal(guestFallbackError.code, 'p2p_required');
 
     await createPair(candidateHost, candidateHostInbox, candidateGuest, candidateGuestInbox, 'auto');
     candidateHost.send(JSON.stringify({ type: 'game_start', ...versionFields, activeTransport: 'p2p' }));
@@ -1340,14 +1346,281 @@ test('relay admission limits preserve P2P matches and reject new relay starts', 
     assert.equal(capacity.counts.activeP2pMatches, 1, serverErrors);
     assert.equal(capacity.relay.canStartNewMatch, false);
     assert.equal(capacity.relay.code, 'relay_capacity');
-    assert.equal(capacity.operations.relay.admissionRejections, 2);
+    assert.equal(capacity.operations.relay.admissionRejections, 1);
 
     candidateHost.send(JSON.stringify({ type: 'game_state', seq: 1, x: 10, y: 20 }));
-    await candidateGuestInbox.type('game_state');
+    await assert.rejects(
+        candidateGuestInbox.next((message) => message.type === 'game_state', 150),
+        /Timed out waiting for WebSocket message/
+    );
     const fallbackCapacity = await fetch(`${baseUrl}/capacity`).then((response) => response.json());
-    assert.equal(fallbackCapacity.counts.activeRelayMatches, 2);
-    assert.equal(fallbackCapacity.counts.activeP2pMatches, 0);
-    assert.equal(fallbackCapacity.operations.relay.runtimeFallbacks, 1);
+    assert.equal(fallbackCapacity.counts.activeRelayMatches, 1);
+    assert.equal(fallbackCapacity.counts.activeP2pMatches, 1);
+    assert.equal(fallbackCapacity.operations.relay.runtimeFallbacks, 0);
+});
+
+test('P2P recovery resumes both peers, attributes a missing server peer, and invalidates unresolved paths', async (t) => {
+    const port = 23000 + Math.floor(Math.random() * 1000);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const child = spawn(process.execPath, ['server.js'], {
+        cwd: __dirname,
+        env: {
+            ...process.env,
+            PORT: String(port),
+            DATABASE_URL: '',
+            SERVER_CHANNEL: 'dev',
+            SERVER_ALLOWED_CHANNELS: 'dev',
+            MULTIPLAYER_RULESET_VERSION: '1',
+            P2P_RECOVERY_TIMEOUT_MS: '1000',
+            P2P_RECOVERY_RESUME_DELAY_MS: '20',
+            AUTH_TOKEN_SECRET: '',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let serverErrors = '';
+    child.stderr.on('data', (chunk) => { serverErrors += chunk.toString(); });
+    t.after(() => {
+        if (child.exitCode === null) child.kill('SIGTERM');
+    });
+    await waitForServer(baseUrl, child);
+
+    const createRankedPair = async (suffix) => {
+        const host = await connect(`ws://127.0.0.1:${port}`, { headers: { 'x-country-code': 'KR' } });
+        const guest = await connect(`ws://127.0.0.1:${port}`, { headers: { 'x-country-code': 'KR' } });
+        const hostInbox = createInbox(host);
+        const guestInbox = createInbox(guest);
+        const hostPlayer = {
+            playerId: `recovery-host-${suffix}`,
+            nickname: `Host${suffix}`,
+            characterId: 'ZEUS',
+            passiveId: 'IRON_WILL',
+            hp: 125,
+        };
+        const guestPlayer = {
+            playerId: `recovery-guest-${suffix}`,
+            nickname: `Guest${suffix}`,
+            characterId: 'TRICKSTER',
+            passiveId: 'LUCKY_WITCH',
+            hp: 100,
+        };
+        host.send(JSON.stringify({
+            type: 'create_room',
+            ...versionFields,
+            matchMode: 'ranked',
+            networkMode: 'auto',
+            hostPlayerId: hostPlayer.playerId,
+            hostNickname: hostPlayer.nickname,
+            hostCharacterId: hostPlayer.characterId,
+            hostPassiveId: hostPlayer.passiveId,
+        }));
+        const created = await hostInbox.next((message) =>
+            message.type === 'room_created' ||
+            message.type === 'room_joined' ||
+            message.type === 'error'
+        );
+        assert.equal(created.type, 'room_created', JSON.stringify(created));
+        guest.send(JSON.stringify({
+            type: 'join_ranked_room',
+            ...versionFields,
+            code: created.code,
+            guestPlayerId: guestPlayer.playerId,
+            guestNickname: guestPlayer.nickname,
+            guestCharacterId: guestPlayer.characterId,
+            guestPassiveId: guestPlayer.passiveId,
+        }));
+        await Promise.all([hostInbox.type('guest_joined'), guestInbox.type('room_joined')]);
+        host.send(JSON.stringify({ type: 'game_start', ...versionFields, activeTransport: 'p2p' }));
+        const [assigned] = await Promise.all([
+            hostInbox.type('match_assigned'),
+            guestInbox.type('game_start'),
+        ]);
+        return {
+            host,
+            guest,
+            hostInbox,
+            guestInbox,
+            hostPlayer,
+            guestPlayer,
+            assigned,
+            code: created.code,
+        };
+    };
+
+    const resumable = await createRankedPair('resume');
+    resumable.host.send(JSON.stringify({
+        type: 'p2p_recovery_request',
+        ...versionFields,
+        roundId: resumable.assigned.matchSequence,
+    }));
+    const [hostRecovery, guestRecovery] = await Promise.all([
+        resumable.hostInbox.type('p2p_recovery_start'),
+        resumable.guestInbox.type('p2p_recovery_start'),
+    ]);
+    assert.equal(hostRecovery.recoveryId, guestRecovery.recoveryId);
+    for (const socket of [resumable.host, resumable.guest]) {
+        socket.send(JSON.stringify({
+            type: 'p2p_recovery_ack',
+            recoveryId: hostRecovery.recoveryId,
+        }));
+        socket.send(JSON.stringify({
+            type: 'p2p_recovery_ready',
+            recoveryId: hostRecovery.recoveryId,
+        }));
+    }
+    const [hostResume, guestResume] = await Promise.all([
+        resumable.hostInbox.type('p2p_recovery_resume'),
+        resumable.guestInbox.type('p2p_recovery_resume'),
+    ]);
+    assert.equal(hostResume.resumeAtMs, guestResume.resumeAtMs);
+    assert.equal(hostResume.recoveryId, hostRecovery.recoveryId);
+
+    resumable.host.send(JSON.stringify({
+        type: 'game_over',
+        outcome: 'win',
+        hp: 125,
+        remoteHp: 0,
+        reason: 'normal',
+    }));
+    await Promise.all([
+        resumable.hostInbox.type('match_result'),
+        resumable.guestInbox.type('match_result'),
+    ]);
+    resumable.host.send(JSON.stringify({ type: 'game_start', ...versionFields, activeTransport: 'p2p' }));
+    const [disconnectAssigned] = await Promise.all([
+        resumable.hostInbox.type('match_assigned'),
+        resumable.guestInbox.type('game_start'),
+    ]);
+    resumable.host.send(JSON.stringify({
+        type: 'p2p_recovery_request',
+        ...versionFields,
+        roundId: disconnectAssigned.matchSequence,
+    }));
+    const [hostDisconnectRecovery] = await Promise.all([
+        resumable.hostInbox.type('p2p_recovery_start'),
+        resumable.guestInbox.type('p2p_recovery_start'),
+    ]);
+    resumable.host.send(JSON.stringify({
+        type: 'p2p_recovery_ack',
+        recoveryId: hostDisconnectRecovery.recoveryId,
+    }));
+    const [hostDisconnectResult, guestDisconnectResult] = await Promise.all([
+        resumable.hostInbox.type('match_result'),
+        resumable.guestInbox.type('match_result'),
+    ]);
+    assert.equal(hostDisconnectResult.outcome, 'win');
+    assert.equal(hostDisconnectResult.finishReason, 'remote_disconnect');
+    assert.equal(guestDisconnectResult.outcome, 'loss');
+    assert.equal(guestDisconnectResult.finishReason, 'local_disconnect');
+    await Promise.all([
+        resumable.hostInbox.type('p2p_recovery_failed'),
+        resumable.guestInbox.type('p2p_recovery_failed'),
+    ]);
+    const lateGuest = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const lateGuestInbox = createInbox(lateGuest);
+    lateGuest.send(JSON.stringify({
+        type: 'resume_match',
+        ...versionFields,
+        code: resumable.code,
+        matchId: disconnectAssigned.matchId,
+        playerId: resumable.guestPlayer.playerId,
+    }));
+    const lateGuestResult = await lateGuestInbox.type('match_result');
+    assert.equal(lateGuestResult.outcome, 'loss');
+    assert.equal(lateGuestResult.finishReason, 'local_disconnect');
+    lateGuest.close();
+    resumable.host.close();
+    resumable.guest.close();
+
+    const socketReconnect = await createRankedPair('sock');
+    socketReconnect.guest.close();
+    const reconnectRecovery = await socketReconnect.hostInbox.type('p2p_recovery_start');
+    socketReconnect.host.send(JSON.stringify({
+        type: 'p2p_recovery_ack',
+        recoveryId: reconnectRecovery.recoveryId,
+    }));
+
+    const reconnectedGuest = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const reconnectedGuestInbox = createInbox(reconnectedGuest);
+    reconnectedGuest.send(JSON.stringify({
+        type: 'resume_match',
+        ...versionFields,
+        code: socketReconnect.code,
+        matchId: socketReconnect.assigned.matchId,
+        playerId: socketReconnect.guestPlayer.playerId,
+    }));
+    const [socketResumed, reconnectedRecovery] = await Promise.all([
+        reconnectedGuestInbox.type('match_resumed'),
+        reconnectedGuestInbox.type('p2p_recovery_start'),
+    ]);
+    assert.equal(socketResumed.role, 'guest');
+    assert.equal(reconnectedRecovery.recoveryId, reconnectRecovery.recoveryId);
+    for (const socket of [socketReconnect.host, reconnectedGuest]) {
+        socket.send(JSON.stringify({
+            type: 'p2p_recovery_ready',
+            recoveryId: reconnectRecovery.recoveryId,
+        }));
+    }
+    const [hostSocketResume, guestSocketResume] = await Promise.all([
+        socketReconnect.hostInbox.type('p2p_recovery_resume'),
+        reconnectedGuestInbox.type('p2p_recovery_resume'),
+    ]);
+    assert.equal(hostSocketResume.recoveryId, reconnectRecovery.recoveryId);
+    assert.equal(guestSocketResume.recoveryId, reconnectRecovery.recoveryId);
+    socketReconnect.host.send(JSON.stringify({
+        type: 'game_over',
+        outcome: 'win',
+        hp: 125,
+        remoteHp: 0,
+        reason: 'normal',
+    }));
+    await Promise.all([
+        socketReconnect.hostInbox.type('match_result'),
+        reconnectedGuestInbox.type('match_result'),
+    ]);
+    socketReconnect.host.close();
+    reconnectedGuest.close();
+
+    const unresolved = await createRankedPair('invalid');
+    unresolved.host.send(JSON.stringify({
+        type: 'p2p_recovery_request',
+        ...versionFields,
+        roundId: unresolved.assigned.matchSequence,
+    }));
+    const [hostInvalidRecovery] = await Promise.all([
+        unresolved.hostInbox.type('p2p_recovery_start'),
+        unresolved.guestInbox.type('p2p_recovery_start'),
+    ]);
+    for (const socket of [unresolved.host, unresolved.guest]) {
+        socket.send(JSON.stringify({
+            type: 'p2p_recovery_ack',
+            recoveryId: hostInvalidRecovery.recoveryId,
+        }));
+    }
+    const [hostInvalidResult, guestInvalidResult] = await Promise.all([
+        unresolved.hostInbox.type('match_result'),
+        unresolved.guestInbox.type('match_result'),
+    ]);
+    assert.equal(hostInvalidResult.outcome, 'draw');
+    assert.equal(guestInvalidResult.outcome, 'draw');
+    assert.equal(hostInvalidResult.finishReason, 'network_unresolved');
+    const invalidSubmission = await fetch(`${baseUrl}/matches/pvp-result`, {
+        method: 'POST',
+        headers: appJsonHeaders,
+        body: JSON.stringify(resultBody(
+            unresolved.assigned.matchId,
+            unresolved.hostPlayer,
+            unresolved.guestPlayer,
+            'draw'
+        )),
+    });
+    assert.equal(invalidSubmission.status, 409, serverErrors);
+    assert.equal((await invalidSubmission.json()).error.code, 'match_invalidated');
+    unresolved.host.close();
+    unresolved.guest.close();
 });
 
 test('guest access tokens issue one-time WebSocket tickets', async (t) => {

@@ -48,6 +48,8 @@ const RATE_LIMITS = {
     gameEvent: Number(process.env.RATE_LIMIT_GAME_EVENT_MAX || 240),
 };
 const BATTLE_COUNTDOWN_SYNC_DELAY_MS = Number(process.env.BATTLE_COUNTDOWN_SYNC_DELAY_MS || 4500);
+const P2P_RECOVERY_TIMEOUT_MS = Number(process.env.P2P_RECOVERY_TIMEOUT_MS || 10000);
+const P2P_RECOVERY_RESUME_DELAY_MS = Number(process.env.P2P_RECOVERY_RESUME_DELAY_MS || 1200);
 const CONFIRMED_MATCH_TTL_MS = Number(process.env.CONFIRMED_MATCH_TTL_MS || 24 * 60 * 60 * 1000);
 const RANK_PLACEMENT_MATCHES = envInt(['RANK_PLACEMENT_MATCHES'], 10);
 const RANK_PLACEMENT_K = envInt(['RANK_PLACEMENT_K'], 48);
@@ -173,7 +175,7 @@ const relayMinuteBytes = new Map();
 
 const LOBBY_TYPES = new Set([
     'create_room', 'join_room', 'join_ranked_room', 'leave_room', 'get_room_list', 'ping_check', 'selection_update',
-    'offer', 'answer', 'ice_candidate',
+    'offer', 'answer', 'ice_candidate', 'resume_match',
 ]);
 const MATCH_MODES = new Set(['ranked', 'casual', 'friendly']);
 const RANKED_BATTLE_TYPE = 'short';
@@ -192,13 +194,18 @@ const GAME_TYPES = new Set([
     'game_over', 'game_start_failed', 'rematch_accept', 'rematch_decline',
     'rematch_request', 'rematch_cancel', 'rematch_reselect', 'rematch_ready',
     'game_pause', 'game_resume', 'game_countdown_sync', 'game_audit',
+    'p2p_recovery_request', 'p2p_recovery_ack', 'p2p_recovery_ready',
 ]);
 
 const ALL_TYPES = new Set([...LOBBY_TYPES, ...GAME_TYPES]);
+const P2P_GAMEPLAY_TYPES = new Set([
+    'game_state', 'game_skill', 'game_hit_claim', 'game_damage', 'game_damage_confirm',
+    'game_state_hp', 'game_emote', 'game_latency_probe', 'game_latency_ack',
+]);
 
 const COMPATIBILITY_TYPES = new Set([
     'create_room', 'join_room', 'join_ranked_room', 'leave_room', 'get_room_list', 'ping_check',
-    'selection_update', 'game_start', 'game_ready', 'rematch_ready',
+    'selection_update', 'resume_match', 'game_start', 'game_ready', 'rematch_ready',
 ]);
 
 function envInt(names, fallback) {
@@ -443,6 +450,202 @@ function sendCountdownSync(room) {
     };
     send(room.host, packet);
     send(room.guest, packet);
+}
+
+function p2pRecoveryStartPacket(recovery) {
+    return {
+        type: 'p2p_recovery_start',
+        recoveryId: recovery.id,
+        matchId: recovery.matchId,
+        roundId: recovery.roundId,
+        serverTimeMs: Date.now(),
+        deadlineAtMs: recovery.deadlineAtMs,
+    };
+}
+
+function clearP2pRecovery(room) {
+    const recovery = room?.p2pRecovery;
+    if (!recovery) return;
+    if (recovery.timer) clearTimeout(recovery.timer);
+    room.p2pRecovery = null;
+}
+
+function closeRoomAfterP2pRecoveryFailure(code, room, recovery, outcome, loserRole = null) {
+    const packet = {
+        type: 'p2p_recovery_failed',
+        recoveryId: recovery.id,
+        matchId: recovery.matchId,
+        outcome,
+        loserRole,
+    };
+    send(room.host, packet);
+    send(room.guest, packet);
+    for (const participant of [room.host, room.guest]) {
+        if (!participant) continue;
+        participant.roomCode = null;
+        participant.role = null;
+    }
+    delete rooms[code];
+    broadcastRoomRemoved(code);
+}
+
+function finishP2pRecovery(code, recoveryId) {
+    const room = rooms[code];
+    const recovery = room?.p2pRecovery;
+    if (!room || !recovery || recovery.id !== recoveryId || room.finalResult) return;
+
+    const hostAck = recovery.ackRoles.has('host');
+    const guestAck = recovery.ackRoles.has('guest');
+    clearP2pRecovery(room);
+
+    if (hostAck !== guestAck) {
+        const loserRole = hostAck ? 'guest' : 'host';
+        finalizeRoomMatch(room, loserRole, {
+            roundId: recovery.roundId,
+            outcome: 'loss',
+            reason: 'disconnect_timeout',
+            hp: 0,
+        });
+        closeRoomAfterP2pRecoveryFailure(code, room, recovery, 'loss', loserRole);
+        console.warn(`[p2p] recovery failed match=${recovery.matchId} loser=${loserRole} reason=server_unreachable`);
+        return;
+    }
+
+    finalizeRoomMatch(room, 'host', {
+        roundId: recovery.roundId,
+        outcome: 'draw',
+        reason: 'network_unresolved',
+    });
+    closeRoomAfterP2pRecoveryFailure(code, room, recovery, 'draw');
+    console.warn(`[p2p] recovery invalidated match=${recovery.matchId} reason=p2p_unresolved`);
+}
+
+function startP2pRecovery(code, room, ws, msg) {
+    if (!room.matchStarted || !room.matchId || room.activeTransport !== 'p2p') {
+        send(ws, {
+            type: 'error',
+            code: 'p2p_recovery_unavailable',
+            message: 'P2P recovery is unavailable for this match',
+        });
+        return;
+    }
+    if (room.p2pRecovery) {
+        send(ws, p2pRecoveryStartPacket(room.p2pRecovery));
+        return;
+    }
+
+    const now = Date.now();
+    const recovery = {
+        id: crypto.randomUUID(),
+        matchId: room.matchId,
+        roundId: packetInt(msg, 'roundId') || room.matchSequence || 1,
+        requestedByRole: ws.role,
+        startedAtMs: now,
+        deadlineAtMs: now + P2P_RECOVERY_TIMEOUT_MS,
+        ackRoles: new Set(),
+        readyRoles: new Set(),
+        timer: null,
+    };
+    room.p2pRecovery = recovery;
+    recovery.timer = setTimeout(
+        () => finishP2pRecovery(code, recovery.id),
+        P2P_RECOVERY_TIMEOUT_MS
+    );
+    const packet = p2pRecoveryStartPacket(recovery);
+    send(room.host, packet);
+    send(room.guest, packet);
+    console.warn(
+        `[p2p] recovery started match=${room.matchId} requestedBy=${ws.role} ` +
+        `timeoutMs=${P2P_RECOVERY_TIMEOUT_MS}`
+    );
+}
+
+function recordP2pRecoveryProgress(room, ws, msg) {
+    const recovery = room?.p2pRecovery;
+    if (!recovery || msg.recoveryId !== recovery.id || !['host', 'guest'].includes(ws.role)) return;
+
+    recovery.ackRoles.add(ws.role);
+    if (msg.type !== 'p2p_recovery_ready') return;
+    recovery.readyRoles.add(ws.role);
+    if (!recovery.readyRoles.has('host') || !recovery.readyRoles.has('guest')) return;
+
+    const serverTimeMs = Date.now();
+    const resumeAtMs = serverTimeMs + P2P_RECOVERY_RESUME_DELAY_MS;
+    const packet = {
+        type: 'p2p_recovery_resume',
+        recoveryId: recovery.id,
+        matchId: recovery.matchId,
+        roundId: recovery.roundId,
+        serverTimeMs,
+        resumeAtMs,
+    };
+    clearP2pRecovery(room);
+    send(room.host, packet);
+    send(room.guest, packet);
+    console.log(`[p2p] recovery completed match=${room.matchId} resumeDelayMs=${P2P_RECOVERY_RESUME_DELAY_MS}`);
+}
+
+function reconnectRole(room, ws, claimedPlayerId) {
+    const playerId = playerIdForSocket(ws, claimedPlayerId);
+    if (!playerId) return null;
+    if (playerId === normalizePlayerId(room?.hostPlayerId)) return 'host';
+    if (playerId === normalizePlayerId(room?.guestPlayerId)) return 'guest';
+    return null;
+}
+
+function reconnectResultPacket(record, role) {
+    const isHost = role === 'host';
+    return {
+        type: 'match_result',
+        matchId: record.matchId,
+        outcome: isHost ? record.hostOutcome : record.guestOutcome,
+        finishReason: isHost ? record.hostFinishReason : record.guestFinishReason,
+        localHp: isHost ? record.hostHp : record.guestHp,
+        remoteHp: isHost ? record.guestHp : record.hostHp,
+        serverConfirmed: true,
+    };
+}
+
+async function sendCompletedReconnectResult(ws, msg) {
+    const matchId = normalizePlayerId(msg.matchId);
+    const playerId = playerIdForSocket(ws, msg.playerId);
+    if (!matchId || !playerId) return false;
+    const record = await confirmedPvpMatch(matchId);
+    if (!record) return false;
+    const role = confirmationRole(record, { playerId });
+    if (!role) return false;
+    send(ws, reconnectResultPacket(record, role));
+    return true;
+}
+
+function resumeActiveMatch(ws, msg) {
+    const code = typeof msg.code === 'string' ? msg.code : '';
+    const matchId = normalizePlayerId(msg.matchId);
+    const room = validateJoinCode(code) ? rooms[code] : null;
+    if (!room || !room.matchStarted || room.matchId !== matchId || !room.p2pRecovery) return false;
+
+    const role = reconnectRole(room, ws, msg.playerId);
+    if (!role) return false;
+    const previousSocket = room[role];
+    room[role] = ws;
+    ws.roomCode = code;
+    ws.role = role;
+    ws.matchmakingPlayerId = playerIdForSocket(ws, msg.playerId);
+    if (previousSocket && previousSocket !== ws && previousSocket.readyState === WebSocket.OPEN) {
+        previousSocket.serverTerminationSource = 'match_replaced';
+        previousSocket.close(4001, 'Match connection replaced');
+    }
+
+    send(ws, {
+        type: 'match_resumed',
+        code,
+        role,
+        matchId: room.matchId,
+        matchSequence: room.matchSequence || 0,
+    });
+    send(ws, p2pRecoveryStartPacket(room.p2pRecovery));
+    console.log(`[p2p] socket resumed match=${room.matchId} role=${role}`);
+    return true;
 }
 
 function markSocketAlive(ws) {
@@ -2947,6 +3150,7 @@ function canonicalMatchReason(reason) {
     if (reason === 'disconnect_timeout' || reason === 'remote_disconnect') {
         return 'disconnect_timeout';
     }
+    if (reason === 'network_unresolved') return 'network_unresolved';
     if (reason === 'timeout') return 'timeout';
     return 'normal';
 }
@@ -2968,7 +3172,7 @@ function resultReasonForRole(result, role) {
         return result.loserRole === role ? 'local_forfeit' : 'remote_forfeit';
     }
     if (result.reason === 'disconnect_timeout') {
-        return result.loserRole === role ? 'local_forfeit' : 'remote_disconnect';
+        return result.loserRole === role ? 'local_disconnect' : 'remote_disconnect';
     }
     return result.reason;
 }
@@ -3185,6 +3389,7 @@ function finalizeRoomMatch(room, reporterRole, msg) {
     if (!room || !['host', 'guest'].includes(reporterRole)) return null;
     if (room.finalResult) return room.finalResult;
     if (!room.matchStarted || !room.matchId) return null;
+    clearP2pRecovery(room);
     const reporterOutcome = reportedGameOutcome(msg);
     const winnerRole = reporterOutcome === 'draw'
         ? null
@@ -3255,6 +3460,16 @@ async function normalizeConfirmedPvpSubmission(body) {
     if (record.matchMode !== 'ranked') {
         return { error: { status: 409, code: 'not_ranked_match', message: 'Only ranked matches submit MMR results' } };
     }
+    if (record.hostFinishReason === 'network_unresolved' ||
+        record.guestFinishReason === 'network_unresolved') {
+        return {
+            error: {
+                status: 409,
+                code: 'match_invalidated',
+                message: 'Network-invalidated matches do not change MMR or rewards',
+            },
+        };
+    }
 
     const localRole = confirmationRole(record, body.localPlayer);
     const remoteRole = confirmationRole(record, body.remotePlayer);
@@ -3309,7 +3524,7 @@ function networkMode(value) {
 function battleTransport(value, roomMode) {
     const normalized = typeof value === 'string' ? value.toLowerCase() : '';
     if (normalized === 'p2p' || normalized === 'relay') return normalized;
-    return roomMode === 'p2p' ? 'p2p' : 'relay';
+    return roomMode === 'relay' ? 'relay' : 'p2p';
 }
 
 function validateJoinCode(code) {
@@ -3723,6 +3938,24 @@ function rejectRoomRelayStart(code, room, relayStatus) {
     console.log(`[!] Relay match rejected: ${code} (${relayStatus.code})`);
 }
 
+function rejectAutomaticRelayStart(code, room) {
+    const packet = {
+        type: 'error',
+        code: 'p2p_required',
+        message: 'Automatic Relay fallback is disabled; establish P2P before starting the match',
+    };
+    for (const participant of [room.host, room.guest]) {
+        send(participant, packet);
+        if (participant) {
+            participant.roomCode = null;
+            participant.role = null;
+        }
+    }
+    delete rooms[code];
+    broadcastRoomRemoved(code);
+    console.log(`[!] Automatic Relay start rejected: ${code}`);
+}
+
 function leaveWaitingRoom(ws, notifyLeaver = false) {
     const code = ws?.roomCode;
     const room = code ? rooms[code] : null;
@@ -3959,6 +4192,17 @@ wss.on('connection', (ws, req) => {
                 break;
             }
 
+            case 'resume_match': {
+                if (resumeActiveMatch(ws, msg)) break;
+                if (await sendCompletedReconnectResult(ws, msg)) break;
+                send(ws, {
+                    type: 'error',
+                    code: 'match_resume_unavailable',
+                    message: 'The match can no longer be resumed',
+                });
+                break;
+            }
+
             // ── 방 만들기 ────────────────────────────────────────────────
             case 'create_room': {
                 const requestedMatchMode = matchMode(msg.matchMode);
@@ -4068,6 +4312,7 @@ wss.on('connection', (ws, req) => {
                     matchId: null,
                     matchSequence: 0,
                     finalResult: null,
+                    p2pRecovery: null,
                     qualityRejectedPlayers: new Map(),
                     battleStartAtMs: null,
                     matchStartedAtMs: null,
@@ -4263,6 +4508,24 @@ wss.on('connection', (ws, req) => {
                 break;
             }
 
+            // ── P2P 복구 조정 ────────────────────────────────────────────
+            case 'p2p_recovery_request': {
+                const code = ws.roomCode;
+                const room = rooms[code];
+                if (!room) return;
+                startP2pRecovery(code, room, ws, msg);
+                break;
+            }
+
+            case 'p2p_recovery_ack':
+            case 'p2p_recovery_ready': {
+                const code = ws.roomCode;
+                const room = rooms[code];
+                if (!room) return;
+                recordP2pRecoveryProgress(room, ws, msg);
+                break;
+            }
+
             // ── 게임 패킷 릴레이 ─────────────────────────────────────────
             case 'game_over': {
                 const code = ws.roomCode;
@@ -4343,6 +4606,12 @@ wss.on('connection', (ws, req) => {
                     const requestedTransport = room.matchStarted
                         ? (room.activeTransport || battleTransport(msg.activeTransport, room.networkMode))
                         : battleTransport(msg.activeTransport, room.networkMode);
+                    if (!room.matchStarted &&
+                        requestedTransport === 'relay' &&
+                        room.networkMode !== 'relay') {
+                        rejectAutomaticRelayStart(code, room);
+                        return;
+                    }
                     if (!room.matchStarted && requestedTransport === 'relay') {
                         const relayStatus = relayAvailabilitySnapshot();
                         if (!relayStatus.canStartNewMatch) {
@@ -4351,6 +4620,7 @@ wss.on('connection', (ws, req) => {
                         }
                     }
                     if (!room.matchStarted) {
+                        clearP2pRecovery(room);
                         room.matchStarted = true;
                         room.activeTransport = requestedTransport;
                         if (room.matchMode === 'ranked' && (room.matchSequence || 0) > 0) {
@@ -4425,9 +4695,12 @@ wss.on('connection', (ws, req) => {
                         msg.analyticsChannel || room[`${prefix}AnalyticsChannel`]
                     );
                 }
-                if (msg.type === 'game_state' && room.matchStarted && room.activeTransport === 'p2p') {
-                    room.activeTransport = 'relay';
-                    relayRuntimeFallbacks += 1;
+                if (room.matchStarted && room.activeTransport === 'p2p' && P2P_GAMEPLAY_TYPES.has(msg.type)) {
+                    console.warn(
+                        `[p2p] dropped WebSocket gameplay packet match=${room.matchId || '-'} ` +
+                        `role=${ws.role || '-'} type=${msg.type}`
+                    );
+                    break;
                 }
                 const peer = ws.role === 'host' ? room.guest : room.host;
                 send(peer, msg, { relay: true });
@@ -4448,9 +4721,21 @@ wss.on('connection', (ws, req) => {
         if (!code || !rooms[code]) return;
 
         const room = rooms[code];
+        if (!['host', 'guest'].includes(ws.role) || room[ws.role] !== ws) return;
         if (leaveWaitingRoom(ws)) return;
 
         const peer = ws.role === 'host' ? room.guest : room.host;
+
+        if (room.matchStarted && room.activeTransport === 'p2p' && !room.finalResult) {
+            startP2pRecovery(code, room, ws, {
+                roundId: room.matchSequence || 1,
+            });
+            console.warn(
+                `[p2p] preserving room after socket disconnect match=${room.matchId} ` +
+                `role=${ws.role} timeoutMs=${P2P_RECOVERY_TIMEOUT_MS}`
+            );
+            return;
+        }
 
         if (room.matchStarted) {
             finalizeRoomMatch(room, ws.role, {
