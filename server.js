@@ -48,8 +48,7 @@ const RATE_LIMITS = {
     gameEvent: Number(process.env.RATE_LIMIT_GAME_EVENT_MAX || 240),
 };
 const BATTLE_COUNTDOWN_SYNC_DELAY_MS = Number(process.env.BATTLE_COUNTDOWN_SYNC_DELAY_MS || 4500);
-const P2P_RECOVERY_TIMEOUT_MS = Number(process.env.P2P_RECOVERY_TIMEOUT_MS || 10000);
-const P2P_RECOVERY_RESUME_DELAY_MS = Number(process.env.P2P_RECOVERY_RESUME_DELAY_MS || 1200);
+const P2P_FAILURE_CHECK_TIMEOUT_MS = Number(process.env.P2P_FAILURE_CHECK_TIMEOUT_MS || 3000);
 const CONFIRMED_MATCH_TTL_MS = Number(process.env.CONFIRMED_MATCH_TTL_MS || 24 * 60 * 60 * 1000);
 const RANK_PLACEMENT_MATCHES = envInt(['RANK_PLACEMENT_MATCHES'], 10);
 const RANK_PLACEMENT_K = envInt(['RANK_PLACEMENT_K'], 48);
@@ -194,7 +193,7 @@ const GAME_TYPES = new Set([
     'game_over', 'game_start_failed', 'rematch_accept', 'rematch_decline',
     'rematch_request', 'rematch_cancel', 'rematch_reselect', 'rematch_ready',
     'game_pause', 'game_resume', 'game_countdown_sync', 'game_audit',
-    'p2p_recovery_request', 'p2p_recovery_ack', 'p2p_recovery_ready',
+    'p2p_failure_report', 'p2p_failure_ack',
 ]);
 
 const ALL_TYPES = new Set([...LOBBY_TYPES, ...GAME_TYPES]);
@@ -452,14 +451,14 @@ function sendCountdownSync(room) {
     send(room.guest, packet);
 }
 
-function p2pRecoveryStartPacket(recovery) {
+function p2pFailureCheckPacket(check) {
     return {
-        type: 'p2p_recovery_start',
-        recoveryId: recovery.id,
-        matchId: recovery.matchId,
-        roundId: recovery.roundId,
+        type: 'p2p_failure_check',
+        checkId: check.id,
+        matchId: check.matchId,
+        roundId: check.roundId,
         serverTimeMs: Date.now(),
-        deadlineAtMs: recovery.deadlineAtMs,
+        deadlineAtMs: check.deadlineAtMs,
     };
 }
 
@@ -470,11 +469,11 @@ function clearP2pRecovery(room) {
     room.p2pRecovery = null;
 }
 
-function closeRoomAfterP2pRecoveryFailure(code, room, recovery, outcome, loserRole = null) {
+function closeRoomAfterP2pFailureDecision(code, room, check, outcome, loserRole = null) {
     const packet = {
-        type: 'p2p_recovery_failed',
-        recoveryId: recovery.id,
-        matchId: recovery.matchId,
+        type: 'p2p_failure_decided',
+        checkId: check.id,
+        matchId: check.matchId,
         outcome,
         loserRole,
     };
@@ -489,108 +488,84 @@ function closeRoomAfterP2pRecoveryFailure(code, room, recovery, outcome, loserRo
     broadcastRoomRemoved(code);
 }
 
-function finishP2pRecovery(code, recoveryId) {
+function finishP2pFailureCheck(code, checkId) {
     const room = rooms[code];
-    const recovery = room?.p2pRecovery;
-    if (!room || !recovery || recovery.id !== recoveryId || room.finalResult) return;
+    const check = room?.p2pRecovery;
+    if (!room || !check || check.id !== checkId || room.finalResult) return;
 
-    const hostAck = recovery.ackRoles.has('host');
-    const guestAck = recovery.ackRoles.has('guest');
+    const hostAck = check.ackRoles.has('host');
+    const guestAck = check.ackRoles.has('guest');
     clearP2pRecovery(room);
 
     if (hostAck !== guestAck) {
         const loserRole = hostAck ? 'guest' : 'host';
         finalizeRoomMatch(room, loserRole, {
-            roundId: recovery.roundId,
+            roundId: check.roundId,
             outcome: 'loss',
             reason: 'disconnect_timeout',
             hp: 0,
         });
-        closeRoomAfterP2pRecoveryFailure(code, room, recovery, 'loss', loserRole);
-        console.warn(`[p2p] recovery failed match=${recovery.matchId} loser=${loserRole} reason=server_unreachable`);
+        closeRoomAfterP2pFailureDecision(code, room, check, 'loss', loserRole);
+        console.warn(`[p2p] failure decided match=${check.matchId} loser=${loserRole} reason=server_unreachable`);
         return;
     }
 
     finalizeRoomMatch(room, 'host', {
-        roundId: recovery.roundId,
+        roundId: check.roundId,
         outcome: 'draw',
         reason: 'network_unresolved',
     });
-    closeRoomAfterP2pRecoveryFailure(code, room, recovery, 'draw');
-    console.warn(`[p2p] recovery invalidated match=${recovery.matchId} reason=p2p_unresolved`);
+    closeRoomAfterP2pFailureDecision(code, room, check, 'draw');
+    console.warn(`[p2p] failure invalidated match=${check.matchId} reason=p2p_unresolved`);
 }
 
-function startP2pRecovery(code, room, ws, msg) {
+function startP2pFailureCheck(code, room, ws, msg) {
     if (!room.matchStarted || !room.matchId || room.activeTransport !== 'p2p') {
         send(ws, {
             type: 'error',
-            code: 'p2p_recovery_unavailable',
-            message: 'P2P recovery is unavailable for this match',
+            code: 'p2p_failure_check_unavailable',
+            message: 'P2P failure check is unavailable for this match',
         });
         return;
     }
     if (room.p2pRecovery) {
-        send(ws, p2pRecoveryStartPacket(room.p2pRecovery));
+        send(ws, p2pFailureCheckPacket(room.p2pRecovery));
         return;
     }
 
     const now = Date.now();
-    const recovery = {
+    const check = {
         id: crypto.randomUUID(),
         matchId: room.matchId,
         roundId: packetInt(msg, 'roundId') || room.matchSequence || 1,
         requestedByRole: ws.role,
         startedAtMs: now,
-        deadlineAtMs: now + P2P_RECOVERY_TIMEOUT_MS,
+        deadlineAtMs: now + P2P_FAILURE_CHECK_TIMEOUT_MS,
         ackRoles: new Set(),
-        readyRoles: new Set(),
         timer: null,
     };
-    room.p2pRecovery = recovery;
-    recovery.timer = setTimeout(
-        () => finishP2pRecovery(code, recovery.id),
-        P2P_RECOVERY_TIMEOUT_MS
+    room.p2pRecovery = check;
+    check.timer = setTimeout(
+        () => finishP2pFailureCheck(code, check.id),
+        P2P_FAILURE_CHECK_TIMEOUT_MS
     );
-    const packet = p2pRecoveryStartPacket(recovery);
+    const packet = p2pFailureCheckPacket(check);
     send(room.host, packet);
     send(room.guest, packet);
     console.warn(
-        `[p2p] recovery started match=${room.matchId} requestedBy=${ws.role} ` +
-        `timeoutMs=${P2P_RECOVERY_TIMEOUT_MS}`
+        `[p2p] failure check started match=${room.matchId} requestedBy=${ws.role} ` +
+        `timeoutMs=${P2P_FAILURE_CHECK_TIMEOUT_MS}`
     );
 }
 
-function recordP2pRecoveryProgress(room, ws, msg) {
-    const recovery = room?.p2pRecovery;
-    if (!recovery || msg.recoveryId !== recovery.id || !['host', 'guest'].includes(ws.role)) return;
+function recordP2pFailureAck(code, room, ws, msg) {
+    const check = room?.p2pRecovery;
+    if (!check || msg.checkId !== check.id || !['host', 'guest'].includes(ws.role)) return;
 
-    recovery.ackRoles.add(ws.role);
-    if (msg.type !== 'p2p_recovery_ready') return;
-    recovery.readyRoles.add(ws.role);
-    if (!recovery.readyRoles.has('host') || !recovery.readyRoles.has('guest')) return;
-
-    const serverTimeMs = Date.now();
-    const resumeAtMs = serverTimeMs + P2P_RECOVERY_RESUME_DELAY_MS;
-    const packet = {
-        type: 'p2p_recovery_resume',
-        recoveryId: recovery.id,
-        matchId: recovery.matchId,
-        roundId: recovery.roundId,
-        serverTimeMs,
-        resumeAtMs,
-    };
-    clearP2pRecovery(room);
-    send(room.host, packet);
-    send(room.guest, packet);
-    console.log(`[p2p] recovery completed match=${room.matchId} resumeDelayMs=${P2P_RECOVERY_RESUME_DELAY_MS}`);
-}
-
-function reconnectRole(room, ws, claimedPlayerId) {
-    const playerId = playerIdForSocket(ws, claimedPlayerId);
-    if (!playerId) return null;
-    if (playerId === normalizePlayerId(room?.hostPlayerId)) return 'host';
-    if (playerId === normalizePlayerId(room?.guestPlayerId)) return 'guest';
-    return null;
+    check.ackRoles.add(ws.role);
+    if (check.ackRoles.has('host') && check.ackRoles.has('guest')) {
+        finishP2pFailureCheck(code, check.id);
+    }
 }
 
 function reconnectResultPacket(record, role) {
@@ -615,36 +590,6 @@ async function sendCompletedReconnectResult(ws, msg) {
     const role = confirmationRole(record, { playerId });
     if (!role) return false;
     send(ws, reconnectResultPacket(record, role));
-    return true;
-}
-
-function resumeActiveMatch(ws, msg) {
-    const code = typeof msg.code === 'string' ? msg.code : '';
-    const matchId = normalizePlayerId(msg.matchId);
-    const room = validateJoinCode(code) ? rooms[code] : null;
-    if (!room || !room.matchStarted || room.matchId !== matchId || !room.p2pRecovery) return false;
-
-    const role = reconnectRole(room, ws, msg.playerId);
-    if (!role) return false;
-    const previousSocket = room[role];
-    room[role] = ws;
-    ws.roomCode = code;
-    ws.role = role;
-    ws.matchmakingPlayerId = playerIdForSocket(ws, msg.playerId);
-    if (previousSocket && previousSocket !== ws && previousSocket.readyState === WebSocket.OPEN) {
-        previousSocket.serverTerminationSource = 'match_replaced';
-        previousSocket.close(4001, 'Match connection replaced');
-    }
-
-    send(ws, {
-        type: 'match_resumed',
-        code,
-        role,
-        matchId: room.matchId,
-        matchSequence: room.matchSequence || 0,
-    });
-    send(ws, p2pRecoveryStartPacket(room.p2pRecovery));
-    console.log(`[p2p] socket resumed match=${room.matchId} role=${role}`);
     return true;
 }
 
@@ -4193,7 +4138,6 @@ wss.on('connection', (ws, req) => {
             }
 
             case 'resume_match': {
-                if (resumeActiveMatch(ws, msg)) break;
                 if (await sendCompletedReconnectResult(ws, msg)) break;
                 send(ws, {
                     type: 'error',
@@ -4508,21 +4452,20 @@ wss.on('connection', (ws, req) => {
                 break;
             }
 
-            // ── P2P 복구 조정 ────────────────────────────────────────────
-            case 'p2p_recovery_request': {
+            // ── P2P 실패 판정 ────────────────────────────────────────────
+            case 'p2p_failure_report': {
                 const code = ws.roomCode;
                 const room = rooms[code];
                 if (!room) return;
-                startP2pRecovery(code, room, ws, msg);
+                startP2pFailureCheck(code, room, ws, msg);
                 break;
             }
 
-            case 'p2p_recovery_ack':
-            case 'p2p_recovery_ready': {
+            case 'p2p_failure_ack': {
                 const code = ws.roomCode;
                 const room = rooms[code];
                 if (!room) return;
-                recordP2pRecoveryProgress(room, ws, msg);
+                recordP2pFailureAck(code, room, ws, msg);
                 break;
             }
 
@@ -4727,12 +4670,12 @@ wss.on('connection', (ws, req) => {
         const peer = ws.role === 'host' ? room.guest : room.host;
 
         if (room.matchStarted && room.activeTransport === 'p2p' && !room.finalResult) {
-            startP2pRecovery(code, room, ws, {
+            startP2pFailureCheck(code, room, ws, {
                 roundId: room.matchSequence || 1,
             });
             console.warn(
-                `[p2p] preserving room after socket disconnect match=${room.matchId} ` +
-                `role=${ws.role} timeoutMs=${P2P_RECOVERY_TIMEOUT_MS}`
+                `[p2p] checking peer after socket disconnect match=${room.matchId} ` +
+                `role=${ws.role} timeoutMs=${P2P_FAILURE_CHECK_TIMEOUT_MS}`
             );
             return;
         }
