@@ -49,6 +49,8 @@ const RATE_LIMITS = {
 };
 const BATTLE_COUNTDOWN_SYNC_DELAY_MS = Number(process.env.BATTLE_COUNTDOWN_SYNC_DELAY_MS || 4500);
 const P2P_FAILURE_CHECK_TIMEOUT_MS = Number(process.env.P2P_FAILURE_CHECK_TIMEOUT_MS || 3000);
+const RANKED_READY_CHECK_TIMEOUT_MS = envInt(['RANKED_READY_CHECK_TIMEOUT_MS'], 30 * 1000);
+const RANKED_SETUP_IDLE_TIMEOUT_MS = envInt(['RANKED_SETUP_IDLE_TIMEOUT_MS'], 60 * 1000);
 const CONFIRMED_MATCH_TTL_MS = Number(process.env.CONFIRMED_MATCH_TTL_MS || 24 * 60 * 60 * 1000);
 const RANK_PLACEMENT_MATCHES = envInt(['RANK_PLACEMENT_MATCHES'], 10);
 const RANK_PLACEMENT_K = envInt(['RANK_PLACEMENT_K'], 48);
@@ -161,6 +163,11 @@ let integrityAuditsReceived = 0;
 let integrityAuditsInvalid = 0;
 let integrityAuditMismatches = 0;
 let integrityMatchesFlagged = 0;
+let rankedSetupSessions = 0;
+let rankedSetupLaunches = 0;
+let rankedSetupNotStarted = 0;
+const rankedSetupFailureReasons = new Map();
+const rankedSetupFailureDetails = new Map();
 let capacityRejections = 0;
 let runtimeDrainEnabled = false;
 let runtimeDrainStartedAtMs = null;
@@ -449,6 +456,8 @@ function sendCountdownSync(room) {
     };
     send(room.host, packet);
     send(room.guest, packet);
+    recordRankedSetupOutcome(room, 'launched', 'countdown_started');
+    clearRankedSetupTimers(room);
 }
 
 function p2pFailureCheckPacket(check) {
@@ -598,16 +607,21 @@ function markSocketAlive(ws) {
     ws.lastSeenAt = Date.now();
 }
 
+function websocketDisconnectSource(ws, code) {
+    return ws.serverTerminationSource || (code === 1000 ? 'normal' : 'transport');
+}
+
 function recordWebSocketDisconnect(ws, code, reason) {
     websocketDisconnects += 1;
     if (code !== 1000) websocketAbnormalDisconnects += 1;
-    const source = ws.serverTerminationSource || (code === 1000 ? 'normal' : 'transport');
+    const source = websocketDisconnectSource(ws, code);
     websocketDisconnectSources.set(source, (websocketDisconnectSources.get(source) || 0) + 1);
     const reasonText = Buffer.isBuffer(reason) ? reason.toString('utf8') : String(reason || '');
     console.log(
         `[ws] closed code=${code} source=${source} room=${ws.roomCode || '-'} ` +
         `role=${ws.role || '-'} reason=${diagnosticText(reasonText, 240) || '-'}`
     );
+    return source;
 }
 
 function diagnosticText(value, maxLength = 600) {
@@ -1373,6 +1387,18 @@ function operationsSnapshot() {
                 reportSkewMs: INTEGRITY_REPORT_MAX_SKEW_MS,
             },
         },
+        rankedSetup: {
+            sessions: rankedSetupSessions,
+            launched: rankedSetupLaunches,
+            notStarted: rankedSetupNotStarted,
+            launchRate: rankedSetupSessions > 0
+                ? Math.round((rankedSetupLaunches / rankedSetupSessions) * 1000) / 10
+                : 0,
+            failureReasons: Object.fromEntries(rankedSetupFailureReasons),
+            failureDetails: Object.fromEntries(rankedSetupFailureDetails),
+            readyTimeoutSec: Math.ceil(RANKED_READY_CHECK_TIMEOUT_MS / 1000),
+            idleTimeoutSec: Math.ceil(RANKED_SETUP_IDLE_TIMEOUT_MS / 1000),
+        },
         eventLoopLagMs: eventLoopLagSnapshot(),
     };
 }
@@ -2120,9 +2146,9 @@ function reverseOutcome(outcome) {
 
 function rewardForResult(outcome, finishReason) {
     if (outcome === 'loss') return 0;
-    if (outcome === 'draw') return 25;
+    if (outcome === 'draw') return 5;
     if (finishReason === 'remote_disconnect' || finishReason === 'remote_forfeit') return 20;
-    return 100;
+    return 20;
 }
 
 function outcomeScore(outcome) {
@@ -3710,6 +3736,7 @@ async function attachGuestToRoom(ws, msg, code, room, guestPlayerId) {
         guestRating: room.guestRating,
         guestMatches: room.guestMatches,
     });
+    startRankedSetupSession(code, room);
     broadcastRoomRemoved(code);
     console.log(`[+] Room joined: ${code}`);
 }
@@ -3831,6 +3858,8 @@ function smoothedRttMs(previous, sample) {
 
 function resetGuestSlot(room) {
     if (!room) return;
+    clearP2pRecovery(room);
+    clearRankedSetupTimers(room);
     room.guest = null;
     room.guestCharacterId = undefined;
     room.guestPassiveId = undefined;
@@ -3841,6 +3870,7 @@ function resetGuestSlot(room) {
     room.guestMatches = undefined;
     room.guestVersionCode = undefined;
     room.guestVersionName = undefined;
+    room.guestAnalyticsChannel = undefined;
     room.guestCountryCode = undefined;
     room.guestUserAgent = undefined;
     room.matchStarted = false;
@@ -3849,6 +3879,274 @@ function resetGuestSlot(room) {
     room.finalResult = null;
     room.battleStartAtMs = null;
     room.matchStartedAtMs = null;
+    room.hostReady = false;
+    room.guestReady = false;
+    room.setupStartedAtMs = null;
+    room.setupOutcomeRecorded = false;
+    room.readyDeadlineAtMs = null;
+    room.setupDeadlineAtMs = null;
+    resetRoomIntegrity(room);
+}
+
+function hasBattleLaunchSignaled(room) {
+    return Number.isFinite(room?.battleStartAtMs);
+}
+
+function clearRankedSetupTimers(room) {
+    if (!room) return;
+    if (room.setupIdleTimer) clearTimeout(room.setupIdleTimer);
+    if (room.readyCheckTimer) clearTimeout(room.readyCheckTimer);
+    room.setupIdleTimer = null;
+    room.readyCheckTimer = null;
+    room.readyDeadlineAtMs = null;
+    room.setupDeadlineAtMs = null;
+}
+
+function clearRankedReadyCheck(room) {
+    if (!room) return;
+    if (room.readyCheckTimer) clearTimeout(room.readyCheckTimer);
+    room.readyCheckTimer = null;
+    room.readyDeadlineAtMs = null;
+}
+
+function recordRankedSetupOutcome(room, outcome, reason, affectedRole = null, detail = null) {
+    if (!room || room.matchMode !== 'ranked' || !room.setupStartedAtMs || room.setupOutcomeRecorded) {
+        return false;
+    }
+    room.setupOutcomeRecorded = true;
+    if (outcome === 'launched') {
+        rankedSetupLaunches += 1;
+    } else {
+        rankedSetupNotStarted += 1;
+        const safeReason = diagnosticToken(reason);
+        rankedSetupFailureReasons.set(
+            safeReason,
+            (rankedSetupFailureReasons.get(safeReason) || 0) + 1
+        );
+        const safeDetail = detail ? diagnosticToken(detail, '') : '';
+        if (safeDetail) {
+            const detailKey = `${safeReason}.${safeDetail}`;
+            rankedSetupFailureDetails.set(
+                detailKey,
+                (rankedSetupFailureDetails.get(detailKey) || 0) + 1
+            );
+        }
+    }
+    console.log(`[setup] ${JSON.stringify({
+        event: 'ranked_setup_outcome',
+        room: diagnosticToken(room.host?.roomCode || 'unknown'),
+        outcome: diagnosticToken(outcome),
+        reason: diagnosticToken(reason),
+        affectedRole: diagnosticToken(affectedRole),
+        detail: detail ? diagnosticToken(detail, '') : '',
+        hostReady: room.hostReady === true,
+        guestReady: room.guestReady === true,
+        durationMs: Math.max(0, Date.now() - room.setupStartedAtMs),
+        hostVersionCode: diagnosticNumber(room.hostVersionCode),
+        guestVersionCode: diagnosticNumber(room.guestVersionCode),
+        analyticsChannel: diagnosticToken(roomAnalyticsChannel(room)),
+    })}`);
+    return true;
+}
+
+function scheduleRankedSetupIdleTimeout(code, room) {
+    if (!room || room.matchMode !== 'ranked') return;
+    if (room.setupIdleTimer) clearTimeout(room.setupIdleTimer);
+    const remainingMs = Math.max(1, room.setupDeadlineAtMs - Date.now());
+    room.setupIdleTimer = setTimeout(() => expireRankedSetupIdle(code), remainingMs);
+}
+
+function startRankedSetupSession(code, room) {
+    if (!room || room.matchMode !== 'ranked' || !room.host || !room.guest) return;
+    clearRankedSetupTimers(room);
+    room.hostReady = false;
+    room.guestReady = false;
+    room.setupStartedAtMs = Date.now();
+    room.setupDeadlineAtMs = room.setupStartedAtMs + RANKED_SETUP_IDLE_TIMEOUT_MS;
+    room.setupOutcomeRecorded = false;
+    rankedSetupSessions += 1;
+    scheduleRankedSetupIdleTimeout(code, room);
+    sendSetupDeadline(room);
+}
+
+function sendSetupDeadline(room) {
+    const serverTimeMs = Date.now();
+    const packet = {
+        type: 'setup_deadline',
+        serverTimeMs,
+        deadlineAtMs: room.setupDeadlineAtMs,
+        countdownMs: Math.max(0, room.setupDeadlineAtMs - serverTimeMs),
+    };
+    send(room.host, packet);
+    send(room.guest, packet);
+}
+
+function sendReadyCheckState(room, active) {
+    const serverTimeMs = Date.now();
+    const packet = {
+        type: 'setup_ready_check',
+        active,
+        serverTimeMs,
+        deadlineAtMs: active ? room.readyDeadlineAtMs : null,
+        countdownMs: active ? Math.max(0, room.readyDeadlineAtMs - serverTimeMs) : 0,
+        hostReady: room.hostReady === true,
+        guestReady: room.guestReady === true,
+    };
+    send(room.host, packet);
+    send(room.guest, packet);
+}
+
+function updateRankedReadyCheck(code, room) {
+    if (!room || room.matchMode !== 'ranked' || !room.host || !room.guest) return;
+    const readyCount = Number(room.hostReady === true) + Number(room.guestReady === true);
+    if (readyCount === 2) {
+        clearRankedReadyCheck(room);
+        sendReadyCheckState(room, false);
+        return;
+    }
+    if (readyCount === 0) {
+        clearRankedReadyCheck(room);
+        sendReadyCheckState(room, false);
+        return;
+    }
+    if (!Number.isFinite(room.readyDeadlineAtMs)) {
+        room.readyDeadlineAtMs = Math.min(
+            Date.now() + RANKED_READY_CHECK_TIMEOUT_MS,
+            room.setupDeadlineAtMs
+        );
+        const remainingMs = Math.max(1, room.readyDeadlineAtMs - Date.now());
+        room.readyCheckTimer = setTimeout(
+            () => expireRankedReadyCheck(code),
+            remainingMs
+        );
+    }
+    sendReadyCheckState(room, true);
+}
+
+function setupTimeoutPacket(type, localTimedOut, room, reason, timedOutRole = null) {
+    return {
+        type,
+        localTimedOut,
+        reason,
+        timedOutRole,
+        matchMode: room.matchMode || 'ranked',
+        waitedMs: Math.max(0, Date.now() - (room.setupStartedAtMs || Date.now())),
+    };
+}
+
+function reconcileAfterSetupDeparture(room) {
+    if (!room || room.matchMode !== 'ranked') return;
+    reconcileRankedWaitingRooms().catch((error) => {
+        console.warn(`[matchmaking] ranked requeue failed: ${error?.message || 'unknown error'}`);
+    });
+}
+
+function expireRankedSetupIdle(code) {
+    const room = rooms[code];
+    if (!room || room.matchMode !== 'ranked' || room.matchStarted || !room.host || !room.guest) return;
+    if (room.hostReady !== room.guestReady) {
+        expireRankedReadyCheck(code);
+        return;
+    }
+    const reason = room.hostReady && room.guestReady ? 'start_timeout' : 'idle_timeout';
+    recordRankedSetupOutcome(room, 'not_started', reason);
+    send(room.host, setupTimeoutPacket('setup_idle_timeout', true, room, reason));
+    send(room.guest, setupTimeoutPacket('setup_idle_timeout', true, room, reason));
+    for (const participant of [room.host, room.guest]) {
+        participant.roomCode = null;
+        participant.role = null;
+    }
+    clearRankedSetupTimers(room);
+    delete rooms[code];
+    broadcastRoomRemoved(code);
+    console.log(`[-] Ranked setup expired without a ready player: ${code}`);
+}
+
+function promoteGuestToHost(code, room, reason = 'disconnect', detail = null) {
+    const promotedHost = room.guest;
+    if (!promotedHost || promotedHost.readyState !== WebSocket.OPEN) return false;
+    room.host = promotedHost;
+    room.guest = null;
+    room.hostRttMs = socketRttMs(promotedHost);
+    room.hostCharacterId = room.guestCharacterId;
+    room.hostPassiveId = room.guestPassiveId;
+    room.arenaId = room.guestArenaId || room.arenaId;
+    room.hostNickname = room.guestNickname;
+    room.hostPlayerId = room.guestPlayerId;
+    room.hostRating = room.guestRating;
+    room.hostMatches = room.guestMatches;
+    room.hostVersionCode = room.guestVersionCode;
+    room.hostVersionName = room.guestVersionName;
+    room.hostAnalyticsChannel = room.guestAnalyticsChannel;
+    room.hostCountryCode = room.guestCountryCode;
+    room.hostUserAgent = room.guestUserAgent;
+    resetGuestSlot(room);
+    room.qualityRejectedPlayers = new Map();
+    promotedHost.role = 'host';
+    promotedHost.roomCode = code;
+    send(promotedHost, {
+        type: 'host_migrated',
+        code,
+        reason,
+        detail,
+        networkMode: room.networkMode || 'relay',
+        arenaId: room.arenaId,
+        battleType: room.battleType,
+        matchMode: room.matchMode,
+        hostRating: room.hostRating,
+        hostMatches: room.hostMatches,
+        debugNoKo: room.debugNoKo,
+        debugNoTime: room.debugNoTime,
+    });
+    broadcastRoomUpsert(code);
+    return true;
+}
+
+function expireRankedReadyCheck(code) {
+    const room = rooms[code];
+    if (!room || room.matchMode !== 'ranked' || hasBattleLaunchSignaled(room)) return;
+    const hostReady = room.hostReady === true;
+    const guestReady = room.guestReady === true;
+    if (hostReady === guestReady) {
+        updateRankedReadyCheck(code, room);
+        return;
+    }
+    const timedOutRole = hostReady ? 'guest' : 'host';
+    const timedOutSocket = room[timedOutRole];
+    recordRankedSetupOutcome(room, 'not_started', 'ready_timeout', timedOutRole);
+    send(room.host, setupTimeoutPacket(
+        'setup_ready_timeout',
+        timedOutRole === 'host',
+        room,
+        'ready_timeout',
+        timedOutRole
+    ));
+    send(room.guest, setupTimeoutPacket(
+        'setup_ready_timeout',
+        timedOutRole === 'guest',
+        room,
+        'ready_timeout',
+        timedOutRole
+    ));
+
+    if (timedOutRole === 'guest') {
+        if (timedOutSocket) {
+            timedOutSocket.roomCode = null;
+            timedOutSocket.role = null;
+        }
+        send(room.host, { type: 'peer_disconnected', reason: 'setup_ready_timeout' });
+        resetGuestSlot(room);
+        broadcastRoomUpsert(code);
+        reconcileAfterSetupDeparture(room);
+    } else {
+        promoteGuestToHost(code, room, 'setup_ready_timeout');
+        if (timedOutSocket) {
+            timedOutSocket.roomCode = null;
+            timedOutSocket.role = null;
+        }
+        reconcileAfterSetupDeparture(room);
+    }
+    console.log(`[-] Ranked setup ready timeout: ${code} role=${timedOutRole}`);
 }
 
 function sendRelayAdmissionError(ws, relayStatus) {
@@ -3901,50 +4199,31 @@ function rejectAutomaticRelayStart(code, room) {
     console.log(`[!] Automatic Relay start rejected: ${code}`);
 }
 
-function leaveWaitingRoom(ws, notifyLeaver = false) {
+function leaveWaitingRoom(ws, {
+    notifyLeaver = false,
+    reason = 'disconnect',
+    detail = null,
+} = {}) {
     const code = ws?.roomCode;
     const room = code ? rooms[code] : null;
-    if (!room || room.matchStarted) return false;
+    if (!room || hasBattleLaunchSignaled(room)) return false;
 
     if (ws.role === 'guest') {
-        send(room.host, { type: 'peer_disconnected' });
+        recordRankedSetupOutcome(room, 'not_started', reason, 'guest', detail);
+        send(room.host, {
+            type: 'peer_disconnected',
+            reason,
+            detail,
+            departedRole: 'guest',
+        });
         resetGuestSlot(room);
         broadcastRoomUpsert(code);
+        reconcileAfterSetupDeparture(room);
         console.log(`[-] Guest left waiting room: ${code}`);
     } else if (ws.role === 'host' && room.guest?.readyState === WebSocket.OPEN) {
-        const promotedHost = room.guest;
-        room.host = promotedHost;
-        room.guest = null;
-        room.hostRttMs = socketRttMs(promotedHost);
-        room.hostCharacterId = room.guestCharacterId;
-        room.hostPassiveId = room.guestPassiveId;
-        room.arenaId = room.guestArenaId || room.arenaId;
-        room.hostNickname = room.guestNickname;
-        room.hostPlayerId = room.guestPlayerId;
-        room.hostRating = room.guestRating;
-        room.hostMatches = room.guestMatches;
-        room.hostVersionCode = room.guestVersionCode;
-        room.hostVersionName = room.guestVersionName;
-        room.hostAnalyticsChannel = room.guestAnalyticsChannel;
-        room.hostCountryCode = room.guestCountryCode;
-        room.hostUserAgent = room.guestUserAgent;
-        resetGuestSlot(room);
-        room.qualityRejectedPlayers = new Map();
-        promotedHost.role = 'host';
-        promotedHost.roomCode = code;
-        send(promotedHost, {
-            type: 'host_migrated',
-            code,
-            networkMode: room.networkMode || 'relay',
-            arenaId: room.arenaId,
-            battleType: room.battleType,
-            matchMode: room.matchMode,
-            hostRating: room.hostRating,
-            hostMatches: room.hostMatches,
-            debugNoKo: room.debugNoKo,
-            debugNoTime: room.debugNoTime,
-        });
-        broadcastRoomUpsert(code);
+        recordRankedSetupOutcome(room, 'not_started', reason, 'host', detail);
+        promoteGuestToHost(code, room, reason, detail);
+        reconcileAfterSetupDeparture(room);
         console.log(`[~] Host migrated after waiting host left: ${code}`);
     } else if (ws.role === 'host') {
         delete rooms[code];
@@ -3956,8 +4235,18 @@ function leaveWaitingRoom(ws, notifyLeaver = false) {
 
     ws.roomCode = null;
     ws.role = null;
-    if (notifyLeaver) send(ws, { type: 'room_left', code });
+    if (notifyLeaver) send(ws, { type: 'room_left', code, reason, detail });
     return true;
+}
+
+function setupLeaveDetail(value) {
+    const detail = diagnosticToken(value, 'user_left');
+    return new Set([
+        'user_back',
+        'return_to_lobby',
+        'matchmaking_cancel',
+        'user_left',
+    ]).has(detail) ? detail : 'user_left';
 }
 
 function rateLimitBucket(type) {
@@ -4260,6 +4549,14 @@ wss.on('connection', (ws, req) => {
                     qualityRejectedPlayers: new Map(),
                     battleStartAtMs: null,
                     matchStartedAtMs: null,
+                    hostReady: false,
+                    guestReady: false,
+                    setupStartedAtMs: null,
+                    setupOutcomeRecorded: false,
+                    setupIdleTimer: null,
+                    readyCheckTimer: null,
+                    readyDeadlineAtMs: null,
+                    setupDeadlineAtMs: null,
                 };
                 ws.roomCode = code;
                 ws.role = 'host';
@@ -4381,7 +4678,11 @@ wss.on('connection', (ws, req) => {
                     send(ws, { type: 'room_left', code: null });
                     break;
                 }
-                if (!leaveWaitingRoom(ws, true)) {
+                if (!leaveWaitingRoom(ws, {
+                    notifyLeaver: true,
+                    reason: 'user_left',
+                    detail: setupLeaveDetail(msg.leaveReason),
+                })) {
                     send(ws, {
                         type: 'error',
                         code: 'match_in_progress',
@@ -4418,6 +4719,7 @@ wss.on('connection', (ws, req) => {
                     }
                     room.hostNickname = typeof msg.nickname === 'string' ? msg.nickname : room.hostNickname;
                     room.hostPlayerId = typeof msg.playerId === 'string' ? msg.playerId : room.hostPlayerId;
+                    if (typeof msg.ready === 'boolean') room.hostReady = msg.ready;
                 } else if (ws.role === 'guest') {
                     room.guestCharacterId = enumToken(msg.characterId) || room.guestCharacterId;
                     room.guestPassiveId = enumToken(msg.passiveId) || room.guestPassiveId;
@@ -4426,12 +4728,16 @@ wss.on('connection', (ws, req) => {
                         : (enumToken(msg.arenaId) || room.guestArenaId);
                     room.guestNickname = typeof msg.nickname === 'string' ? msg.nickname : room.guestNickname;
                     room.guestPlayerId = typeof msg.playerId === 'string' ? msg.playerId : room.guestPlayerId;
+                    if (typeof msg.ready === 'boolean') room.guestReady = msg.ready;
                 }
                 const peer = ws.role === 'host' ? room.guest : room.host;
                 const selectionPacket = room.matchMode === 'ranked'
                     ? { ...msg, arenaId: room.arenaId, battleType: room.battleType }
                     : msg;
                 send(peer, selectionPacket);
+                if (room.matchMode === 'ranked' && !room.matchStarted) {
+                    updateRankedReadyCheck(code, room);
+                }
                 if (ws.role === 'host' && !room.guest) broadcastRoomUpsert(code);
                 break;
             }
@@ -4510,6 +4816,13 @@ wss.on('connection', (ws, req) => {
 
                 if (msg.type === 'game_start_failed') {
                     if (Number.isFinite(room.battleStartAtMs)) return;
+                    recordRankedSetupOutcome(
+                        room,
+                        'not_started',
+                        'start_failed',
+                        ws.role,
+                        diagnosticToken(msg.code, 'game_start_failed')
+                    );
                     if (room.matchMode === 'friendly' && room.host) {
                         recordGameStartFailure(room, ws, msg, 'friendly_guest_removed');
                         const host = room.host;
@@ -4546,6 +4859,14 @@ wss.on('connection', (ws, req) => {
 
                 if (msg.type === 'game_start') {
                     if (ws.role !== 'host') return;
+                    if (room.matchMode === 'ranked' && (!room.hostReady || !room.guestReady)) {
+                        send(ws, {
+                            type: 'error',
+                            code: 'setup_not_ready',
+                            message: 'Both players must be ready before starting a ranked match',
+                        });
+                        return;
+                    }
                     const requestedTransport = room.matchStarted
                         ? (room.activeTransport || battleTransport(msg.activeTransport, room.networkMode))
                         : battleTransport(msg.activeTransport, room.networkMode);
@@ -4659,13 +4980,16 @@ wss.on('connection', (ws, req) => {
     });
 
     ws.on('close', (closeCode, closeReason) => {
-        recordWebSocketDisconnect(ws, closeCode, closeReason);
+        const disconnectSource = recordWebSocketDisconnect(ws, closeCode, closeReason);
         const code = ws.roomCode;
         if (!code || !rooms[code]) return;
 
         const room = rooms[code];
         if (!['host', 'guest'].includes(ws.role) || room[ws.role] !== ws) return;
-        if (leaveWaitingRoom(ws)) return;
+        if (leaveWaitingRoom(ws, {
+            reason: 'disconnect',
+            detail: disconnectSource,
+        })) return;
 
         const peer = ws.role === 'host' ? room.guest : room.host;
 

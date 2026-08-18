@@ -37,6 +37,8 @@ Set these environment variables in production to block outdated multiplayer clie
 | `DEPLOYMENT_DRAIN_MESSAGE` | Korean default | Message shown while the runtime deployment drain blocks new entry |
 | `DATABASE_URL` | unset | PostgreSQL connection string. When set, match results/rankings use Postgres instead of memory |
 | `CONFIRMED_MATCH_TTL_MS` | `86400000` | Time a server-confirmed PvP result remains eligible for stats submission |
+| `RANKED_READY_CHECK_TIMEOUT_MS` | `30000` | Time the remaining player has to ready after one ranked player readies |
+| `RANKED_SETUP_IDLE_TIMEOUT_MS` | `60000` | Maximum ranked setup time when neither player readies |
 | `RANK_PLACEMENT_MATCHES` | `10` | Ranked matches that use the placement K-factor |
 | `RANK_PLACEMENT_K` | `48` | Elo K-factor while either player is in placement |
 | `RANK_ESTABLISHED_K` | `24` | Elo K-factor after placement |
@@ -126,7 +128,7 @@ An unapproved channel returns HTTP 409 with `wrong_environment`. A missing, malf
 | `join_room` | Client -> Server | Compatibility metadata and `{ code, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
 | `room_joined` | Server -> Guest | `{ code, networkMode, battleType, debugNoKo, debugNoTime, hostCharacterId, hostPassiveId, arenaId, hostNickname, hostPlayerId }` |
 | `guest_joined` | Server -> Host | `{ networkMode, battleType, debugNoKo, debugNoTime, guestCharacterId, guestPassiveId, arenaId, guestNickname, guestPlayerId }` |
-| `leave_room` | Client -> Server | Leave the waiting/rematch room while keeping the WebSocket connected |
+| `leave_room` | Client -> Server | Leave the waiting/rematch room while keeping the WebSocket connected. Optional `leaveReason` is allowlisted as `user_back`, `return_to_lobby`, or `matchmaking_cancel` |
 | `room_left` | Server -> Client | Confirms that room state was cleared; the client can return to room-list polling |
 | `selection_update` | Client -> Server -> Peer | Live setup selection and ready state: `{ characterId, passiveId, arenaId, battleType, nickname, playerId, ready, networkMode }`; room `battleType` is fixed at `create_room` |
 | `ping_check` | Client -> Server | `{ clientTime, rttMs? }` |
@@ -174,7 +176,7 @@ The same process also exposes HTTP JSON APIs. With `DATABASE_URL` set, the serve
 | `GET` | `/admin/api/support` | Basic-auth JSON support inbox; filter with `channel` and `status` |
 | `POST` | `/admin/api/support/:inquiryId/status` | Basic-auth support status update: `open`, `review`, or `closed` |
 
-`/health`, `/capacity`, and the admin snapshot expose process-local operational metrics: active Relay/P2P matches, Relay packet/byte totals, rolling 60-minute Relay bytes, Relay/capacity rejections, WebSocket backpressure drops/closes, disconnect sources, ranked integrity-audit counts, and rolling 60-second event-loop lag. Counters reset when the service restarts. The rolling egress value measures WebSocket payload bytes and is an application-level estimate; Railway Network Egress remains the billing source of truth.
+`/health`, `/capacity`, and the admin snapshot expose process-local operational metrics: active Relay/P2P matches, Relay packet/byte totals, rolling 60-minute Relay bytes, Relay/capacity rejections, WebSocket backpressure drops/closes, disconnect sources, ranked setup launch/failure counts, ranked integrity-audit counts, and rolling 60-second event-loop lag. Ranked setup failures use stable top-level reasons (`user_left`, `disconnect`, `ready_timeout`, `idle_timeout`, `start_timeout`, `start_failed`) plus `failureDetails` such as `user_left.user_back`, `disconnect.transport`, or `disconnect.heartbeat_timeout`. A force-closed app and a broken transport cannot be reliably distinguished, so both remain under `disconnect`. Counters reset when the service restarts. The rolling egress value measures WebSocket payload bytes and is an application-level estimate; Railway Network Egress remains the billing source of truth.
 
 `/health` deliberately does not query PostgreSQL. Railway calls it while a new deployment starts, so it must reflect process readiness without making deployment activation depend on a dashboard query. It remains HTTP 200 while runtime drain is active and reports `acceptingConnections=false`; `/capacity` and WebSocket admission enforce the actual entry block.
 

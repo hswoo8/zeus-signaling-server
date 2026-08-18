@@ -512,6 +512,87 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     atomicRankedHost.close();
     atomicRankedGuest.close();
 
+    const prelaunchRankedHost = await connect(`ws://127.0.0.1:${port}`);
+    const promotedRankedGuest = await connect(`ws://127.0.0.1:${port}`);
+    const replacementRankedGuest = await connect(`ws://127.0.0.1:${port}`);
+    const prelaunchRankedHostInbox = createInbox(prelaunchRankedHost);
+    const promotedRankedInbox = createInbox(promotedRankedGuest);
+    const replacementRankedInbox = createInbox(replacementRankedGuest);
+    prelaunchRankedHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'ranked',
+        hostPlayerId: 'prelaunch-ranked-host',
+        hostCharacterId: 'ZEUS',
+        hostPassiveId: 'IRON_WILL',
+    }));
+    const prelaunchRankedRoom = await prelaunchRankedHostInbox.type('room_created');
+    promotedRankedGuest.send(JSON.stringify({
+        type: 'join_ranked_room',
+        ...versionFields,
+        code: prelaunchRankedRoom.code,
+        guestPlayerId: 'promoted-ranked-guest',
+        guestCharacterId: 'TRICKSTER',
+        guestPassiveId: 'LUCKY_WITCH',
+    }));
+    await Promise.all([
+        prelaunchRankedHostInbox.type('guest_joined'),
+        promotedRankedInbox.type('room_joined'),
+    ]);
+    prelaunchRankedHost.send(JSON.stringify({
+        type: 'selection_update',
+        ...versionFields,
+        ready: true,
+    }));
+    await promotedRankedInbox.type('selection_update');
+    promotedRankedGuest.send(JSON.stringify({
+        type: 'selection_update',
+        ...versionFields,
+        ready: true,
+    }));
+    await prelaunchRankedHostInbox.type('selection_update');
+    prelaunchRankedHost.send(JSON.stringify({
+        type: 'game_start',
+        ...versionFields,
+        activeTransport: 'p2p',
+    }));
+    await Promise.all([
+        prelaunchRankedHostInbox.type('match_assigned'),
+        promotedRankedInbox.type('game_start'),
+    ]);
+
+    prelaunchRankedHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    const [prelaunchRankedLeft, rankedMigrated] = await Promise.all([
+        prelaunchRankedHostInbox.type('room_left'),
+        promotedRankedInbox.type('host_migrated'),
+    ]);
+    assert.equal(prelaunchRankedLeft.code, prelaunchRankedRoom.code);
+    assert.equal(rankedMigrated.code, prelaunchRankedRoom.code);
+    assert.equal(rankedMigrated.matchMode, 'ranked');
+
+    replacementRankedGuest.send(JSON.stringify({
+        type: 'join_ranked_room',
+        ...versionFields,
+        code: prelaunchRankedRoom.code,
+        guestPlayerId: 'replacement-ranked-guest',
+        guestCharacterId: 'ZEUS',
+        guestPassiveId: 'STORM_MASTERY',
+    }));
+    await Promise.all([
+        promotedRankedInbox.type('guest_joined'),
+        replacementRankedInbox.type('room_joined'),
+    ]);
+    replacementRankedGuest.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await Promise.all([
+        replacementRankedInbox.type('room_left'),
+        promotedRankedInbox.type('peer_disconnected'),
+    ]);
+    promotedRankedGuest.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await promotedRankedInbox.type('room_left');
+    prelaunchRankedHost.close();
+    promotedRankedGuest.close();
+    replacementRankedGuest.close();
+
     const expandedKrPlayer = await connect(`ws://127.0.0.1:${port}`, {
         headers: { 'x-country-code': 'KR' },
     });
@@ -949,6 +1030,10 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     const transportReady = await guestInbox.type('game_transport_ready');
     assert.equal(transportReady.activeTransport, 'relay');
 
+    host.send(JSON.stringify({ type: 'selection_update', ...versionFields, ready: true }));
+    await guestInbox.type('selection_update');
+    guest.send(JSON.stringify({ type: 'selection_update', ...versionFields, ready: true }));
+    await hostInbox.type('selection_update');
     host.send(JSON.stringify({ type: 'game_start', ...versionFields }));
     const [assigned, started] = await Promise.all([
         hostInbox.type('match_assigned'),
@@ -1072,7 +1157,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(backpressureCapacity.backpressure.closedConnections, 0);
     assert.equal(backpressureCapacity.counts.activeRelayMatches, 1);
     assert.equal(backpressureCapacity.counts.activeP2pMatches, 0);
-    assert.equal(backpressureCapacity.operations.relay.packets, 8);
+    assert.equal(backpressureCapacity.operations.relay.packets, 9);
     assert.ok(backpressureCapacity.operations.relay.bytes > 0);
     assert.equal(backpressureCapacity.operations.backpressure.droppedStatePackets, 1);
     assert.equal(backpressureCapacity.relay.canStartNewMatch, true);
@@ -1112,8 +1197,10 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(acceptedBody.players.local.ratingBefore, 1000);
     assert.equal(acceptedBody.players.local.ratingDelta, 24);
     assert.equal(acceptedBody.players.local.rating, 1024);
+    assert.equal(acceptedBody.players.local.rewardCoins, 20);
     assert.equal(acceptedBody.players.remote.ratingDelta, -24);
     assert.equal(acceptedBody.players.remote.rating, 976);
+    assert.equal(acceptedBody.players.remote.rewardCoins, 0);
 
     const duplicate = await fetch(`${baseUrl}/matches/pvp-result`, {
         method: 'POST',
@@ -1181,6 +1268,11 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     ]);
     assert.equal(disconnectAssigned.arenaId, disconnectStarted.arenaId);
     assert.notEqual(disconnectStarted.arenaId, rematchStarted.arenaId);
+    guest.send(JSON.stringify({ type: 'game_ready', ...versionFields }));
+    await Promise.all([
+        hostInbox.type('game_countdown_sync'),
+        guestInbox.type('game_countdown_sync'),
+    ]);
     guest.close();
     const disconnectResult = await hostInbox.type('match_result');
     assert.equal(disconnectResult.matchId, disconnectAssigned.matchId);
@@ -1271,6 +1363,210 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.match(adminHtml, /이벤트 루프 p95/);
     assert.match(adminHtml, /송신 지연 보호/);
     assert.match(adminHtml, /배포 드레인 시작/);
+});
+
+test('ranked setup ready checks time out inactive players and expose setup outcomes', async (t) => {
+    const port = 21500 + Math.floor(Math.random() * 400);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const child = spawn(process.execPath, ['server.js'], {
+        cwd: __dirname,
+        env: {
+            ...process.env,
+            PORT: String(port),
+            DATABASE_URL: '',
+            SERVER_CHANNEL: 'dev',
+            SERVER_ALLOWED_CHANNELS: 'dev',
+            MULTIPLAYER_RULESET_VERSION: '1',
+            RANKED_READY_CHECK_TIMEOUT_MS: '120',
+            RANKED_SETUP_IDLE_TIMEOUT_MS: '250',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let serverErrors = '';
+    child.stderr.on('data', (chunk) => { serverErrors += chunk.toString(); });
+    t.after(() => {
+        if (child.exitCode === null) child.kill('SIGTERM');
+    });
+    await waitForServer(baseUrl, child);
+
+    const inactiveHost = await connect(`ws://127.0.0.1:${port}`);
+    const readyGuest = await connect(`ws://127.0.0.1:${port}`);
+    const replacementGuest = await connect(`ws://127.0.0.1:${port}`);
+    const inactiveHostInbox = createInbox(inactiveHost);
+    const readyGuestInbox = createInbox(readyGuest);
+    const replacementInbox = createInbox(replacementGuest);
+    t.after(() => {
+        inactiveHost.close();
+        readyGuest.close();
+        replacementGuest.close();
+    });
+
+    inactiveHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'ranked',
+        networkMode: 'relay',
+        hostPlayerId: 'inactive-ready-host',
+    }));
+    const created = await inactiveHostInbox.type('room_created');
+    readyGuest.send(JSON.stringify({
+        type: 'join_ranked_room',
+        ...versionFields,
+        code: created.code,
+        guestPlayerId: 'ready-ranked-guest',
+    }));
+    await Promise.all([
+        inactiveHostInbox.type('guest_joined'),
+        readyGuestInbox.type('room_joined'),
+    ]);
+    const [hostSetupDeadline, guestSetupDeadline] = await Promise.all([
+        inactiveHostInbox.type('setup_deadline'),
+        readyGuestInbox.type('setup_deadline'),
+    ]);
+    assert.equal(hostSetupDeadline.deadlineAtMs, guestSetupDeadline.deadlineAtMs);
+    readyGuest.send(JSON.stringify({ type: 'selection_update', ...versionFields, ready: true }));
+    await inactiveHostInbox.type('selection_update');
+    const [hostReadyCheck, guestReadyCheck] = await Promise.all([
+        inactiveHostInbox.type('setup_ready_check'),
+        readyGuestInbox.type('setup_ready_check'),
+    ]);
+    assert.equal(hostReadyCheck.active, true);
+    assert.equal(guestReadyCheck.active, true);
+    assert.ok(hostReadyCheck.countdownMs <= 120 && hostReadyCheck.countdownMs > 0);
+    assert.ok(hostReadyCheck.deadlineAtMs <= hostSetupDeadline.deadlineAtMs);
+
+    readyGuest.send(JSON.stringify({ type: 'selection_update', ...versionFields, ready: false }));
+    await inactiveHostInbox.type('selection_update');
+    const [hostReadyCancelled, guestReadyCancelled] = await Promise.all([
+        inactiveHostInbox.next((message) => message.type === 'setup_ready_check' && message.active === false),
+        readyGuestInbox.next((message) => message.type === 'setup_ready_check' && message.active === false),
+    ]);
+    assert.equal(hostReadyCancelled.active, false);
+    assert.equal(guestReadyCancelled.active, false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    readyGuest.send(JSON.stringify({ type: 'selection_update', ...versionFields, ready: true }));
+    await inactiveHostInbox.type('selection_update');
+    const [hostResetReadyCheck, guestResetReadyCheck] = await Promise.all([
+        inactiveHostInbox.next((message) => message.type === 'setup_ready_check' && message.active === true),
+        readyGuestInbox.next((message) => message.type === 'setup_ready_check' && message.active === true),
+    ]);
+    assert.ok(hostResetReadyCheck.deadlineAtMs > hostReadyCheck.deadlineAtMs);
+    assert.ok(hostResetReadyCheck.deadlineAtMs <= hostSetupDeadline.deadlineAtMs);
+    assert.equal(hostResetReadyCheck.deadlineAtMs, guestResetReadyCheck.deadlineAtMs);
+
+    const [hostTimeout, guestTimeout, migrated] = await Promise.all([
+        inactiveHostInbox.type('setup_ready_timeout'),
+        readyGuestInbox.type('setup_ready_timeout'),
+        readyGuestInbox.type('host_migrated'),
+    ]);
+    assert.equal(hostTimeout.localTimedOut, true);
+    assert.equal(guestTimeout.localTimedOut, false);
+    assert.equal(hostTimeout.timedOutRole, 'host');
+    assert.equal(migrated.code, created.code);
+    assert.equal(migrated.reason, 'setup_ready_timeout');
+
+    replacementGuest.send(JSON.stringify({
+        type: 'join_ranked_room',
+        ...versionFields,
+        code: created.code,
+        guestPlayerId: 'replacement-ready-guest',
+    }));
+    await Promise.all([
+        readyGuestInbox.type('guest_joined'),
+        replacementInbox.type('room_joined'),
+    ]);
+    replacementGuest.send(JSON.stringify({
+        type: 'leave_room',
+        ...versionFields,
+        leaveReason: 'user_back',
+    }));
+    const [replacementLeft, peerSawUserLeave] = await Promise.all([
+        replacementInbox.type('room_left'),
+        readyGuestInbox.type('peer_disconnected'),
+    ]);
+    assert.equal(replacementLeft.reason, 'user_left');
+    assert.equal(replacementLeft.detail, 'user_back');
+    assert.equal(peerSawUserLeave.reason, 'user_left');
+    assert.equal(peerSawUserLeave.detail, 'user_back');
+    readyGuest.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await readyGuestInbox.type('room_left');
+
+    const disconnectHost = await connect(`ws://127.0.0.1:${port}`);
+    const disconnectGuest = await connect(`ws://127.0.0.1:${port}`);
+    const disconnectHostInbox = createInbox(disconnectHost);
+    const disconnectGuestInbox = createInbox(disconnectGuest);
+    t.after(() => {
+        disconnectHost.close();
+        disconnectGuest.close();
+    });
+    disconnectHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'ranked',
+        networkMode: 'relay',
+        hostPlayerId: 'disconnect-ranked-host',
+    }));
+    const disconnectCreated = await disconnectHostInbox.type('room_created');
+    disconnectGuest.send(JSON.stringify({
+        type: 'join_ranked_room',
+        ...versionFields,
+        code: disconnectCreated.code,
+        guestPlayerId: 'disconnect-ranked-guest',
+    }));
+    await Promise.all([
+        disconnectHostInbox.type('guest_joined'),
+        disconnectGuestInbox.type('room_joined'),
+    ]);
+    disconnectGuest.terminate();
+    const peerSawDisconnect = await disconnectHostInbox.type('peer_disconnected');
+    assert.equal(peerSawDisconnect.reason, 'disconnect');
+    assert.equal(peerSawDisconnect.detail, 'transport');
+    disconnectHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await disconnectHostInbox.type('room_left');
+
+    const idleHost = await connect(`ws://127.0.0.1:${port}`);
+    const idleGuest = await connect(`ws://127.0.0.1:${port}`);
+    const idleHostInbox = createInbox(idleHost);
+    const idleGuestInbox = createInbox(idleGuest);
+    t.after(() => {
+        idleHost.close();
+        idleGuest.close();
+    });
+    idleHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'ranked',
+        networkMode: 'relay',
+        hostPlayerId: 'idle-ranked-host',
+    }));
+    const idleCreated = await idleHostInbox.type('room_created');
+    idleGuest.send(JSON.stringify({
+        type: 'join_ranked_room',
+        ...versionFields,
+        code: idleCreated.code,
+        guestPlayerId: 'idle-ranked-guest',
+    }));
+    await Promise.all([idleHostInbox.type('guest_joined'), idleGuestInbox.type('room_joined')]);
+    const [idleHostTimeout, idleGuestTimeout] = await Promise.all([
+        idleHostInbox.type('setup_idle_timeout'),
+        idleGuestInbox.type('setup_idle_timeout'),
+    ]);
+    assert.equal(idleHostTimeout.localTimedOut, true);
+    assert.equal(idleGuestTimeout.localTimedOut, true);
+
+    const capacity = await fetch(`${baseUrl}/capacity`).then((response) => response.json());
+    assert.equal(capacity.operations.rankedSetup.sessions, 4, serverErrors);
+    assert.equal(capacity.operations.rankedSetup.launched, 0);
+    assert.equal(capacity.operations.rankedSetup.notStarted, 4);
+    assert.equal(capacity.operations.rankedSetup.failureReasons.ready_timeout, 1);
+    assert.equal(capacity.operations.rankedSetup.failureReasons.idle_timeout, 1);
+    assert.equal(capacity.operations.rankedSetup.failureReasons.user_left, 1);
+    assert.equal(capacity.operations.rankedSetup.failureReasons.disconnect, 1);
+    assert.equal(capacity.operations.rankedSetup.failureDetails['user_left.user_back'], 1);
+    assert.equal(capacity.operations.rankedSetup.failureDetails['disconnect.transport'], 1);
+    assert.equal(capacity.operations.rankedSetup.readyTimeoutSec, 1);
+    assert.equal(capacity.operations.rankedSetup.idleTimeoutSec, 1);
+
 });
 
 test('relay admission limits preserve P2P matches and drop P2P gameplay sent over WebSocket', async (t) => {
@@ -1428,10 +1724,19 @@ test('P2P failure checks assign a missing peer and invalidate ambiguous failures
             guestPassiveId: guestPlayer.passiveId,
         }));
         await Promise.all([hostInbox.type('guest_joined'), guestInbox.type('room_joined')]);
+        host.send(JSON.stringify({ type: 'selection_update', ...versionFields, ready: true }));
+        await guestInbox.type('selection_update');
+        guest.send(JSON.stringify({ type: 'selection_update', ...versionFields, ready: true }));
+        await hostInbox.type('selection_update');
         host.send(JSON.stringify({ type: 'game_start', ...versionFields, activeTransport: 'p2p' }));
         const [assigned] = await Promise.all([
             hostInbox.type('match_assigned'),
             guestInbox.type('game_start'),
+        ]);
+        guest.send(JSON.stringify({ type: 'game_ready', ...versionFields }));
+        await Promise.all([
+            hostInbox.type('game_countdown_sync'),
+            guestInbox.type('game_countdown_sync'),
         ]);
         return {
             host,
