@@ -20,6 +20,9 @@ const MAX_MSG_BYTES = Number(process.env.MAX_MSG_BYTES || 16 * 1024);
 const HTTP_BODY_LIMIT_BYTES = Number(process.env.HTTP_BODY_LIMIT_BYTES || MAX_MSG_BYTES);
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 15000);
 const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS || 45000);
+const POPULATION_BROADCAST_DEBOUNCE_MS = Number(
+    process.env.POPULATION_BROADCAST_DEBOUNCE_MS || 500
+);
 const WS_BACKPRESSURE_SOFT_BYTES = Number(process.env.WS_BACKPRESSURE_SOFT_BYTES || 256 * 1024);
 const WS_BACKPRESSURE_HARD_BYTES = Number(process.env.WS_BACKPRESSURE_HARD_BYTES || 1024 * 1024);
 const MAX_CONNECTIONS = envOptionalInt(['MAX_CONNECTIONS', 'MULTIPLAYER_MAX_CONNECTIONS']);
@@ -178,9 +181,11 @@ let relayRuntimeFallbacks = 0;
 let eventLoopLagLatestMs = 0;
 const eventLoopLagSamples = [];
 const relayMinuteBytes = new Map();
+let populationBroadcastTimer = null;
 
 const LOBBY_TYPES = new Set([
-    'create_room', 'join_room', 'join_ranked_room', 'leave_room', 'get_room_list', 'ping_check', 'selection_update',
+    'create_room', 'join_room', 'join_ranked_room', 'leave_room', 'get_room_list', 'lobby_presence',
+    'ping_check', 'selection_update',
     'offer', 'answer', 'ice_candidate', 'resume_match',
 ]);
 const MATCH_MODES = new Set(['ranked', 'casual', 'friendly']);
@@ -210,7 +215,7 @@ const P2P_GAMEPLAY_TYPES = new Set([
 ]);
 
 const COMPATIBILITY_TYPES = new Set([
-    'create_room', 'join_room', 'join_ranked_room', 'leave_room', 'get_room_list', 'ping_check',
+    'create_room', 'join_room', 'join_ranked_room', 'leave_room', 'get_room_list', 'lobby_presence', 'ping_check',
     'selection_update', 'resume_match', 'game_start', 'game_ready', 'rematch_ready',
 ]);
 
@@ -1284,6 +1289,64 @@ function roomCounts() {
         activeRelayMatches,
         activeP2pMatches,
     };
+}
+
+function socketMatchesViewerCountry(socket, viewer) {
+    const socketCountry = normalizedCountryCode(socket?.analyticsCountryCode);
+    const viewerCountry = normalizedCountryCode(viewer?.analyticsCountryCode);
+    if (!socketCountry || !viewerCountry) return !socketCountry && !viewerCountry;
+    return socketCountry === viewerCountry;
+}
+
+function populationSnapshot(viewer) {
+    let lobbyUsers = 0;
+    let friendlySearching = 0;
+    let rankedSearching = 0;
+    let availableFriendlyRooms = 0;
+
+    wss.clients.forEach((client) => {
+        if (client.readyState !== WebSocket.OPEN ||
+            client.lobbyPresenceActive !== true ||
+            !socketMatchesViewerCountry(client, viewer)) return;
+        lobbyUsers += 1;
+    });
+
+    for (const [code, room] of Object.entries(rooms)) {
+        const entry = roomListEntry(code, room, viewer, 1000);
+        if (!entry) continue;
+        if (room.matchMode === 'ranked') {
+            rankedSearching += 1;
+        } else if (room.matchMode === 'friendly') {
+            availableFriendlyRooms += 1;
+            if (room.matchmaking === true) friendlySearching += 1;
+        }
+    }
+
+    return {
+        type: 'population_updated',
+        poolId: SERVER_POOL_ID,
+        lobbyUsers,
+        friendlySearching,
+        rankedSearching,
+        availableFriendlyRooms,
+    };
+}
+
+function sendPopulationSnapshot(client) {
+    if (!client || client.readyState !== WebSocket.OPEN) return;
+    send(client, populationSnapshot(client));
+}
+
+function schedulePopulationBroadcast() {
+    if (populationBroadcastTimer) return;
+    populationBroadcastTimer = setTimeout(() => {
+        populationBroadcastTimer = null;
+        wss.clients.forEach((client) => {
+            if (client.populationSubscribed === true && client.readyState === WebSocket.OPEN) {
+                sendPopulationSnapshot(client);
+            }
+        });
+    }, Math.max(50, POPULATION_BROADCAST_DEBOUNCE_MS));
 }
 
 function recordRelayBytes(bytes) {
@@ -3632,6 +3695,7 @@ function roomListEntry(code, room, viewer, viewerRating = 1000) {
         arenaId: room.arenaId,
         battleType: room.battleType,
         matchMode: room.matchMode || 'friendly',
+        matchmaking: room.matchmaking === true,
         networkMode: room.networkMode || 'relay',
         region: room.hostRegion || null,
         relayRegion: SERVER_POOL_ID,
@@ -3842,12 +3906,14 @@ function broadcastRoomUpsert(code) {
             send(client, { type: 'room_removed', code });
         }
     });
+    schedulePopulationBroadcast();
 }
 
 function broadcastRoomRemoved(code) {
     wss.clients.forEach((client) => {
         if (client.roomListSubscribed) send(client, { type: 'room_removed', code });
     });
+    schedulePopulationBroadcast();
 }
 
 function smoothedRttMs(previous, sample) {
@@ -4206,7 +4272,9 @@ function leaveWaitingRoom(ws, {
 } = {}) {
     const code = ws?.roomCode;
     const room = code ? rooms[code] : null;
-    if (!room || hasBattleLaunchSignaled(room)) return false;
+    // A completed match keeps its room for the rematch flow, but either player
+    // must still be able to leave that room before creating a new one.
+    if (!room || (hasBattleLaunchSignaled(room) && !room.finalResult)) return false;
 
     if (ws.role === 'guest') {
         recordRankedSetupOutcome(room, 'not_started', reason, 'guest', detail);
@@ -4356,6 +4424,9 @@ wss.on('connection', (ws, req) => {
     ws.role = null; // 'host' | 'guest'
     ws.lastRankedArenaId = null;
     ws.roomListSubscribed = false;
+    ws.populationSubscribed = false;
+    ws.lobbyPresenceActive = false;
+    ws.lobbySelectedMode = 'friendly';
     ws.analyticsCountryCode = requestCountry(req, null);
     ws.analyticsUserAgent = safeUserAgent(req);
     ws.authPlayerId = normalizePlayerId(req.authPrincipal?.sub);
@@ -4411,6 +4482,15 @@ wss.on('connection', (ws, req) => {
         }
 
         switch (msg.type) {
+            case 'lobby_presence': {
+                ws.populationSubscribed = msg.active === true;
+                ws.lobbyPresenceActive = msg.active === true;
+                ws.lobbySelectedMode = matchMode(msg.selectedMode);
+                if (ws.populationSubscribed) sendPopulationSnapshot(ws);
+                schedulePopulationBroadcast();
+                break;
+            }
+
             case 'ping_check': {
                 const reportedRttMs = msg.rttMs;
                 if (typeof reportedRttMs === 'number' &&
@@ -4951,6 +5031,7 @@ wss.on('connection', (ws, req) => {
                 }
                 if (msg.type === 'rematch_ready') {
                     const prefix = ws.role === 'host' ? 'host' : 'guest';
+                    room[`${prefix}Ready`] = msg.ready !== false;
                     room[`${prefix}CharacterId`] = enumToken(msg.characterId) || room[`${prefix}CharacterId`];
                     room[`${prefix}PassiveId`] = enumToken(msg.passiveId) || room[`${prefix}PassiveId`];
                     room[`${prefix}Nickname`] = typeof msg.nickname === 'string' ? msg.nickname : room[`${prefix}Nickname`];
@@ -4981,6 +5062,9 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', (closeCode, closeReason) => {
         const disconnectSource = recordWebSocketDisconnect(ws, closeCode, closeReason);
+        ws.populationSubscribed = false;
+        ws.lobbyPresenceActive = false;
+        schedulePopulationBroadcast();
         const code = ws.roomCode;
         if (!code || !rooms[code]) return;
 
@@ -5056,6 +5140,7 @@ const eventLoopLagInterval = setInterval(() => {
 wss.on('close', () => {
     clearInterval(heartbeatInterval);
     clearInterval(eventLoopLagInterval);
+    if (populationBroadcastTimer) clearTimeout(populationBroadcastTimer);
 });
 
 initializeStatsStorage()

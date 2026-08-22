@@ -118,6 +118,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
             RANK_PLACEMENT_K: '48',
             RANK_ESTABLISHED_K: '24',
             QUALITY_REJECT_COOLDOWN_MS: '60000',
+            POPULATION_BROADCAST_DEBOUNCE_MS: '50',
             NICKNAME_BLOCKED_TERMS: 'spoilername',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -376,6 +377,130 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(soloRooms.rooms.some((room) => room.code === soloCreated.code), false);
     soloHost.close();
     roomListObserver.close();
+
+    const populationViewer = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const populationBrowser = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const populationViewerInbox = createInbox(populationViewer);
+    const populationBrowserInbox = createInbox(populationBrowser);
+    populationViewer.send(JSON.stringify({
+        type: 'lobby_presence',
+        ...versionFields,
+        active: true,
+        selectedMode: 'friendly',
+    }));
+    await populationViewerInbox.next((message) =>
+        message.type === 'population_updated' && message.lobbyUsers === 1
+    );
+    populationBrowser.send(JSON.stringify({
+        type: 'lobby_presence',
+        ...versionFields,
+        active: true,
+        selectedMode: 'friendly',
+    }));
+    await populationBrowserInbox.type('population_updated');
+    await populationViewerInbox.next((message) =>
+        message.type === 'population_updated' && message.lobbyUsers === 2
+    );
+
+    const publicRoomHost = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const publicRoomHostInbox = createInbox(publicRoomHost);
+    publicRoomHost.send(JSON.stringify({
+        type: 'lobby_presence',
+        ...versionFields,
+        active: true,
+        selectedMode: 'friendly',
+    }));
+    await publicRoomHostInbox.type('population_updated');
+    publicRoomHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'friendly',
+        matchmaking: false,
+        hostPlayerId: 'population-public-host',
+    }));
+    await publicRoomHostInbox.type('room_created');
+    await populationViewerInbox.next((message) =>
+        message.type === 'population_updated' &&
+        message.lobbyUsers === 3 &&
+        message.availableFriendlyRooms === 1 &&
+        message.friendlySearching === 0
+    );
+    publicRoomHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await publicRoomHostInbox.type('room_left');
+    publicRoomHost.close();
+
+    const friendlySearchHost = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const friendlySearchHostInbox = createInbox(friendlySearchHost);
+    friendlySearchHost.send(JSON.stringify({
+        type: 'lobby_presence',
+        ...versionFields,
+        active: true,
+        selectedMode: 'friendly',
+    }));
+    await friendlySearchHostInbox.type('population_updated');
+    friendlySearchHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'friendly',
+        matchmaking: true,
+        hostPlayerId: 'population-friendly-search-host',
+    }));
+    await friendlySearchHostInbox.type('room_created');
+    await populationViewerInbox.next((message) =>
+        message.type === 'population_updated' &&
+        message.availableFriendlyRooms === 1 &&
+        message.friendlySearching === 1
+    );
+    friendlySearchHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await friendlySearchHostInbox.type('room_left');
+    friendlySearchHost.close();
+
+    const rankedSearchHost = await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'KR' },
+    });
+    const rankedSearchHostInbox = createInbox(rankedSearchHost);
+    rankedSearchHost.send(JSON.stringify({
+        type: 'lobby_presence',
+        ...versionFields,
+        active: true,
+        selectedMode: 'ranked',
+    }));
+    await rankedSearchHostInbox.type('population_updated');
+    rankedSearchHost.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'ranked',
+        hostPlayerId: 'population-ranked-search-host',
+    }));
+    await rankedSearchHostInbox.type('room_created');
+    await populationViewerInbox.next((message) =>
+        message.type === 'population_updated' && message.rankedSearching === 1
+    );
+    rankedSearchHost.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await rankedSearchHostInbox.type('room_left');
+    rankedSearchHost.close();
+    populationViewer.send(JSON.stringify({
+        type: 'lobby_presence',
+        ...versionFields,
+        active: false,
+        selectedMode: 'friendly',
+    }));
+    populationBrowser.send(JSON.stringify({
+        type: 'lobby_presence',
+        ...versionFields,
+        active: false,
+        selectedMode: 'friendly',
+    }));
+    populationViewer.close();
+    populationBrowser.close();
 
     const staleHost = await connect(`ws://127.0.0.1:${port}`);
     const replacementHost = await connect(`ws://127.0.0.1:${port}`);
@@ -1179,6 +1304,33 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(hostResult.matchId, assigned.matchId);
     assert.equal(guestResult.matchId, assigned.matchId);
 
+    host.send(JSON.stringify({
+        type: 'rematch_ready',
+        ...versionFields,
+        ready: true,
+        characterId: hostPlayer.characterId,
+        passiveId: hostPlayer.passiveId,
+    }));
+    const hostReadyForRematch = await guestInbox.type('rematch_ready');
+    assert.equal(hostReadyForRematch.ready, true);
+    host.send(JSON.stringify({
+        type: 'rematch_ready',
+        ...versionFields,
+        ready: false,
+        characterId: hostPlayer.characterId,
+        passiveId: hostPlayer.passiveId,
+    }));
+    const hostCancelledRematchReady = await guestInbox.type('rematch_ready');
+    assert.equal(hostCancelledRematchReady.ready, false);
+    host.send(JSON.stringify({
+        type: 'rematch_ready',
+        ...versionFields,
+        ready: true,
+        characterId: hostPlayer.characterId,
+        passiveId: hostPlayer.passiveId,
+    }));
+    assert.equal((await guestInbox.type('rematch_ready')).ready, true);
+
     const mismatch = await fetch(`${baseUrl}/matches/pvp-result`, {
         method: 'POST',
         headers: appJsonHeaders,
@@ -1295,6 +1447,24 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(finalStats.status, 200);
     assert.equal((await finalStats.json()).matches, 3);
 
+    host.send(JSON.stringify({
+        type: 'leave_room',
+        ...versionFields,
+        leaveReason: 'return_to_lobby',
+    }));
+    const completedRoomLeft = await hostInbox.type('room_left');
+    assert.ok(completedRoomLeft.code === created.code || completedRoomLeft.code === null);
+    host.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'friendly',
+        hostPlayerId: hostPlayer.playerId,
+    }));
+    const roomAfterCompletedMatch = await hostInbox.type('room_created');
+    assert.ok(roomAfterCompletedMatch.code);
+    host.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await hostInbox.type('room_left');
+
     const adminAuthorization = `Basic ${Buffer.from('admin:test-password').toString('base64')}`;
     const adminStats = await fetch(`${baseUrl}/admin/api/stats`, {
         headers: { authorization: adminAuthorization },
@@ -1363,6 +1533,99 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.match(adminHtml, /이벤트 루프 p95/);
     assert.match(adminHtml, /송신 지연 보호/);
     assert.match(adminHtml, /배포 드레인 시작/);
+});
+
+test('players can leave a completed rematch room and create another room', async (t) => {
+    const port = 24500 + Math.floor(Math.random() * 200);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const child = spawn(process.execPath, ['server.js'], {
+        cwd: __dirname,
+        env: {
+            ...process.env,
+            PORT: String(port),
+            DATABASE_URL: '',
+            SERVER_CHANNEL: 'dev',
+            SERVER_ALLOWED_CHANNELS: 'dev',
+            MULTIPLAYER_RULESET_VERSION: '1',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    t.after(() => {
+        if (child.exitCode === null) child.kill('SIGTERM');
+    });
+    await waitForServer(baseUrl, child);
+
+    const host = await connect(`ws://127.0.0.1:${port}`);
+    const guest = await connect(`ws://127.0.0.1:${port}`);
+    const hostInbox = createInbox(host);
+    const guestInbox = createInbox(guest);
+    t.after(() => {
+        host.close();
+        guest.close();
+    });
+
+    host.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'friendly',
+        networkMode: 'relay',
+        hostPlayerId: 'completed-room-host',
+    }));
+    const created = await hostInbox.type('room_created');
+    guest.send(JSON.stringify({
+        type: 'join_room',
+        ...versionFields,
+        code: created.code,
+        guestPlayerId: 'completed-room-guest',
+    }));
+    await Promise.all([hostInbox.type('guest_joined'), guestInbox.type('room_joined')]);
+
+    host.send(JSON.stringify({
+        type: 'game_start',
+        ...versionFields,
+        activeTransport: 'relay',
+    }));
+    await Promise.all([hostInbox.type('match_assigned'), guestInbox.type('game_start')]);
+    guest.send(JSON.stringify({ type: 'game_ready', ...versionFields }));
+    await Promise.all([
+        hostInbox.type('game_countdown_sync'),
+        guestInbox.type('game_countdown_sync'),
+    ]);
+    host.send(JSON.stringify({
+        type: 'game_over',
+        roundId: 1,
+        hp: 125,
+        remoteHp: 0,
+        outcome: 'win',
+        reason: 'normal',
+    }));
+    await Promise.all([hostInbox.type('match_result'), guestInbox.type('match_result')]);
+
+    host.send(JSON.stringify({
+        type: 'leave_room',
+        ...versionFields,
+        leaveReason: 'return_to_lobby',
+    }));
+    const [hostLeft, guestMigrated] = await Promise.all([
+        hostInbox.type('room_left'),
+        guestInbox.type('host_migrated'),
+    ]);
+    assert.equal(hostLeft.code, created.code);
+    assert.equal(guestMigrated.code, created.code);
+
+    host.send(JSON.stringify({
+        type: 'create_room',
+        ...versionFields,
+        matchMode: 'friendly',
+        networkMode: 'relay',
+        hostPlayerId: 'completed-room-host',
+    }));
+    const nextRoom = await hostInbox.type('room_created');
+    assert.notEqual(nextRoom.code, created.code);
+
+    host.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    guest.send(JSON.stringify({ type: 'leave_room', ...versionFields }));
+    await Promise.all([hostInbox.type('room_left'), guestInbox.type('room_left')]);
 });
 
 test('ranked setup ready checks time out inactive players and expose setup outcomes', async (t) => {
