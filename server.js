@@ -3691,6 +3691,10 @@ function roomListEntry(code, room, viewer, viewerRating = 1000) {
     return {
         code,
         ...roomQuality(room.hostRttMs, socketRttMs(viewer)),
+        hostNickname: room.hostNickname,
+        hostRating: Number.isFinite(Number(room.hostRating))
+            ? Math.max(0, Math.round(Number(room.hostRating)))
+            : 1000,
         hostCharacterId: room.hostCharacterId,
         arenaId: room.arenaId,
         battleType: room.battleType,
@@ -4532,9 +4536,7 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
                 const hostPlayerId = playerIdForSocket(ws, msg.hostPlayerId);
-                const hostRating = requestedMatchMode === 'ranked'
-                    ? await matchmakingRatingForSocket(ws, msg.hostPlayerId)
-                    : null;
+                const hostRating = await matchmakingRatingForSocket(ws, msg.hostPlayerId);
                 removeDuplicateWaitingRoomsForPlayer(hostPlayerId, ws);
                 const rankedCandidate = requestedMatchMode === 'ranked'
                     ? bestRankedWaitingRoom(ws, hostRating)

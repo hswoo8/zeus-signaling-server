@@ -134,7 +134,7 @@ An unapproved channel returns HTTP 409 with `wrong_environment`. A missing, malf
 | `ping_check` | Client -> Server | `{ clientTime, rttMs? }` |
 | `ping_check_ack` | Server -> Client | `{ clientTime, serverTime }` |
 | `get_room_list` | Client -> Server | Open rooms |
-| `room_list` | Server -> Client | `{ rooms: [{ code, pingMs, quality, hostCharacterId?, arenaId?, battleType, networkMode }] }` |
+| `room_list` | Server -> Client | `{ rooms: [{ code, hostNickname?, hostRating, pingMs, quality, hostCharacterId?, arenaId?, battleType, networkMode }] }`; public rows omit player IDs |
 | `room_updated` / `room_removed` | Server -> Client | Push room-list deltas after the initial snapshot; clients periodically request a new snapshot for recovery |
 
 `create_room` and `join_room` also enforce the same capacity gates as `/capacity`, so clients cannot bypass overload protection by skipping the HTTP preflight.

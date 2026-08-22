@@ -547,6 +547,7 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
         ...versionFields,
         matchMode: 'ranked',
         hostPlayerId: 'ranked-host',
+        hostNickname: 'Ranked Host',
         hostCharacterId: 'ZEUS',
         hostPassiveId: 'IRON_WILL',
         arenaId: 'CLASSIC_OLYMPUS',
@@ -558,7 +559,8 @@ test('server assigns per-round IDs and accepts only confirmed PvP results', asyn
     assert.equal(rankedAdded.room.battleType, 'short');
     assert.ok(['CLASSIC_OLYMPUS', 'SKY_OLYMPUS'].includes(rankedCreated.arenaId));
     assert.equal(rankedAdded.room.arenaId, rankedCreated.arenaId);
-    assert.equal(rankedAdded.room.hostRating, undefined);
+    assert.equal(rankedAdded.room.hostNickname, 'Ranked Host');
+    assert.equal(rankedAdded.room.hostRating, 1000);
     assert.equal(rankedAdded.room.hostMatches, undefined);
     assert.equal(rankedAdded.room.ratingDifference, 0);
     assert.equal(typeof rankedAdded.room.waitingMs, 'number');
