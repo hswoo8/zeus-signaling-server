@@ -26,6 +26,10 @@ const POPULATION_BROADCAST_DEBOUNCE_MS = Number(
 const WS_BACKPRESSURE_SOFT_BYTES = Number(process.env.WS_BACKPRESSURE_SOFT_BYTES || 256 * 1024);
 const WS_BACKPRESSURE_HARD_BYTES = Number(process.env.WS_BACKPRESSURE_HARD_BYTES || 1024 * 1024);
 const MAX_CONNECTIONS = envOptionalInt(['MAX_CONNECTIONS', 'MULTIPLAYER_MAX_CONNECTIONS']);
+const MAX_CONNECTIONS_PER_COUNTRY = envOptionalInt([
+    'MAX_CONNECTIONS_PER_COUNTRY',
+    'MULTIPLAYER_MAX_CONNECTIONS_PER_COUNTRY',
+]);
 const MAX_ACTIVE_ROOMS = envOptionalInt(['MAX_ACTIVE_ROOMS', 'MULTIPLAYER_MAX_ACTIVE_ROOMS']);
 const MAX_ACTIVE_MATCHES = envOptionalInt(['MAX_ACTIVE_MATCHES', 'MULTIPLAYER_MAX_ACTIVE_MATCHES']);
 const RELAY_MATCHES_ENABLED = envBool(['RELAY_MATCHES_ENABLED'], true);
@@ -33,6 +37,12 @@ const MAX_ACTIVE_RELAY_MATCHES = envOptionalInt(['MAX_ACTIVE_RELAY_MATCHES']);
 const RELAY_EGRESS_WARNING_MB_PER_HOUR = envOptionalInt(['RELAY_EGRESS_WARNING_MB_PER_HOUR']);
 const RELAY_EGRESS_LIMIT_MB_PER_HOUR = envOptionalInt(['RELAY_EGRESS_LIMIT_MB_PER_HOUR']);
 const CAPACITY_BUSY_RATIO = envFloat(['CAPACITY_BUSY_RATIO', 'MULTIPLAYER_CAPACITY_BUSY_RATIO'], 0.9, 0.1, 1);
+const COUNTRY_CAPACITY_BUSY_RATIO = envFloat(
+    ['COUNTRY_CAPACITY_BUSY_RATIO', 'MULTIPLAYER_COUNTRY_CAPACITY_BUSY_RATIO'],
+    CAPACITY_BUSY_RATIO,
+    0.1,
+    1
+);
 const CAPACITY_RETRY_AFTER_SEC = envInt(['CAPACITY_RETRY_AFTER_SEC', 'MULTIPLAYER_CAPACITY_RETRY_AFTER_SEC'], 30);
 const MAINTENANCE_MODE = envBool(['MAINTENANCE_MODE', 'MULTIPLAYER_MAINTENANCE'], false);
 const MAINTENANCE_MESSAGE = process.env.MAINTENANCE_MESSAGE ||
@@ -1254,6 +1264,18 @@ function openConnectionCount() {
     return Array.from(wss.clients).filter((client) => client.readyState === WebSocket.OPEN).length;
 }
 
+function countryBucket(value) {
+    return normalizedCountryCode(value) || 'ZZ';
+}
+
+function openConnectionCountForCountry(countryCode) {
+    const bucket = countryBucket(countryCode);
+    return Array.from(wss.clients).filter((client) =>
+        client.readyState === WebSocket.OPEN &&
+        countryBucket(client.analyticsCountryCode) === bucket
+    ).length;
+}
+
 function roomCounts() {
     const roomValues = Object.values(rooms);
     const waitingRooms = roomValues.filter((room) =>
@@ -1487,6 +1509,17 @@ function blockedReason(count, limit, extra = 0) {
     return null;
 }
 
+function countryAdmissionLimit(limit) {
+    if (limit <= 0) return null;
+    return Math.max(1, Math.floor(limit * COUNTRY_CAPACITY_BUSY_RATIO));
+}
+
+function countryBlockedReason(count, limit, extra = 0) {
+    if (exceedsLimit(count, limit, extra)) return 'full';
+    const admissionLimit = countryAdmissionLimit(limit);
+    return admissionLimit !== null && count + extra > admissionLimit ? 'busy' : null;
+}
+
 function deploymentSnapshot() {
     const roomStats = roomCounts();
     const admissionPaused = MAINTENANCE_MODE || runtimeDrainEnabled;
@@ -1508,6 +1541,12 @@ function deploymentSnapshot() {
 
 function capacitySnapshot(options = {}) {
     const connectionExtra = Number.isInteger(options.connectionExtra) ? options.connectionExtra : 1;
+    const countryCode = options.countryCode === undefined || options.countryCode === null
+        ? null
+        : countryBucket(options.countryCode);
+    const countryConnections = countryCode === null
+        ? null
+        : openConnectionCountForCountry(countryCode);
     const roomStats = roomCounts();
     const counts = {
         connections: openConnectionCount(),
@@ -1520,12 +1559,21 @@ function capacitySnapshot(options = {}) {
     };
     const limits = {
         connections: limitValue(MAX_CONNECTIONS),
+        connectionsPerCountry: limitValue(MAX_CONNECTIONS_PER_COUNTRY),
         rooms: limitValue(MAX_ACTIVE_ROOMS),
         activeMatches: limitValue(MAX_ACTIVE_MATCHES),
         busyRatio: CAPACITY_BUSY_RATIO,
     };
 
-    const connectReason = blockedReason(counts.connections, MAX_CONNECTIONS, connectionExtra);
+    const globalConnectReason = blockedReason(counts.connections, MAX_CONNECTIONS, connectionExtra);
+    const countryConnectReason = countryConnections === null
+        ? null
+        : countryBlockedReason(
+            countryConnections,
+            MAX_CONNECTIONS_PER_COUNTRY,
+            connectionExtra
+        );
+    const connectReason = globalConnectReason || countryConnectReason;
     const createReason = blockedReason(counts.rooms, MAX_ACTIVE_ROOMS, 1);
     const joinReason = blockedReason(counts.matchSlots, MAX_ACTIVE_MATCHES, 1);
     const admissionPaused = MAINTENANCE_MODE || runtimeDrainEnabled;
@@ -1566,6 +1614,13 @@ function capacitySnapshot(options = {}) {
         retryAfterSec: status === 'available' ? 0 : CAPACITY_RETRY_AFTER_SEC,
         counts,
         limits,
+        country: countryCode === null ? null : {
+            code: countryCode,
+            connections: countryConnections,
+            maxConnections: limitValue(MAX_CONNECTIONS_PER_COUNTRY),
+            admissionConnections: countryAdmissionLimit(MAX_CONNECTIONS_PER_COUNTRY),
+            busyRatio: COUNTRY_CAPACITY_BUSY_RATIO,
+        },
         backpressure: {
             droppedStatePackets: backpressureDroppedStatePackets,
             closedConnections: backpressureClosedConnections,
@@ -1962,10 +2017,11 @@ async function handleHttpRequest(req, res) {
     }
 
     if (req.method === 'GET' && pathname === '/capacity') {
+        const capacityOptions = { countryCode: requestCountry(req, null) };
         const compatibilityIssue = compatibilityErrorFromQuery(url.searchParams);
         if (compatibilityIssue) {
             sendJson(res, 200, {
-                ...capacitySnapshot(),
+                ...capacitySnapshot(capacityOptions),
                 status: compatibilityIssue.code === 'wrong_environment' ? 'wrong_environment' : 'update_required',
                 code: compatibilityIssue.code,
                 message: compatibilityIssue.message,
@@ -1977,7 +2033,7 @@ async function handleHttpRequest(req, res) {
             });
             return;
         }
-        sendJson(res, 200, capacitySnapshot());
+        sendJson(res, 200, capacitySnapshot(capacityOptions));
         return;
     }
 
@@ -4436,7 +4492,10 @@ wss.on('connection', (ws, req) => {
     ws.authPlayerId = normalizePlayerId(req.authPrincipal?.sub);
     markSocketAlive(ws);
 
-    const connectionCapacity = capacitySnapshot({ connectionExtra: 0 });
+    const connectionCapacity = capacitySnapshot({
+        connectionExtra: 0,
+        countryCode: ws.analyticsCountryCode,
+    });
     if (!connectionCapacity.canConnect) {
         sendCapacityWsError(ws, connectionCapacity);
         ws.close(1013, connectionCapacity.status || 'server_busy');

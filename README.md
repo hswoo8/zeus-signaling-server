@@ -24,10 +24,12 @@ Set these environment variables in production to block outdated multiplayer clie
 | `WS_BACKPRESSURE_SOFT_BYTES` | `262144` | Drop superseded `game_state` packets above this pending-send buffer |
 | `WS_BACKPRESSURE_HARD_BYTES` | `1048576` | Terminate a slow socket above this pending-send buffer to protect server memory |
 | `MAX_CONNECTIONS` | unset | Optional hard cap for simultaneous WebSocket clients |
+| `MAX_CONNECTIONS_PER_COUNTRY` | unset | Optional per-country WebSocket cap; unknown countries share the `ZZ` bucket |
 | `MAX_ACTIVE_ROOMS` | unset | Optional cap for total in-memory rooms |
 | `MAX_ACTIVE_MATCHES` | unset | Optional cap for active two-player matches |
 | `RELAY_MATCHES_ENABLED` | `true` | When false, keep signaling/P2P available but reject new Relay rooms and AUTO-to-Relay starts |
 | `MAX_ACTIVE_RELAY_MATCHES` | unset | Optional cap for concurrently active Relay transports; existing matches are not interrupted |
+| `COUNTRY_CAPACITY_BUSY_RATIO` | `CAPACITY_BUSY_RATIO` | Per-country admission ratio; with a cap of 50 and ratio 0.9, 45 connections are admitted and five slots remain for recovery |
 | `RELAY_EGRESS_WARNING_MB_PER_HOUR` | unset | Mark Relay traffic warning state when rolling 60-minute WebSocket payload bytes reach this value |
 | `RELAY_EGRESS_LIMIT_MB_PER_HOUR` | unset | Reject new Relay starts when rolling 60-minute WebSocket payload bytes reach this value |
 | `CAPACITY_BUSY_RATIO` | `0.9` | When below `1`, block new matchmaking before a cap is fully reached |
@@ -147,6 +149,9 @@ Friendly and ranked matchmaking are country-locked. A room is listed or selected
 players report the same country, and direct room-code joins return `country_mismatch` across
 countries. Manual friendly hosts are never moved; they can still receive a same-country auto-queue
 guest. Connections where both sides lack country metadata remain available for local development.
+`MAX_CONNECTIONS_PER_COUNTRY` can additionally reserve a logical capacity slice for each country
+inside one server process. The global `MAX_CONNECTIONS` cap still applies across every country, so
+logical country slices do not create additional infrastructure or exceed the instance-wide limit.
 
 Rate limits are type-specific so lobby/signaling traffic stays low while `game_state` can sustain 20 Hz relay traffic.
 

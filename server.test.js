@@ -94,6 +94,73 @@ function resultBody(matchId, localPlayer, remotePlayer, outcome) {
     };
 }
 
+test('country capacity reserves independent logical connection slices', async (t) => {
+    const port = 20500 + Math.floor(Math.random() * 400);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const child = spawn(process.execPath, ['server.js'], {
+        cwd: __dirname,
+        env: {
+            ...process.env,
+            PORT: String(port),
+            DATABASE_URL: '',
+            SERVER_CHANNEL: 'dev',
+            SERVER_ALLOWED_CHANNELS: 'dev',
+            MULTIPLAYER_RULESET_VERSION: '1',
+            MAX_CONNECTIONS: '20',
+            MAX_CONNECTIONS_PER_COUNTRY: '4',
+            COUNTRY_CAPACITY_BUSY_RATIO: '0.75',
+            AUTH_TOKEN_SECRET: '',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let serverErrors = '';
+    child.stderr.on('data', (chunk) => { serverErrors += chunk.toString(); });
+    t.after(() => {
+        if (child.exitCode === null) child.kill('SIGTERM');
+    });
+    await waitForServer(baseUrl, child);
+
+    const clients = [];
+    t.after(() => clients.forEach((client) => client.close()));
+    for (let index = 0; index < 3; index += 1) {
+        clients.push(await connect(`ws://127.0.0.1:${port}`, {
+            headers: { 'x-country-code': 'KR' },
+        }));
+    }
+
+    const capacityUrl = `${baseUrl}/capacity?clientVersionCode=1&channel=dev` +
+        '&protocolVersion=1&rulesetVersion=1&balanceVersion=1';
+    const krCapacity = await fetch(capacityUrl, {
+        headers: { 'x-country-code': 'KR' },
+    }).then((response) => response.json());
+    assert.equal(krCapacity.status, 'busy', serverErrors);
+    assert.equal(krCapacity.canConnect, false);
+    assert.deepEqual(krCapacity.country, {
+        code: 'KR',
+        connections: 3,
+        maxConnections: 4,
+        admissionConnections: 3,
+        busyRatio: 0.75,
+    });
+
+    const usCapacity = await fetch(capacityUrl, {
+        headers: { 'x-country-code': 'US' },
+    }).then((response) => response.json());
+    assert.equal(usCapacity.status, 'available', serverErrors);
+    assert.equal(usCapacity.canConnect, true);
+    assert.equal(usCapacity.country.code, 'US');
+    assert.equal(usCapacity.country.connections, 0);
+
+    clients.push(await connect(`ws://127.0.0.1:${port}`, {
+        headers: { 'x-country-code': 'US' },
+    }));
+    const usAfterConnect = await fetch(capacityUrl, {
+        headers: { 'x-country-code': 'US' },
+    }).then((response) => response.json());
+    assert.equal(usAfterConnect.country.connections, 1);
+    assert.equal(usAfterConnect.counts.connections, 4);
+});
+
 test('server assigns per-round IDs and accepts only confirmed PvP results', async (t) => {
     const port = 21000 + Math.floor(Math.random() * 1000);
     const baseUrl = `http://127.0.0.1:${port}`;
