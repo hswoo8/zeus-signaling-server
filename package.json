@@ -1,6 +1,6 @@
 {
   "name": "zeus-signaling-server",
-  "version": "1.5.0",
+  "version": "1.0.0",
   "description": "WebRTC signaling server for Zeus 1v1 Battle",
   "main": "server.js",
   "scripts": {
