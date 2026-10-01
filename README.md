@@ -220,3 +220,53 @@ Set `ADMIN_DASHBOARD_PASSWORD` in Railway, optionally change `ADMIN_DASHBOARD_US
 The same administrator credentials protect `/admin/support`. Each inquiry links the submitted anonymous `playerId` to the current `br_player_stats` single/multi MMR and record snapshot for support handling. Support messages and optional reply emails are not analytics events. They are retained for `SUPPORT_RETENTION_DAYS` and should only be accessed for support operations.
 
 Current Android builds send app-usage analytics to Firebase Analytics and do not call `/analytics/events`. The legacy endpoint stores a one-way short hash of the anonymous player ID and does not persist raw IP addresses. Country prefers a trusted proxy country header and falls back to the Android locale country code, so it is operational grouping rather than precise location. Persistent legacy history requires `DATABASE_URL`; memory mode resets dashboard history whenever the server restarts. Set `ANALYTICS_INGEST_ENABLED=false` after versions that still use the endpoint are no longer supported.
+
+### v55: persistent admission queue and runtime cap
+
+`AUTH_ENABLED` plus positive `MAX_CONNECTIONS` enables admission reservations for every
+WebSocket ticket request. A new client posts `waitForSlot: true`, a per-UI-session
+`admissionSessionId`, and `clientVersionCode/protocolVersion/rulesetVersion/balanceVersion`
+to `/auth/ws-ticket` with its access token. HTTP 202 returns `status: queued`, `position`,
+`retryAfterSec` (20). HTTP 201 returns an identity/country/channel/pool-bound, single-use
+60-second connection reservation. Poll with jitter; don't open a battle WebSocket while waiting.
+`POST /auth/admission/cancel` accepts that same session ID and bearer token. Old clients/home
+preconnect use the normal ticket flow: they cannot jump ahead of queued players.
+
+Queue entries expire after 120 seconds without a poll, offers after 60 seconds, connecting
+reservations after 10 seconds, abnormal-disconnect grace after 45 seconds. Max queue size is
+2000 per compatible pool. Backgrounding/cancelling the Android waiting screen releases its
+place; foreground return starts again. Repeated player requests keep one position. No ETA
+is fabricated. Existing `resume_match` still retrieves completed results; this does not add
+live combat restoration after a lost socket.
+
+`/admin/admission` and GET/POST `/admin/api/admission` use existing Basic admin authentication.
+`manualLimit` is persisted and applied without restarting, bounded by `MAX_CONNECTIONS`.
+Zero pauses new admissions. Reducing it never closes an existing connection; previously
+issued offers and genuine reconnect grace remain valid until their short expiry.
+
+Cost model inputs are `budgetEnabled`, `budgetUsd`, `baselineMonthlyUsd`,
+`costPer100MonthlyUsd`, `measuredAt` (ISO8601). Missing measurements keep the manual cap.
+Formula: `min(manualLimit, floor(max(0,(budget-baseline)/costPer100*100)*poolShare))`.
+`ADMISSION_BUDGET_POOL_SHARE` defaults to production `MAX_CONNECTIONS/500` (capped at1),
+otherwise1. Current production Green450/Blue50 means shares0.9/0.1. Enter the **same measured
+whole-service model in both production pools**; Beta's cost is in the baseline and its auto
+mode stays off. Inputs concern average concurrency; mapping that to an admission cap assumes
+sustained occupancy conservatively. No Railway billing token, automatic bill retrieval,
+plan change or hard shutdown is installed. The admin explicitly enables a reviewed model.
+
+Connections are sampled every5s and persisted as anonymous five-minute aggregates (30-day
+retention). Admin shows the last7days average/peak and actual covered hours. Compare matching
+Railway resource-cost windows, not subscription minimums or lifetime forecasts, before filling
+the model. The parent repo's `scripts/estimate_multiplayer_cost.py` calculates the incremental
+cost per100 average production connections without changing live settings.
+
+Persistence uses `br_admission_settings`, `br_admission_queue`, `br_admission_samples`.
+**One replica per pool** is required. The DB ownership row fences the retired process during
+rolling deployment; queue/settings writes and ticket consumption share transactions. Deploy
+only after drain and zero active matches; prefer zero live connections. This is not a global
+queue across replicas or a way to transfer ongoing matches between processes. Do not configure
+multiple replicas under the same pool ID. Restart preserves unexpired queue positions/settings.
+
+User-run checks only: `node --test admission.test.js`. The optional Postgres test requires
+`ADMISSION_TEST_DATABASE_URL` pointing to a disposable test DB; it creates/drops a unique schema.
+No test execution is implied by the source or deployment checks in the implementation report.

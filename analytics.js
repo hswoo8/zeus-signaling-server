@@ -611,7 +611,7 @@ function renderAdminPage(snapshot) {
 <body>
 <header><h1>MiniZeus 운영 통계</h1><p>관리자 전용 · 원 IP와 실제 기기 식별자는 저장하지 않음</p></header>
 <main>
-<div class="toolbar"><div>생성 ${escapeHtml(generated)} · 저장소 ${escapeHtml(snapshot.storage)}</div><div><a href="/admin/announcements?channel=${selectedChannel}">공지 관리</a> <a href="/admin/support?channel=${selectedChannel}">문의 관리</a> <a href="/admin?channel=${selectedChannel}">새로고침</a></div></div>
+<div class="toolbar"><div>생성 ${escapeHtml(generated)} · 저장소 ${escapeHtml(snapshot.storage)}</div><div><a href="/admin/admission">입장 정원·대기열</a> <a href="/admin/announcements?channel=${selectedChannel}">공지 관리</a> <a href="/admin/support?channel=${selectedChannel}">문의 관리</a> <a href="/admin?channel=${selectedChannel}">새로고침</a></div></div>
 <nav class="channel-filter" aria-label="배포 채널">${channelTabs}</nav>
 <div class="deployment-panel ${drainEnabled ? 'draining' : ''}">
   <div><strong>${staticMaintenance ? '환경변수 점검 중' : drainEnabled ? '배포 드레인 중' : '신규 대전 입장 허용 중'}</strong><small>진행 중 대전 ${escapeHtml(deployment.activeMatches || 0)} · 대기 방 ${escapeHtml(deployment.waitingRooms || 0)} · ${deployment.activeMatchesDrained ? '활성 대전 0건, 배포 가능' : '활성 대전 종료 대기 필요'}</small></div>

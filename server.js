@@ -2,6 +2,8 @@ const http = require('http');
 const crypto = require('crypto');
 const WebSocket = require('ws');
 const { Pool } = require('pg');
+const { AdmissionController } = require('./admission');
+const { renderAdmissionPage } = require('./admission-admin');
 const packageJson = require('./package.json');
 const {
     AnalyticsStore,
@@ -146,6 +148,7 @@ const statsPool = DATABASE_URL ? new Pool({
     ssl: postgresSslConfig(),
 }) : null;
 const analyticsStore = new AnalyticsStore(statsPool, { retentionDays: ANALYTICS_RETENTION_DAYS });
+let admission = null;
 const server = http.createServer((req, res) => {
     handleHttpRequest(req, res).catch((err) => {
         console.error('[http] unexpected error:', err?.message || err);
@@ -155,10 +158,14 @@ const server = http.createServer((req, res) => {
     });
 });
 const authRequestBuckets = new Map();
+const admissionRequestBuckets = new Map();
 const usedWsTicketIds = new Map();
 const wss = new WebSocket.Server({
     server,
-    verifyClient: ({ req }) => authenticateWebSocketUpgrade(req),
+    verifyClient: ({ req }, done) => {
+        authenticateWebSocketUpgrade(req).then((allowed) => done(allowed, allowed ? undefined : 403))
+            .catch(() => done(false, 503));
+    },
 });
 
 // rooms[roomCode] = { host, guest, networkMode, hostCharacterId, hostPassiveId, arenaId, matchId, hostNickname, guestNickname }
@@ -1068,12 +1075,18 @@ function cleanupUsedWsTickets(nowSec = Math.floor(Date.now() / 1000)) {
     }
 }
 
-function authenticateWebSocketUpgrade(req) {
+async function authenticateWebSocketUpgrade(req) {
     if (!AUTH_ENABLED) return true;
     const payload = verifySignedToken(bearerToken(req), 'ws_ticket');
     if (!payload?.jti) return false;
     cleanupUsedWsTickets();
     if (usedWsTicketIds.has(payload.jti)) return false;
+    if (admission) {
+        const country = countryBucket(requestCountry(req, null));
+        if (payload.poolId !== SERVER_POOL_ID || (SUPPORTED_COUNTRIES.size && !SUPPORTED_COUNTRIES.has(country))) return false;
+        if (!await admission.claim(payload.sub, payload.admissionId, country, payload.channel)) return false;
+        req.admissionGranted = true;
+    }
     usedWsTicketIds.set(payload.jti, payload.exp);
     req.authPrincipal = payload;
     return true;
@@ -1096,6 +1109,18 @@ function authRequestAllowed(req) {
         }
     }
     return bucket.count <= AUTH_RATE_LIMIT_PER_MINUTE;
+}
+
+function admissionRequestAllowed(playerId) {
+    const now = Date.now();
+    const previous = admissionRequestBuckets.get(playerId);
+    const bucket = previous && now - previous.start < 60000 ? previous : { start: now, count: 0 };
+    bucket.count += 1;
+    admissionRequestBuckets.set(playerId, bucket);
+    if (admissionRequestBuckets.size > 5000) {
+        for (const [key, value] of admissionRequestBuckets) if (now - value.start >= 60000) admissionRequestBuckets.delete(key);
+    }
+    return bucket.count <= 12;
 }
 
 function secureEqual(left, right) {
@@ -1600,8 +1625,11 @@ function capacitySnapshot(options = {}) {
         activeRelayMatches: roomStats.activeRelayMatches,
         activeP2pMatches: roomStats.activeP2pMatches,
     };
+    const admissionState = admission?.snapshot();
+    const effectiveConnectionLimit = admissionState?.effectiveLimit ?? MAX_CONNECTIONS;
     const limits = {
-        connections: limitValue(MAX_CONNECTIONS),
+        connections: admissionState ? effectiveConnectionLimit : limitValue(MAX_CONNECTIONS),
+        connectionHardLimit: limitValue(MAX_CONNECTIONS),
         connectionsPerCountry: limitValue(MAX_CONNECTIONS_PER_COUNTRY),
         rooms: limitValue(MAX_ACTIVE_ROOMS),
         activeMatches: limitValue(MAX_ACTIVE_MATCHES),
@@ -1609,7 +1637,9 @@ function capacitySnapshot(options = {}) {
         supportedCountries: [...SUPPORTED_COUNTRIES],
     };
 
-    const globalConnectReason = blockedReason(counts.connections, MAX_CONNECTIONS, connectionExtra);
+    const occupancy = counts.connections + (admissionState?.reserved || 0);
+    const globalConnectReason = admissionState && (effectiveConnectionLimit === 0 || admissionState.queued > 0)
+        ? 'busy' : blockedReason(occupancy, effectiveConnectionLimit, connectionExtra);
     const countryConnectReason = countryConnections === null
         ? null
         : countryBlockedReason(
@@ -1663,6 +1693,8 @@ function capacitySnapshot(options = {}) {
         retryAfterSec: status === 'available' || !countrySupported ? 0 : CAPACITY_RETRY_AFTER_SEC,
         counts,
         limits,
+        admission: admissionState ? { enabled: true, queued: admissionState.queued,
+            reserved: admissionState.reserved, retryAfterSec: admissionState.retryAfterSec } : { enabled: false },
         country: countryCode === null ? null : {
             code: countryCode,
             supported: countrySupported,
@@ -1791,20 +1823,92 @@ async function handleHttpRequest(req, res) {
             sendHttpError(res, 503, 'auth_disabled', 'Guest authentication is not configured');
             return;
         }
-        if (!authRequestAllowed(req)) {
-            sendHttpError(res, 429, 'rate_limited', 'Too many authentication requests');
-            return;
-        }
         const access = verifySignedToken(bearerToken(req), 'access');
         if (!access) {
             sendHttpError(res, 401, 'invalid_access_token', 'Access token is invalid or expired');
             return;
         }
-        const ticket = issueSignedToken('ws_ticket', access.sub, access.channel, AUTH_WS_TICKET_TTL_SEC);
+        const body = await readJsonRequest(req, res);
+        if (!body) return;
+        const waitForSlot = body.waitForSlot === true;
+        const admissionSessionId = normalizePlayerId(body.admissionSessionId);
+        if (waitForSlot && !admissionSessionId) { sendHttpError(res, 400, 'invalid_admission_session', 'Admission session is required'); return; }
+        if (!waitForSlot && !authRequestAllowed(req)) {
+            sendHttpError(res, 429, 'rate_limited', 'Too many authentication requests');
+            return;
+        }
+        if (waitForSlot && !admissionRequestAllowed(access.sub)) {
+            sendHttpError(res, 429, 'rate_limited', 'Too many admission requests');
+            return;
+        }
+        if (waitForSlot) {
+            const issue = clientCompatibilityError(packetInt(body, 'clientVersionCode'), packetInt(body, 'protocolVersion'), packetInt(body, 'rulesetVersion'), packetInt(body, 'balanceVersion'), access.channel, true);
+            if (issue) { sendHttpError(res, 409, issue.code, issue.message); return; }
+        }
+        const country = countryBucket(requestCountry(req, null));
+        if (SUPPORTED_COUNTRIES.size > 0 && !SUPPORTED_COUNTRIES.has(country)) {
+            sendHttpError(res, 403, 'country_unsupported', 'Multiplayer is not available in this country');
+            return;
+        }
+        let reservation = null;
+        if (admission) {
+            reservation = await admission.request(access.sub, country, access.channel, waitForSlot, admissionSessionId || null);
+            if (reservation.status !== 'admitted') {
+                if (reservation.status === 'queued') {
+                    sendJson(res, 202, { ...reservation, code: 'server_queued' });
+                } else {
+                    sendHttpError(res, 503, reservation.status === 'maintenance' ? 'server_maintenance' : 'server_busy', 'Multiplayer admission is temporarily unavailable');
+                }
+                return;
+            }
+        }
+        const ttlSec = reservation ? Math.max(1, Math.floor((reservation.expiresAt - Date.now()) / 1000)) : AUTH_WS_TICKET_TTL_SEC;
+        const ticket = issueSignedToken('ws_ticket', access.sub, access.channel, ttlSec,
+            reservation ? { admissionId: reservation.reservationId, poolId: SERVER_POOL_ID } : {});
         sendJson(res, 201, {
             ticket: ticket.token,
             expiresAtMs: ticket.payload.exp * 1000,
         });
+        return;
+    }
+
+    if (req.method === 'POST' && pathname === '/auth/admission/cancel') {
+        const access = verifySignedToken(bearerToken(req), 'access');
+        if (!access) { sendHttpError(res, 401, 'invalid_access_token', 'Authentication required'); return; }
+        if (!admissionRequestAllowed(access.sub)) { sendHttpError(res, 429, 'rate_limited', 'Too many admission requests'); return; }
+        const body = await readJsonRequest(req, res);
+        if (!body) return;
+        const sessionId = normalizePlayerId(body.admissionSessionId);
+        if (!sessionId) { sendHttpError(res, 400, 'invalid_admission_session', 'Admission session is required'); return; }
+        await admission?.cancel(access.sub, sessionId);
+        sendJson(res, 200, { cancelled: true });
+        return;
+    }
+
+    if ((req.method === 'GET' || req.method === 'POST') && pathname === '/admin/api/admission') {
+        if (!requireAdmin(req, res)) return;
+        if (!admission) { sendHttpError(res, 503, 'admission_disabled', 'Admission control requires authentication and a connection limit'); return; }
+        if (req.method === 'GET') sendJson(res, 200, { ...admission.snapshot(), observations: await admission.observations() });
+        else {
+            const body = await readJsonRequest(req, res);
+            if (!body) return;
+            try { sendJson(res, 200, await admission.updateSettings(body)); }
+            catch (error) {
+                if (['invalid_admission_settings', 'invalid_cost_model', 'invalid_cost_measurement_date'].includes(error.message)) sendHttpError(res, 400, error.message, 'Check the limit and measured cost values');
+                else throw error;
+            }
+        }
+        return;
+    }
+
+    if (req.method === 'GET' && pathname === '/admin/admission') {
+        if (!requireAdmin(req, res)) return;
+        const nonce = crypto.randomBytes(18).toString('base64');
+        const state = admission ? { ...admission.snapshot(), observations: await admission.observations() } : null;
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY',
+            'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'` });
+        res.end(renderAdmissionPage(nonce, state));
         return;
     }
 
@@ -2055,7 +2159,8 @@ async function handleHttpRequest(req, res) {
             storage: storageMode(),
             authEnabled: AUTH_ENABLED,
             servicePolicy: {
-                revision: 'v54',
+                revision: 'v55',
+                admissionQueue: Boolean(admission),
                 supportedCountries: [...SUPPORTED_COUNTRIES],
                 relayMatchesEnabled: RELAY_MATCHES_ENABLED,
                 populationAggregation: 'shared-per-broadcast',
@@ -4552,10 +4657,13 @@ wss.on('connection', (ws, req) => {
         connectionExtra: 0,
         countryCode: ws.analyticsCountryCode,
     });
-    if (!connectionCapacity.canConnect) {
+    if (!connectionCapacity.canConnect && !req.admissionGranted) {
         sendCapacityWsError(ws, connectionCapacity);
         ws.close(1013, connectionCapacity.status || 'server_busy');
         return;
+    }
+    if (req.admissionGranted) {
+        admission.connectedPlayer(ws.authPlayerId, req.authPrincipal.admissionId).catch(() => console.warn('[admission] connection reservation cleanup deferred'));
     }
 
     ws.on('pong', () => {
@@ -5181,6 +5289,9 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', (closeCode, closeReason) => {
         const disconnectSource = recordWebSocketDisconnect(ws, closeCode, closeReason);
+        const retainAdmission = closeCode !== 1000 && disconnectSource !== 'backpressure' && Boolean(ws.roomCode || ws.lobbyPresenceActive);
+        admission?.disconnect(ws.authPlayerId, countryBucket(ws.analyticsCountryCode), req.authPrincipal?.channel, retainAdmission)
+            .catch(() => console.warn('[admission] reconnect reservation unavailable'));
         ws.populationSubscribed = false;
         ws.lobbyPresenceActive = false;
         schedulePopulationBroadcast();
@@ -5260,9 +5371,23 @@ wss.on('close', () => {
     clearInterval(heartbeatInterval);
     clearInterval(eventLoopLagInterval);
     if (populationBroadcastTimer) clearTimeout(populationBroadcastTimer);
+    clearInterval(admissionInterval);
 });
 
+const admissionInterval = setInterval(() => {
+    admission?.tick().catch(() => console.warn('[admission] queue maintenance deferred'));
+}, 5000);
+
 initializeStatsStorage()
+    .then(async () => {
+        if (!AUTH_ENABLED || MAX_CONNECTIONS <= 0) return;
+        const controller = new AdmissionController({ pool: statsPool, poolId: SERVER_POOL_ID,
+            hardLimit: MAX_CONNECTIONS,
+            share: envFloat(['ADMISSION_BUDGET_POOL_SHARE'], SERVER_CHANNEL === 'production' ? Math.min(1, MAX_CONNECTIONS / 500) : 1, 0.001, 1),
+            connected: openConnectionCount, paused: () => MAINTENANCE_MODE || runtimeDrainEnabled });
+        await controller.initialize();
+        admission = controller;
+    })
     .then(() => analyticsStore.initialize())
     .then(() => {
         server.listen(PORT, () => {
