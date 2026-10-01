@@ -25,6 +25,7 @@ Set these environment variables in production to block outdated multiplayer clie
 | `WS_BACKPRESSURE_HARD_BYTES` | `1048576` | Terminate a slow socket above this pending-send buffer to protect server memory |
 | `MAX_CONNECTIONS` | unset | Optional hard cap for simultaneous WebSocket clients |
 | `MAX_CONNECTIONS_PER_COUNTRY` | unset | Optional per-country WebSocket cap; unknown countries share the `ZZ` bucket |
+| `MULTIPLAYER_SUPPORTED_COUNTRIES` | unset | Comma-separated country allowlist, e.g. `KR,JP,TW,US`. Unset retains local development behavior. When set, missing/unknown country is rejected with `country_unsupported` at capacity and WebSocket/room admission. |
 | `MAX_ACTIVE_ROOMS` | unset | Optional cap for total in-memory rooms |
 | `MAX_ACTIVE_MATCHES` | unset | Optional cap for active two-player matches |
 | `RELAY_MATCHES_ENABLED` | `true` | When false, keep signaling/P2P available but reject new Relay rooms and AUTO-to-Relay starts |
@@ -67,7 +68,13 @@ Set these environment variables in production to block outdated multiplayer clie
 If a client is missing or below the version values, the server returns `{ type: "error", code: "update_required", message }`.
 If capacity or maintenance gates block entry, the server returns `{ type: "error", code: "server_busy" | "server_maintenance", message, retryAfterSec }`.
 Relay admission failures return `relay_disabled`, `relay_capacity`, or `relay_egress_limited`. An AUTO room may still start over P2P while Relay admission is blocked. If AUTO falls back to Relay and admission fails, the server removes the waiting room and returns both players to the lobby without interrupting existing matches.
-If a running P2P match later sends `game_state` over WebSocket, the server reclassifies it as a runtime Relay fallback for metrics and admission decisions. The existing match continues even when this temporarily moves active Relay usage above its configured cap.
+P2P gameplay packets received over WebSocket are dropped. With `RELAY_MATCHES_ENABLED=false`, gameplay packets are also dropped before a match starts; WebRTC signaling, setup/countdown, recovery, result confirmation and audits remain available. Apply this policy during a drained deployment so an existing Relay match is not interrupted.
+
+### v54 service policy (2026-10-01)
+
+Production uses a combined hard connection budget of 500: current-app Green 450 and legacy v1 Blue 50. They remain separate version pools, so unused slots are not automatically borrowed. Set `CAPACITY_BUSY_RATIO=1`, `MAX_CONNECTIONS_PER_COUNTRY=0`, `MULTIPLAYER_MAX_CONNECTIONS_PER_COUNTRY=0`, `MULTIPLAYER_SUPPORTED_COUNTRIES=KR,JP,TW,US`, and `RELAY_MATCHES_ENABLED=false` on each game service. Green rooms/match slots are 450/225; Blue 50/25. Beta remains separately capped at 100 connections, 100 rooms, 50 match slots with the same country/P2P policy. These are admission settings, not measured 500-user performance or a monthly price guarantee. Country signals are operational grouping from existing proxy/client metadata, not a new IP-geolocation security boundary.
+
+Population broadcasts now build country totals and per-player exclusions once per broadcast. Own rooms and recent per-player quality failures remain excluded, without recomputing all rooms and sockets for every subscriber. `/health.servicePolicy` exposes revision and enabled policy for deployment inspection.
 
 For a controlled pool smoke test, pass the exact compatibility tuple to the load
 client. Production targets always require the explicit safety flag, including

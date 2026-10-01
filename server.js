@@ -32,6 +32,13 @@ const MAX_CONNECTIONS_PER_COUNTRY = envOptionalInt([
 ]);
 const MAX_ACTIVE_ROOMS = envOptionalInt(['MAX_ACTIVE_ROOMS', 'MULTIPLAYER_MAX_ACTIVE_ROOMS']);
 const MAX_ACTIVE_MATCHES = envOptionalInt(['MAX_ACTIVE_MATCHES', 'MULTIPLAYER_MAX_ACTIVE_MATCHES']);
+const SUPPORTED_COUNTRIES = new Set(
+    String(process.env.MULTIPLAYER_SUPPORTED_COUNTRIES || '').split(',')
+        .map((country) => country.trim().toUpperCase()).filter(Boolean)
+);
+if ([...SUPPORTED_COUNTRIES].some((country) => !/^[A-Z]{2}$/.test(country) || country === 'ZZ')) {
+    throw new Error('MULTIPLAYER_SUPPORTED_COUNTRIES must contain two-letter country codes');
+}
 const RELAY_MATCHES_ENABLED = envBool(['RELAY_MATCHES_ENABLED'], true);
 const MAX_ACTIVE_RELAY_MATCHES = envOptionalInt(['MAX_ACTIVE_RELAY_MATCHES']);
 const RELAY_EGRESS_WARNING_MB_PER_HOUR = envOptionalInt(['RELAY_EGRESS_WARNING_MB_PER_HOUR']);
@@ -1320,52 +1327,88 @@ function socketMatchesViewerCountry(socket, viewer) {
     return socketCountry === viewerCountry;
 }
 
-function populationSnapshot(viewer) {
-    let lobbyUsers = 0;
-    let friendlySearching = 0;
-    let rankedSearching = 0;
-    let availableFriendlyRooms = 0;
-
+function buildPopulationIndex() {
+    const byCountry = new Map();
+    const excludedByPlayer = new Map();
+    const excludedBySocket = new Map();
+    const countryCounts = (code) => {
+        if (!byCountry.has(code)) byCountry.set(code, {
+            lobbyUsers: 0, friendlySearching: 0, rankedSearching: 0, availableFriendlyRooms: 0,
+        });
+        return byCountry.get(code);
+    };
+    const exclude = (map, key, entry) => {
+        if (!key) return;
+        if (!map.has(key)) map.set(key, new Set());
+        map.get(key).add(entry);
+    };
     wss.clients.forEach((client) => {
-        if (client.readyState !== WebSocket.OPEN ||
-            client.lobbyPresenceActive !== true ||
-            !socketMatchesViewerCountry(client, viewer)) return;
-        lobbyUsers += 1;
+        if (client.readyState === WebSocket.OPEN && client.lobbyPresenceActive === true) {
+            countryCounts(countryBucket(client.analyticsCountryCode)).lobbyUsers += 1;
+        }
     });
-
-    for (const [code, room] of Object.entries(rooms)) {
-        const entry = roomListEntry(code, room, viewer, 1000);
-        if (!entry) continue;
-        if (room.matchMode === 'ranked') {
-            rankedSearching += 1;
-        } else if (room.matchMode === 'friendly') {
-            availableFriendlyRooms += 1;
-            if (room.matchmaking === true) friendlySearching += 1;
+    const relayAllowed = relayAvailabilitySnapshot().canStartNewMatch;
+    const now = Date.now();
+    for (const room of Object.values(rooms)) {
+        if (room.host?.readyState !== WebSocket.OPEN ||
+            room.guest?.readyState === WebSocket.OPEN ||
+            (room.networkMode === 'relay' && !relayAllowed)) continue;
+        const entry = {
+            country: countryBucket(room.hostCountryCode),
+            rankedSearching: room.matchMode === 'ranked' ? 1 : 0,
+            availableFriendlyRooms: room.matchMode === 'friendly' ? 1 : 0,
+            friendlySearching: room.matchMode === 'friendly' && room.matchmaking === true ? 1 : 0,
+        };
+        const counts = countryCounts(entry.country);
+        for (const field of ['rankedSearching', 'availableFriendlyRooms', 'friendlySearching']) {
+            counts[field] += entry[field];
+        }
+        exclude(excludedBySocket, room.host, entry);
+        exclude(excludedByPlayer, normalizePlayerId(room.hostPlayerId), entry);
+        for (const [playerId, expiresAt] of room.qualityRejectedPlayers || []) {
+            if ((Number(expiresAt) || 0) <= now) room.qualityRejectedPlayers.delete(playerId);
+            else exclude(excludedByPlayer, playerId, entry);
         }
     }
+    return { byCountry, excludedByPlayer, excludedBySocket };
+}
 
+function populationSnapshot(viewer, index = buildPopulationIndex()) {
+    const country = countryBucket(viewer?.analyticsCountryCode);
+    const counts = { lobbyUsers: 0, friendlySearching: 0, rankedSearching: 0,
+        availableFriendlyRooms: 0, ...index.byCountry.get(country) };
+    const playerId = playerIdForSocket(viewer, viewer?.matchmakingPlayerId);
+    // A room owned by the viewer AND recently rejected must only be subtracted once.
+    const exclusions = new Set([
+        ...(index.excludedBySocket.get(viewer) || []),
+        ...(index.excludedByPlayer.get(playerId) || []),
+    ]);
+    for (const entry of exclusions) {
+        if (entry.country !== country) continue;
+        for (const field of ['rankedSearching', 'availableFriendlyRooms', 'friendlySearching']) {
+            counts[field] -= entry[field];
+        }
+    }
     return {
         type: 'population_updated',
         poolId: SERVER_POOL_ID,
-        lobbyUsers,
-        friendlySearching,
-        rankedSearching,
-        availableFriendlyRooms,
+        ...counts,
     };
 }
 
-function sendPopulationSnapshot(client) {
+function sendPopulationSnapshot(client, index) {
     if (!client || client.readyState !== WebSocket.OPEN) return;
-    send(client, populationSnapshot(client));
+    send(client, populationSnapshot(client, index));
 }
 
 function schedulePopulationBroadcast() {
     if (populationBroadcastTimer) return;
     populationBroadcastTimer = setTimeout(() => {
         populationBroadcastTimer = null;
+        const index = buildPopulationIndex();
         wss.clients.forEach((client) => {
             if (client.populationSubscribed === true && client.readyState === WebSocket.OPEN) {
-                sendPopulationSnapshot(client);
+                sendPopulationSnapshot(client, index);
             }
         });
     }, Math.max(50, POPULATION_BROADCAST_DEBOUNCE_MS));
@@ -1563,6 +1606,7 @@ function capacitySnapshot(options = {}) {
         rooms: limitValue(MAX_ACTIVE_ROOMS),
         activeMatches: limitValue(MAX_ACTIVE_MATCHES),
         busyRatio: CAPACITY_BUSY_RATIO,
+        supportedCountries: [...SUPPORTED_COUNTRIES],
     };
 
     const globalConnectReason = blockedReason(counts.connections, MAX_CONNECTIONS, connectionExtra);
@@ -1577,15 +1621,20 @@ function capacitySnapshot(options = {}) {
     const createReason = blockedReason(counts.rooms, MAX_ACTIVE_ROOMS, 1);
     const joinReason = blockedReason(counts.matchSlots, MAX_ACTIVE_MATCHES, 1);
     const admissionPaused = MAINTENANCE_MODE || runtimeDrainEnabled;
-    const canConnect = !admissionPaused && !connectReason;
-    const canCreateRoom = !admissionPaused && !createReason;
-    const canJoinRoom = !admissionPaused && !joinReason;
+    const countrySupported = SUPPORTED_COUNTRIES.size === 0 || SUPPORTED_COUNTRIES.has(countryCode);
+    const canConnect = countrySupported && !admissionPaused && !connectReason;
+    const canCreateRoom = countrySupported && !admissionPaused && !createReason;
+    const canJoinRoom = countrySupported && !admissionPaused && !joinReason;
     const canAcceptMatchmaking = canConnect && (canCreateRoom || canJoinRoom);
 
     let status = 'available';
     let code = 'ok';
     let message = '대전 서버 이용 가능';
-    if (admissionPaused) {
+    if (!countrySupported) {
+        status = 'unavailable';
+        code = 'country_unsupported';
+        message = 'Multiplayer is not available in this country or region';
+    } else if (admissionPaused) {
         status = 'maintenance';
         code = 'server_maintenance';
         message = runtimeDrainEnabled ? DEPLOYMENT_DRAIN_MESSAGE : MAINTENANCE_MESSAGE;
@@ -1611,11 +1660,12 @@ function capacitySnapshot(options = {}) {
         canCreateRoom,
         canJoinRoom,
         canAcceptMatchmaking,
-        retryAfterSec: status === 'available' ? 0 : CAPACITY_RETRY_AFTER_SEC,
+        retryAfterSec: status === 'available' || !countrySupported ? 0 : CAPACITY_RETRY_AFTER_SEC,
         counts,
         limits,
         country: countryCode === null ? null : {
             code: countryCode,
+            supported: countrySupported,
             connections: countryConnections,
             maxConnections: limitValue(MAX_CONNECTIONS_PER_COUNTRY),
             admissionConnections: countryAdmissionLimit(MAX_CONNECTIONS_PER_COUNTRY),
@@ -1646,7 +1696,7 @@ function sendCapacityWsError(ws, snapshot) {
         code: snapshot.code || 'server_busy',
         message: snapshot.message || SERVER_BUSY_MESSAGE,
         status: snapshot.status || 'busy',
-        retryAfterSec: snapshot.retryAfterSec || CAPACITY_RETRY_AFTER_SEC,
+        retryAfterSec: snapshot.retryAfterSec ?? CAPACITY_RETRY_AFTER_SEC,
     });
 }
 
@@ -2004,6 +2054,12 @@ async function handleHttpRequest(req, res) {
             uptimeSec: Math.floor(process.uptime()),
             storage: storageMode(),
             authEnabled: AUTH_ENABLED,
+            servicePolicy: {
+                revision: 'v54',
+                supportedCountries: [...SUPPORTED_COUNTRIES],
+                relayMatchesEnabled: RELAY_MATCHES_ENABLED,
+                populationAggregation: 'shared-per-broadcast',
+            },
             rooms: Object.keys(rooms).length,
             players: statsPool ? null : statsPlayers.size,
             deployment,
@@ -4605,7 +4661,7 @@ wss.on('connection', (ws, req) => {
                     : null;
                 const matchmakingCandidate = rankedCandidate || friendlyCandidate;
                 if (matchmakingCandidate) {
-                    const joinCapacity = capacitySnapshot({ connectionExtra: 0 });
+                    const joinCapacity = capacitySnapshot({ connectionExtra: 0, countryCode: ws.analyticsCountryCode });
                     if (!joinCapacity.canJoinRoom) {
                         sendCapacityWsError(ws, joinCapacity);
                         return;
@@ -4631,7 +4687,7 @@ wss.on('connection', (ws, req) => {
                         break;
                     }
                 }
-                const capacity = capacitySnapshot({ connectionExtra: 0 });
+                const capacity = capacitySnapshot({ connectionExtra: 0, countryCode: ws.analyticsCountryCode });
                 if (!capacity.canCreateRoom) {
                     sendCapacityWsError(ws, capacity);
                     return;
@@ -4734,7 +4790,7 @@ wss.on('connection', (ws, req) => {
             // ── 방 참가 ──────────────────────────────────────────────────
             case 'join_room':
             case 'join_ranked_room': {
-                const capacity = capacitySnapshot({ connectionExtra: 0 });
+                const capacity = capacitySnapshot({ connectionExtra: 0, countryCode: ws.analyticsCountryCode });
                 if (!capacity.canJoinRoom) {
                     sendCapacityWsError(ws, capacity);
                     return;
@@ -4954,6 +5010,8 @@ wss.on('connection', (ws, req) => {
                 const code = ws.roomCode;
                 const room = rooms[code];
                 if (!room) return;
+                // Signaling/results/audits stay on WS; battle payloads require P2P when Relay is off.
+                if (!RELAY_MATCHES_ENABLED && P2P_GAMEPLAY_TYPES.has(msg.type)) return;
 
                 if (msg.type === 'game_start_failed') {
                     if (Number.isFinite(room.battleStartAtMs)) return;
