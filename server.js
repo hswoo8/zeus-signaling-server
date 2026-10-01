@@ -4,6 +4,8 @@ const WebSocket = require('ws');
 const { Pool } = require('pg');
 const { AdmissionController } = require('./admission');
 const { renderAdmissionPage } = require('./admission-admin');
+const { ServerMonitor } = require('./monitor');
+const { renderMonitorPage } = require('./monitor-admin');
 const packageJson = require('./package.json');
 const {
     AnalyticsStore,
@@ -149,7 +151,12 @@ const statsPool = DATABASE_URL ? new Pool({
 }) : null;
 const analyticsStore = new AnalyticsStore(statsPool, { retentionDays: ANALYTICS_RETENTION_DAYS });
 let admission = null;
+const monitor = new ServerMonitor({ pool: statsPool, poolId: SERVER_POOL_ID,
+    targets: JSON.parse(process.env.MONITOR_TARGETS_JSON || '[]') });
+// Observe a fatal crash without suppressing Node's normal exit/restart behavior.
+process.on('uncaughtExceptionMonitor', () => monitor.event('fatal_exception', SERVER_POOL_ID));
 const server = http.createServer((req, res) => {
+    monitor.observeHttp(req, res);
     handleHttpRequest(req, res).catch((err) => {
         console.error('[http] unexpected error:', err?.message || err);
         sendJson(res, 500, {
@@ -163,8 +170,11 @@ const usedWsTicketIds = new Map();
 const wss = new WebSocket.Server({
     server,
     verifyClient: ({ req }, done) => {
-        authenticateWebSocketUpgrade(req).then((allowed) => done(allowed, allowed ? undefined : 403))
-            .catch(() => done(false, 503));
+        monitor.record('wsUpgradeRequests');
+        authenticateWebSocketUpgrade(req).then((allowed) => {
+            if (!allowed) monitor.record('wsUpgradeRejected');
+            done(allowed, allowed ? undefined : 403);
+        }).catch(() => { monitor.record('wsUpgradeFailures'); done(false, 503); });
     },
 });
 
@@ -741,6 +751,7 @@ function sendHtml(res, statusCode, body) {
 }
 
 function sendHttpError(res, statusCode, code, message) {
+    res.monitorErrorCode = code;
     sendJson(res, statusCode, { error: { code, message } });
 }
 
@@ -1885,6 +1896,30 @@ async function handleHttpRequest(req, res) {
         return;
     }
 
+    if (req.method === 'GET' && pathname === '/admin/api/monitor') {
+        if (!requireAdmin(req, res)) return;
+        const history = await monitor.history();
+        res.setHeader('Cache-Control', 'no-store');
+        sendJson(res, 200, { snapshot: monitor.snapshot(), history });
+        return;
+    }
+    if (req.method === 'GET' && pathname === '/admin/monitor') {
+        if (!requireAdmin(req, res)) return;
+        const nonce = crypto.randomBytes(18).toString('base64');
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY',
+            'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'` });
+        res.end(renderMonitorPage(nonce));
+        return;
+    }
+    if (req.method === 'GET' && pathname === '/health/ready') {
+        const state = monitor.publicSnapshot();
+        const ready = !statsPool || state.database === 'ok';
+        res.setHeader('Cache-Control', 'no-store');
+        sendJson(res, ready ? 200 : 503, { ok: ready, monitor: state });
+        return;
+    }
+
     if ((req.method === 'GET' || req.method === 'POST') && pathname === '/admin/api/admission') {
         if (!requireAdmin(req, res)) return;
         if (!admission) { sendHttpError(res, 503, 'admission_disabled', 'Admission control requires authentication and a connection limit'); return; }
@@ -2146,6 +2181,7 @@ async function handleHttpRequest(req, res) {
 
     if (req.method === 'GET' && pathname === '/health') {
         const deployment = deploymentSnapshot();
+        res.setHeader('Cache-Control', 'no-store');
         sendJson(res, 200, {
             ok: true,
             ready: deployment.ready,
@@ -2159,8 +2195,9 @@ async function handleHttpRequest(req, res) {
             storage: storageMode(),
             authEnabled: AUTH_ENABLED,
             servicePolicy: {
-                revision: 'v55',
+                revision: 'v57',
                 admissionQueue: Boolean(admission),
+                runtimeMonitoring: true,
                 supportedCountries: [...SUPPORTED_COUNTRIES],
                 relayMatchesEnabled: RELAY_MATCHES_ENABLED,
                 populationAggregation: 'shared-per-broadcast',
@@ -2173,6 +2210,7 @@ async function handleHttpRequest(req, res) {
                 closedConnections: backpressureClosedConnections,
             },
             operations: operationsSnapshot(),
+            monitor: monitor.publicSnapshot(),
         });
         return;
     }
@@ -3477,6 +3515,7 @@ function rememberConfirmedPvpMatch(room, result) {
                 SET record = EXCLUDED.record, expires_at = EXCLUDED.expires_at`,
             [record.matchId, JSON.stringify(record), record.expiresAt]
         ).catch((err) => {
+            monitor.record('backgroundErrors');
             console.error('[stats] failed to persist confirmed PvP match:', err?.message || err);
         });
     }
@@ -3523,6 +3562,7 @@ function recordMultiMatchAnalytics(room, result) {
             integrity: roomIntegritySummary(room),
         },
     }).catch((err) => {
+        monitor.record('backgroundErrors');
         console.error('[analytics] failed to record multi match:', err?.message || err);
     });
 }
@@ -3810,6 +3850,7 @@ async function matchmakingRatingForSocket(ws, claimedPlayerId, refresh = false) 
             ? await postgresFindPlayerByRef('multi', playerId)
             : findPlayerByRef('multi', playerId);
     } catch (error) {
+        monitor.record('backgroundErrors');
         console.warn(`[matchmaking] MMR lookup failed: ${error?.message || 'unknown error'}`);
     }
     ws.matchmakingRating = Number.isFinite(player?.rating) ? player.rating : 1000;
@@ -4663,7 +4704,7 @@ wss.on('connection', (ws, req) => {
         return;
     }
     if (req.admissionGranted) {
-        admission.connectedPlayer(ws.authPlayerId, req.authPrincipal.admissionId).catch(() => console.warn('[admission] connection reservation cleanup deferred'));
+        admission.connectedPlayer(ws.authPlayerId, req.authPrincipal.admissionId).catch(() => { monitor.record('backgroundErrors'); console.warn('[admission] connection reservation cleanup deferred'); });
     }
 
     ws.on('pong', () => {
@@ -4887,6 +4928,7 @@ wss.on('connection', (ws, req) => {
                     ? reconcileRankedWaitingRooms()
                     : reconcileFriendlyMatchmakingRooms();
                 reconciliation.catch((error) => {
+                    monitor.record('backgroundErrors');
                     console.warn(
                         `[matchmaking] ${requestedMatchMode} reconciliation failed: ${error?.message || 'unknown error'}`
                     );
@@ -5289,9 +5331,11 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', (closeCode, closeReason) => {
         const disconnectSource = recordWebSocketDisconnect(ws, closeCode, closeReason);
+        monitor.record('wsClosed');
+        if (closeCode !== 1000 && closeCode !== 1001) monitor.record('wsAbnormal');
         const retainAdmission = closeCode !== 1000 && disconnectSource !== 'backpressure' && Boolean(ws.roomCode || ws.lobbyPresenceActive);
         admission?.disconnect(ws.authPlayerId, countryBucket(ws.analyticsCountryCode), req.authPrincipal?.channel, retainAdmission)
-            .catch(() => console.warn('[admission] reconnect reservation unavailable'));
+            .catch(() => { monitor.record('backgroundErrors'); console.warn('[admission] reconnect reservation unavailable'); });
         ws.populationSubscribed = false;
         ws.lobbyPresenceActive = false;
         schedulePopulationBroadcast();
@@ -5372,10 +5416,11 @@ wss.on('close', () => {
     clearInterval(eventLoopLagInterval);
     if (populationBroadcastTimer) clearTimeout(populationBroadcastTimer);
     clearInterval(admissionInterval);
+    monitor.stop();
 });
 
 const admissionInterval = setInterval(() => {
-    admission?.tick().catch(() => console.warn('[admission] queue maintenance deferred'));
+    admission?.tick().catch(() => { monitor.record('backgroundErrors'); console.warn('[admission] queue maintenance deferred'); });
 }, 5000);
 
 initializeStatsStorage()
@@ -5391,6 +5436,7 @@ initializeStatsStorage()
     .then(() => analyticsStore.initialize())
     .then(() => {
         server.listen(PORT, () => {
+            monitor.start();
             console.log(`Signaling server running on port ${PORT} (${storageMode()} stats)`);
         });
     })

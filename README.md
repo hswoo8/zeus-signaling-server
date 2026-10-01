@@ -270,3 +270,43 @@ multiple replicas under the same pool ID. Restart preserves unexpired queue posi
 User-run checks only: `node --test admission.test.js`. The optional Postgres test requires
 `ADMISSION_TEST_DATABASE_URL` pointing to a disposable test DB; it creates/drops a unique schema.
 No test execution is implied by the source or deployment checks in the implementation report.
+
+### v57: read-only runtime monitoring
+
+`/admin/monitor` (existing Basic admin login) shows peer reachability, DB probe status,
+HTTP 5xx counts/rates, abnormal WebSocket closes and background/upgrade processing errors.
+`GET /admin/api/monitor` returns the same snapshot and last24h minute history. The dashboard
+refreshes every30s; all observation is read-only and never changes caps, drain or restart policy.
+
+HTTP rate is failed application HTTP responses / completed application HTTP responses.
+Admin/health endpoints and404scanners are excluded. Expected busy/maintenance/config-disabled
+503s and client4xxs are separate; neither is counted as a server failure. Aborted responses,
+WS upgrade processing failures/auth rejections, abnormal closes and selected logged background
+DB/MMR/matchmaking/admission failures have separate counts. An abnormal close may be a player's
+network problem. Fatal Node exceptions are observed through `uncaughtExceptionMonitor` without
+suppressing the normal crash behavior; fatal logs may precede the next persistence flush.
+
+Trend compares the last completed5minutes against the preceding5minutes. Both windows need
+20completed requests and current failures>=3; rising requires +2percentage points and2x rate.
+Before10minutes after process start, trend is warming_up. Low volume is insufficient_samples;
+raw error counts/rates still remain visible. These initial thresholds are not QA-validated.
+
+Anonymous minute counters persist in `br_monitor_minutes` keyed by pool/process/minute, retained
+7days. Dashboard displays24h; local memory keeps2h. Gaps and no requests are not drawn as0%.
+DB probes run once/minute with a2.5s response deadline; a hung query does not enqueue another
+probe. DB history read is time-bounded and falls back to memory/cached observations. The pool's
+main request behavior and credentials are unchanged. `/health/ready` returns503 if a configured
+DB cannot currently be observed healthy. Existing `/health` remains a deployment liveness200
+endpoint and adds a small aggregate `monitor` field without player data, tokens or raw errors.
+
+`MONITOR_TARGETS_JSON` is an optional operator-supplied array of `{name,url}` HTTPS health URLs
+(max8). Each game process probes them once/minute (4s timeout,128KiB maximum response). A failed
+probe is immediately shown;3consecutive failures becomes unreachable. Results older than150s
+are stale. Peer restart/degradation/recovery and error-rate rise are recorded as `[monitor]`
+JSON logs; recent50transitions are shown in process memory. No external email/webhook is sent.
+
+Current deployment uses existing3game processes to observe the3game health endpoints and2
+match routers. Mac uptime is irrelevant. This shares Railway's platform and is **not independent
+whole-platform outage monitoring**. If one game is down, use another game's `/admin/monitor`.
+A separate external uptime provider remains optional/unconfigured; no paid service was added.
+User checks: `node --test monitor.test.js` (not executed by the implementation agent).
