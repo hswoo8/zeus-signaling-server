@@ -75,6 +75,7 @@ const BATTLE_COUNTDOWN_SYNC_DELAY_MS = Number(process.env.BATTLE_COUNTDOWN_SYNC_
 const P2P_FAILURE_CHECK_TIMEOUT_MS = Number(process.env.P2P_FAILURE_CHECK_TIMEOUT_MS || 3000);
 const RANKED_READY_CHECK_TIMEOUT_MS = envInt(['RANKED_READY_CHECK_TIMEOUT_MS'], 30 * 1000);
 const RANKED_SETUP_IDLE_TIMEOUT_MS = envInt(['RANKED_SETUP_IDLE_TIMEOUT_MS'], 60 * 1000);
+const ROOM_SHARE_LEASE_MS = 120 * 1000;
 const CONFIRMED_MATCH_TTL_MS = Number(process.env.CONFIRMED_MATCH_TTL_MS || 24 * 60 * 60 * 1000);
 const RANK_PLACEMENT_MATCHES = envInt(['RANK_PLACEMENT_MATCHES'], 10);
 const RANK_PLACEMENT_K = envInt(['RANK_PLACEMENT_K'], 48);
@@ -219,6 +220,7 @@ let populationBroadcastTimer = null;
 
 const LOBBY_TYPES = new Set([
     'create_room', 'join_room', 'join_ranked_room', 'leave_room', 'get_room_list', 'lobby_presence',
+    'room_share_prepare', 'room_share_resume',
     'ping_check', 'selection_update',
     'offer', 'answer', 'ice_candidate', 'resume_match',
 ]);
@@ -250,6 +252,7 @@ const P2P_GAMEPLAY_TYPES = new Set([
 
 const COMPATIBILITY_TYPES = new Set([
     'create_room', 'join_room', 'join_ranked_room', 'leave_room', 'get_room_list', 'lobby_presence', 'ping_check',
+    'room_share_prepare', 'room_share_resume',
     'selection_update', 'resume_match', 'game_start', 'game_ready', 'rematch_ready',
 ]);
 
@@ -1387,6 +1390,7 @@ function buildPopulationIndex() {
     const now = Date.now();
     for (const room of Object.values(rooms)) {
         if (room.host?.readyState !== WebSocket.OPEN ||
+            room.shareLease ||
             room.guest?.readyState === WebSocket.OPEN ||
             (room.networkMode === 'relay' && !relayAllowed)) continue;
         const entry = {
@@ -3901,12 +3905,207 @@ function rememberQualityRejectedPlayer(room, playerId) {
     room.qualityRejectedPlayers.set(normalizedPlayerId, Date.now() + QUALITY_REJECT_COOLDOWN_MS);
 }
 
+function isShareableWaitingRoom(room) {
+    return room?.matchMode === 'friendly' && !room.guest && !room.matchStarted &&
+        !room.matchId && !room.finalResult && !hasBattleLaunchSignaled(room) &&
+        !room.hostReady && !room.guestReady;
+}
+
+function clearRoomShareLease(room) {
+    if (room?.shareLease?.timer) clearTimeout(room.shareLease.timer);
+    if (room) room.shareLease = null;
+}
+
+function expireRoomShareLease(code, room, lease) {
+    // A stale timer must never delete a reused code or a successfully resumed room.
+    if (rooms[code] !== room || room.shareLease !== lease) return;
+    clearRoomShareLease(room);
+    const host = room.host;
+    if (host?.roomCode === code && host.role === 'host') {
+        host.roomCode = null;
+        host.role = null;
+    }
+    delete rooms[code];
+    send(host, { type: 'room_left', code, reason: 'share_expired' });
+    broadcastRoomRemoved(code);
+    console.log(`[-] Shared waiting room expired: ${code}`);
+}
+
+function roomShareOwnerMatches(ws, lease) {
+    return Boolean(ws.authPlayerId && ws.authPlayerId === lease.ownerPlayerId &&
+        ws.authChannel === lease.ownerChannel && ws.authPoolId === lease.poolId &&
+        lease.poolId === SERVER_POOL_ID &&
+        countryBucket(ws.analyticsCountryCode) === lease.countryCode);
+}
+
+function retainRoomForShare(ws) {
+    const room = rooms[ws.roomCode];
+    const lease = room?.shareLease;
+    return Boolean(lease && lease.resumeUntilMs > Date.now() &&
+        room.host === ws && ws.role === 'host' && isShareableWaitingRoom(room) &&
+        roomShareOwnerMatches(ws, lease));
+}
+
+function sendRoomCreated(ws, code, room, resumedFromShare = false) {
+    send(ws, {
+        type: 'room_created', code,
+        networkMode: room.networkMode,
+        arenaId: room.arenaId,
+        battleType: room.battleType,
+        debugNoKo: room.debugNoKo,
+        debugNoTime: room.debugNoTime,
+        matchMode: room.matchMode,
+        hostRating: room.hostRating,
+        hostMatches: room.hostMatches,
+        ...(resumedFromShare ? { resumedFromShare: true } : {}),
+    });
+}
+
+function roomShareError(ws, code) {
+    send(ws, {
+        type: 'error', code,
+        message: code === 'room_share_expired'
+            ? 'The shared room has expired'
+            : 'The shared room cannot be restored by this connection',
+    });
+}
+
+function prepareRoomShare(ws, code) {
+    const room = validateJoinCode(code) ? rooms[code] : null;
+    if (ws.readyState !== WebSocket.OPEN || !ws.authPlayerId || !ws.authChannel || ws.authPoolId !== SERVER_POOL_ID ||
+        !room || room.host !== ws || ws.role !== 'host' || ws.roomCode !== code ||
+        room.hostPlayerId !== ws.authPlayerId || !isShareableWaitingRoom(room)) {
+        roomShareError(ws, 'room_share_unavailable');
+        return;
+    }
+    if (room.shareLease && room.shareLease.resumeUntilMs <= Date.now()) {
+        roomShareError(ws, 'room_share_expired');
+        return;
+    }
+    if (!room.shareLease) {
+        const lease = {
+            ownerPlayerId: ws.authPlayerId,
+            ownerChannel: ws.authChannel,
+            countryCode: countryBucket(ws.analyticsCountryCode),
+            poolId: SERVER_POOL_ID,
+            resumeToken: crypto.randomBytes(32).toString('base64url'),
+            resumeUntilMs: Date.now() + ROOM_SHARE_LEASE_MS,
+            timer: null,
+        };
+        room.shareLease = lease;
+        lease.timer = setTimeout(() => expireRoomShareLease(code, room, lease), ROOM_SHARE_LEASE_MS);
+        lease.timer.unref();
+    }
+    // A repeated prepare is idempotent and does not extend the original deadline.
+    send(ws, {
+        type: 'room_share_prepared', code,
+        resumeUntilMs: room.shareLease.resumeUntilMs,
+        resumeToken: room.shareLease.resumeToken,
+        leaseMs: Math.max(0, room.shareLease.resumeUntilMs - Date.now()),
+    });
+    broadcastRoomUpsert(code);
+}
+
+function roomShareTokenMatches(ws, room, lease, token) {
+    // The original socket already owns the room. Rebinding another socket also
+    // requires the random capability delivered only to that host's prepare ACK.
+    return room.host === ws || (typeof token === 'string' && token.length <= 128 &&
+        secureEqual(token, lease.resumeToken));
+}
+
+function resumeRoomShare(ws, code, token) {
+    if (ws.readyState !== WebSocket.OPEN || !validateJoinCode(code) || !ws.authPlayerId || !ws.authChannel ||
+        ws.authPoolId !== SERVER_POOL_ID || (ws.roomCode && ws.roomCode !== code)) {
+        roomShareError(ws, 'room_share_unavailable');
+        return;
+    }
+    const room = rooms[code];
+    if (!room) {
+        roomShareError(ws, 'room_share_expired');
+        return;
+    }
+    const lease = room.shareLease;
+    if (!lease) {
+        // An acknowledgement may be retried on the socket already restored above.
+        if (ws.lastShareResume?.room === room && ws.lastShareResume.code === code &&
+            room.host === ws && ws.role === 'host' && room.hostPlayerId === ws.authPlayerId &&
+            isShareableWaitingRoom(room)) {
+            sendRoomCreated(ws, code, room, true);
+        } else {
+            roomShareError(ws, 'room_share_unavailable');
+        }
+        return;
+    }
+    if (!roomShareOwnerMatches(ws, lease) || room.hostPlayerId !== ws.authPlayerId ||
+        !roomShareTokenMatches(ws, room, lease, token)) {
+        roomShareError(ws, 'room_share_owner_mismatch');
+        return;
+    }
+    if (lease.resumeUntilMs <= Date.now()) {
+        roomShareError(ws, 'room_share_expired');
+        return;
+    }
+    if (!isShareableWaitingRoom(room)) {
+        roomShareError(ws, 'room_share_unavailable');
+        return;
+    }
+    const previousHost = room.host;
+    clearRoomShareLease(room);
+    if (previousHost && previousHost !== ws) {
+        previousHost.roomCode = null;
+        previousHost.role = null;
+        previousHost.supersededByShareResume = true;
+    }
+    room.host = ws;
+    room.hostRttMs = socketRttMs(ws);
+    room.hostUserAgent = ws.analyticsUserAgent;
+    ws.roomCode = code;
+    ws.role = 'host';
+    ws.matchmakingPlayerId = room.hostPlayerId;
+    ws.lastShareResume = { room, code };
+    sendRoomCreated(ws, code, room, true);
+    if (previousHost && previousHost !== ws && previousHost.readyState === WebSocket.OPEN) {
+        previousHost.close(1000, 'share_resumed_elsewhere');
+    }
+    broadcastRoomUpsert(code);
+    console.log(`[+] Shared waiting room resumed: ${code}`);
+}
+
+function leaveSharedRoom(ws, code, leaveReason, token) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const room = rooms[code];
+    const lease = room?.shareLease;
+    if (!lease || lease.resumeUntilMs <= Date.now()) {
+        roomShareError(ws, 'room_share_expired');
+        return;
+    }
+    if (!roomShareOwnerMatches(ws, lease) || room.hostPlayerId !== ws.authPlayerId ||
+        !roomShareTokenMatches(ws, room, lease, token)) {
+        roomShareError(ws, 'room_share_owner_mismatch');
+        return;
+    }
+    if (!isShareableWaitingRoom(room)) {
+        roomShareError(ws, 'room_share_unavailable');
+        return;
+    }
+    const previousHost = room.host;
+    const detail = setupLeaveDetail(leaveReason);
+    if (!leaveWaitingRoom(previousHost, { reason: 'user_left', detail })) {
+        roomShareError(ws, 'room_share_unavailable');
+        return;
+    }
+    // This authenticated caller has replaced the detached host for cleanup as well.
+    previousHost.supersededByShareResume = true;
+    send(ws, { type: 'room_left', code, reason: 'user_left', detail });
+    if (previousHost.readyState === WebSocket.OPEN) previousHost.close(1000, 'shared_room_left');
+}
+
 function removeDuplicateWaitingRoomsForPlayer(playerId, currentSocket) {
     const normalizedPlayerId = normalizePlayerId(playerId);
     if (!normalizedPlayerId) return 0;
     let removed = 0;
     for (const [code, room] of Object.entries(rooms)) {
-        if (!room || room.host === currentSocket || room.matchStarted) continue;
+        if (!room || room.host === currentSocket || room.matchStarted || room.shareLease) continue;
         if (room.guest?.readyState === WebSocket.OPEN) continue;
         if (normalizePlayerId(room.hostPlayerId) !== normalizedPlayerId) continue;
 
@@ -3929,7 +4128,7 @@ function removeDuplicateWaitingRoomsForPlayer(playerId, currentSocket) {
 }
 
 function roomListEntry(code, room, viewer, viewerRating = 1000) {
-    if (!room || room.host?.readyState !== WebSocket.OPEN ||
+    if (!room || room.shareLease || room.host?.readyState !== WebSocket.OPEN ||
         (room.guest && room.guest.readyState === WebSocket.OPEN)) {
         return null;
     }
@@ -4002,6 +4201,11 @@ function bestFriendlyWaitingRoom(viewer) {
 }
 
 async function attachGuestToRoom(ws, msg, code, room, guestPlayerId) {
+    if (room.shareLease) {
+        send(ws, { type: 'error', code: 'room_host_away',
+            message: 'The host is sharing this room; retry after the host returns', retryAfterSec: 2 });
+        return;
+    }
     room.guest = ws;
     const guestRating = room.matchMode === 'ranked'
         ? await matchmakingRatingForSocket(ws, guestPlayerId)
@@ -4116,6 +4320,7 @@ async function reconcileFriendlyMatchmakingRooms() {
         .filter(([, room]) =>
             room?.matchMode === 'friendly' &&
             room.matchmaking === true &&
+            !room.shareLease &&
             !room.matchStarted &&
             !room.guest &&
             room.host?.readyState === WebSocket.OPEN
@@ -4536,7 +4741,8 @@ function leaveWaitingRoom(ws, {
     const room = code ? rooms[code] : null;
     // A completed match keeps its room for the rematch flow, but either player
     // must still be able to leave that room before creating a new one.
-    if (!room || (hasBattleLaunchSignaled(room) && !room.finalResult)) return false;
+    if (!room || room[ws.role] !== ws || (hasBattleLaunchSignaled(room) && !room.finalResult)) return false;
+    clearRoomShareLease(room);
 
     if (ws.role === 'guest') {
         recordRankedSetupOutcome(room, 'not_started', reason, 'guest', detail);
@@ -4692,6 +4898,8 @@ wss.on('connection', (ws, req) => {
     ws.analyticsCountryCode = requestCountry(req, null);
     ws.analyticsUserAgent = safeUserAgent(req);
     ws.authPlayerId = normalizePlayerId(req.authPrincipal?.sub);
+    ws.authChannel = req.authPrincipal?.channel || null;
+    ws.authPoolId = req.authPrincipal?.poolId || SERVER_POOL_ID;
     markSocketAlive(ws);
 
     const connectionCapacity = capacitySnapshot({
@@ -4712,6 +4920,7 @@ wss.on('connection', (ws, req) => {
     });
 
     ws.on('message', async (raw) => {
+        if (ws.supersededByShareResume) return;
         markSocketAlive(ws);
         if (typeof raw !== 'string' && !Buffer.isBuffer(raw)) return;
         const text = raw.toString();
@@ -4750,6 +4959,16 @@ wss.on('connection', (ws, req) => {
         }
 
         switch (msg.type) {
+            case 'room_share_prepare': {
+                prepareRoomShare(ws, msg.code);
+                break;
+            }
+
+            case 'room_share_resume': {
+                resumeRoomShare(ws, msg.code, msg.resumeToken);
+                break;
+            }
+
             case 'lobby_presence': {
                 ws.populationSubscribed = msg.active === true;
                 ws.lobbyPresenceActive = msg.active === true;
@@ -4801,6 +5020,17 @@ wss.on('connection', (ws, req) => {
                 }
                 const hostPlayerId = playerIdForSocket(ws, msg.hostPlayerId);
                 const hostRating = await matchmakingRatingForSocket(ws, msg.hostPlayerId);
+                // Rating lookup may yield while this same owner resumes the shared room.
+                if (ws.supersededByShareResume || ws.readyState !== WebSocket.OPEN) return;
+                if (ws.roomCode) {
+                    send(ws, { type: 'error', code: 'already_in_room', message: 'Already in a room' });
+                    return;
+                }
+                if (ws.authPlayerId && Object.values(rooms).some((room) =>
+                    room.shareLease?.ownerPlayerId === ws.authPlayerId)) {
+                    roomShareError(ws, 'room_share_unavailable');
+                    return;
+                }
                 removeDuplicateWaitingRoomsForPlayer(hostPlayerId, ws);
                 const rankedCandidate = requestedMatchMode === 'ranked'
                     ? bestRankedWaitingRoom(ws, hostRating)
@@ -4911,18 +5141,7 @@ wss.on('connection', (ws, req) => {
                     ws.lastRankedArenaId = rooms[code].arenaId;
                 }
 
-                send(ws, {
-                    type: 'room_created',
-                    code,
-                    networkMode: rooms[code].networkMode,
-                    arenaId: rooms[code].arenaId,
-                    battleType: rooms[code].battleType,
-                    debugNoKo: rooms[code].debugNoKo,
-                    debugNoTime: rooms[code].debugNoTime,
-                    matchMode: rooms[code].matchMode,
-                    hostRating: rooms[code].hostRating,
-                    hostMatches: rooms[code].hostMatches,
-                });
+                sendRoomCreated(ws, code, rooms[code]);
                 broadcastRoomUpsert(code);
                 const reconciliation = requestedMatchMode === 'ranked'
                     ? reconcileRankedWaitingRooms()
@@ -5006,6 +5225,15 @@ wss.on('connection', (ws, req) => {
                     send(ws, { type: 'error', code: 'room_full', message: 'Room is full' });
                     return;
                 }
+                if (room.shareLease) {
+                    send(ws, { type: 'error', code: 'room_host_away',
+                        message: 'The host is sharing this room; retry after the host returns', retryAfterSec: 2 });
+                    return;
+                }
+                if (room.host?.readyState !== WebSocket.OPEN) {
+                    send(ws, { type: 'error', code: 'room_not_found', message: 'Room host is no longer connected' });
+                    return;
+                }
                 if (room.networkMode === 'relay') {
                     const relayStatus = relayAvailabilitySnapshot();
                     if (!relayStatus.canStartNewMatch) {
@@ -5019,6 +5247,11 @@ wss.on('connection', (ws, req) => {
             }
 
             case 'leave_room': {
+                // Back can arrive on a fresh connection before the resume acknowledgement.
+                if (!ws.roomCode && validateJoinCode(msg.code)) {
+                    leaveSharedRoom(ws, msg.code, msg.leaveReason, msg.resumeToken);
+                    break;
+                }
                 if (!ws.roomCode || !rooms[ws.roomCode]) {
                     ws.roomCode = null;
                     ws.role = null;
@@ -5057,6 +5290,7 @@ wss.on('connection', (ws, req) => {
                 const code = ws.roomCode;
                 const room = rooms[code];
                 if (!room) return;
+                if (room.shareLease) return;
 
                 if (ws.role === 'host') {
                     room.hostCharacterId = enumToken(msg.characterId) || room.hostCharacterId;
@@ -5127,6 +5361,7 @@ wss.on('connection', (ws, req) => {
                 const code = ws.roomCode;
                 const room = rooms[code];
                 if (!room) return;
+                if (room.shareLease) return;
 
                 const peer = ws.role === 'host' ? room.guest : room.host;
                 send(peer, { ...msg, matchId: room.matchId || null }, { relay: true });
@@ -5160,6 +5395,8 @@ wss.on('connection', (ws, req) => {
                 const code = ws.roomCode;
                 const room = rooms[code];
                 if (!room) return;
+                // Prepared sharing freezes this solo waiting room until explicit resume.
+                if (room.shareLease) return;
                 // Signaling/results/audits stay on WS; battle payloads require P2P when Relay is off.
                 if (!RELAY_MATCHES_ENABLED && P2P_GAMEPLAY_TYPES.has(msg.type)) return;
 
@@ -5333,9 +5570,19 @@ wss.on('connection', (ws, req) => {
         const disconnectSource = recordWebSocketDisconnect(ws, closeCode, closeReason);
         monitor.record('wsClosed');
         if (closeCode !== 1000 && closeCode !== 1001) monitor.record('wsAbnormal');
-        const retainAdmission = closeCode !== 1000 && disconnectSource !== 'backpressure' && Boolean(ws.roomCode || ws.lobbyPresenceActive);
-        admission?.disconnect(ws.authPlayerId, countryBucket(ws.analyticsCountryCode), req.authPrincipal?.channel, retainAdmission)
-            .catch(() => { monitor.record('backgroundErrors'); console.warn('[admission] reconnect reservation unavailable'); });
+        const keepSharedRoom = retainRoomForShare(ws);
+        const shareOwnerAlreadyConnected = keepSharedRoom && [...wss.clients].some((client) =>
+            client !== ws && client.readyState === WebSocket.OPEN &&
+            client.authPlayerId === ws.authPlayerId && client.authChannel === ws.authChannel &&
+            client.authPoolId === ws.authPoolId &&
+            countryBucket(client.analyticsCountryCode) === countryBucket(ws.analyticsCountryCode));
+        const retainAdmission = keepSharedRoom ||
+            (closeCode !== 1000 && disconnectSource !== 'backpressure' && Boolean(ws.roomCode || ws.lobbyPresenceActive));
+        // The replaced socket no longer owns the player's new admission connection.
+        if (!ws.supersededByShareResume && !shareOwnerAlreadyConnected) {
+            admission?.disconnect(ws.authPlayerId, countryBucket(ws.analyticsCountryCode), req.authPrincipal?.channel, retainAdmission)
+                .catch(() => { monitor.record('backgroundErrors'); console.warn('[admission] reconnect reservation unavailable'); });
+        }
         ws.populationSubscribed = false;
         ws.lobbyPresenceActive = false;
         schedulePopulationBroadcast();
@@ -5344,6 +5591,11 @@ wss.on('connection', (ws, req) => {
 
         const room = rooms[code];
         if (!['host', 'guest'].includes(ws.role) || room[ws.role] !== ws) return;
+        if (keepSharedRoom) {
+            broadcastRoomRemoved(code);
+            console.log(`[~] Shared waiting room retained: ${code}`);
+            return;
+        }
         if (leaveWaitingRoom(ws, {
             reason: 'disconnect',
             detail: disconnectSource,
@@ -5416,6 +5668,7 @@ wss.on('close', () => {
     clearInterval(eventLoopLagInterval);
     if (populationBroadcastTimer) clearTimeout(populationBroadcastTimer);
     clearInterval(admissionInterval);
+    for (const room of Object.values(rooms)) clearRoomShareLease(room);
     monitor.stop();
 });
 
